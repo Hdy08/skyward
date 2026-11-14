@@ -13,6 +13,7 @@ use rsa::{BigUint, Pkcs1v15Sign, RsaPublicKey};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 use x509_cert::der::oid::ObjectIdentifier;
 use x509_cert::der::{Decode, DecodePem, Encode};
 use x509_cert::Certificate;
@@ -103,6 +104,18 @@ pub fn keys<R: Read + Seek>(zip: R) -> Result<Vec<Key>> {
     }
     ensure!(!keys.is_empty(), "the zip holds no certificate");
     Ok(keys)
+}
+
+/// Adopt the installed system's public OTA certificates in the recovery's
+/// RAM trust store. Validate the complete ZIP before replacing the old
+/// file, so an unreadable source leaves recovery's bundled keys intact.
+pub fn adopt(from: &Path, into: &Path) -> Result<usize> {
+    let bytes = std::fs::read(from).with_context(|| format!("read {}", from.display()))?;
+    let count = keys(std::io::Cursor::new(&bytes))?.len();
+    let part = into.with_extension("zip.part");
+    std::fs::write(&part, bytes).with_context(|| format!("write {}", part.display()))?;
+    std::fs::rename(&part, into).with_context(|| format!("put {} in place", into.display()))?;
+    Ok(count)
 }
 
 /// The key of a PEM certificate. Android's recovery takes an RSA key of
@@ -244,6 +257,25 @@ mod tests {
         let names: Vec<String> = (0..pems.len()).map(|k| format!("keys/{k}.x509.pem")).collect();
         let entries: Vec<(&str, &str)> = names.iter().map(String::as_str).zip(pems.iter().copied()).collect();
         keys(Cursor::new(certificates(&entries))).unwrap()
+    }
+
+    #[test]
+    fn adopting_current_ota_certificates_preserves_the_previous_store_on_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("installed-otacerts.zip");
+        let into = dir.path().join("otacerts.zip");
+        let old = certificates(&[("old.x509.pem", TESTKEY)]);
+        std::fs::write(&into, &old).unwrap();
+        for invalid in [b"not a certificate zip".to_vec(), certificates(&[]), certificates(&[("bad.x509.pem", "invalid PEM")])] {
+            std::fs::write(&from, invalid).unwrap();
+            assert!(adopt(&from, &into).is_err());
+            assert_eq!(std::fs::read(&into).unwrap(), old);
+        }
+        let new = certificates(&[("online.x509.pem", EC), ("local.x509.pem", SHA1)]);
+        std::fs::write(&from, &new).unwrap();
+        assert_eq!(adopt(&from, &into).unwrap(), 2);
+        assert_eq!(std::fs::read(&into).unwrap(), new);
+        assert_eq!(check(SIGNED_EC, &keys(std::fs::File::open(into).unwrap()).unwrap()), Verdict::Signed);
     }
 
     fn check(package: &[u8], keys: &[Key]) -> Verdict {

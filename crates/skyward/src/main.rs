@@ -523,6 +523,16 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     skyward_sys::kmsg(&format!("{nodes} device nodes given the owner their phone describes"))?;
     let props = skyward_info::installed_props(slot)?;
     adopt_installed_version(&props)?;
+    if let Some(base) = &cfg.recovery {
+        install_recovery_libraries(&base.libraries)?;
+        skyward_sys::kmsg(&format!("{} installed libraries supplied to the recovery base", base.libraries.len()))?;
+        if let Some(certificates) = &base.ota_certificates {
+            match skyward_install::signature::adopt(Path::new(certificates), Path::new(skyward_install::signature::CERTIFICATES)) {
+                Ok(count) => skyward_sys::kmsg(&format!("{count} installed OTA certificates supplied to the recovery base"))?,
+                Err(e) => skyward_sys::kmsg(&format!("installed OTA certificates not supplied: {e:#}"))?,
+            }
+        }
+    }
     // Without logd the phone's own programs still run, and only what they
     // log is lost, so why it did not start goes to the kernel log.
     if let Some(logd) = &cfg.logd
@@ -536,7 +546,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     // there to ueventd, which looks in the recovery's firmware folders.
     std::fs::write(FIRMWARE_FALLBACK, "1").with_context(|| format!("write 1 to {FIRMWARE_FALLBACK}"))?;
     if let Some(firmware) = &cfg.firmware {
-        mount_firmware(&firmware.partition)?;
+        mount_firmware(firmware)?;
     }
     for name in &cfg.partitions.mounted {
         let at = skyward_block::fstab::mount(name)?;
@@ -544,6 +554,19 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     }
     for path in load_modules(cfg, &cfg.modules.load)? {
         skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
+    }
+    for name in &cfg.modules.optional {
+        match load_modules(cfg, std::slice::from_ref(name)) {
+            Ok(paths) => {
+                for path in paths {
+                    skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
+                }
+            }
+            Err(e) => skyward_sys::kmsg(&format!("optional module {name}: {e:#}"))?,
+        }
+    }
+    if cfg.recovery.is_some() {
+        skyward_sys::set_prop("skyward.modules.ready", "1")?;
     }
     if !cfg.owners.is_empty() {
         let handed = hand_over(&cfg.owners)?;
@@ -648,7 +671,17 @@ const LOGD_READY: std::time::Duration = std::time::Duration::from_secs(5);
 /// started keeps the copy it has open.
 #[cfg(target_os = "android")]
 fn start_logd(logd: &skyward_config::Logd) -> Result<()> {
-    for library in &logd.libraries {
+    install_recovery_libraries(&logd.libraries)?;
+    skyward_sys::set_prop("ctl.start", "logd")?;
+    skyward_sys::wait_prop("logd.ready", "true", LOGD_READY)?;
+    skyward_sys::kmsg(&format!("logd runs with {} libraries of the installed system", logd.libraries.len()))
+}
+
+/// Replace individual runtime libraries in the ramdisk. Processes already
+/// using the older inode keep it until they exit.
+#[cfg(target_os = "android")]
+fn install_recovery_libraries(libraries: &[String]) -> Result<()> {
+    for library in libraries {
         let from = Path::new(library);
         let to = Path::new(RECOVERY_LIBRARIES).join(from.file_name().expect("the configuration names each library's file"));
         let mut part = to.clone().into_os_string();
@@ -656,9 +689,7 @@ fn start_logd(logd: &skyward_config::Logd) -> Result<()> {
         std::fs::copy(from, &part).with_context(|| format!("copy {library} to {}", Path::new(&part).display()))?;
         std::fs::rename(&part, &to).with_context(|| format!("put {} in place", to.display()))?;
     }
-    skyward_sys::set_prop("ctl.start", "logd")?;
-    skyward_sys::wait_prop("logd.ready", "true", LOGD_READY)?;
-    skyward_sys::kmsg(&format!("logd runs with {} libraries of the installed system", logd.libraries.len()))
+    Ok(())
 }
 
 /// Have the parts of the secure world that keep keys agree on the key they
@@ -698,12 +729,13 @@ const FIRMWARE_SHOWN: &str = "/firmware";
 /// world's apps look for theirs, and show it where the recovery's ueventd
 /// looks for the rest. Both stay when the recovery service starts again.
 #[cfg(target_os = "android")]
-fn mount_firmware(partition: &str) -> Result<()> {
+fn mount_firmware(firmware: &skyward_config::FirmwarePartition) -> Result<()> {
+    let partition = &firmware.partition;
     let shown = Path::new(FIRMWARE_SHOWN);
     if skyward_block::mount::is_mount_point(shown)? {
         return Ok(());
     }
-    let at = skyward_block::fstab::mount(partition)?;
+    let at = skyward_block::fstab::mount_with_context(partition, firmware.context.as_deref())?;
     std::fs::create_dir_all(shown).with_context(|| format!("make {}", shown.display()))?;
     skyward_block::mount::bind(&at, shown)?;
     skyward_sys::kmsg(&format!("{partition} is mounted on {}, shown at {}", at.display(), shown.display()))

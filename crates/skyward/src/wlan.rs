@@ -40,7 +40,7 @@ const WIFI: u32 = 1010;
 
 /// How long the driver may take to make its interface, the chip's firmware
 /// loading meanwhile.
-const INTERFACE_WAIT: Duration = Duration::from_secs(20);
+const INTERFACE_WAIT: Duration = Duration::from_secs(60);
 
 /// How long the supplicant may take to open its control socket.
 const SOCKET_WAIT: Duration = Duration::from_secs(10);
@@ -149,6 +149,7 @@ struct Running {
     monitor: Control,
     mac: [u8; 6],
     found: Vec<Bss>,
+    scanned: bool,
     lease: Option<Held>,
     /// The thread asking for an address or to keep one, and its number;
     /// what an earlier one answers is let go.
@@ -208,6 +209,20 @@ struct Station {
 
 impl Station {
     fn run(&mut self, asked: &worker::Told<Inbox>) {
+        if self.cfg.prepare_on_boot {
+            let began = Instant::now();
+            let _ = skyward_sys::kmsg("WLAN: preparing the driver in the background");
+            match prepare_driver(&self.cfg, &self.modules).and_then(|()| iface::set_up(&self.cfg.interface, false)) {
+                Ok(()) => {
+                    let _ = skyward_sys::kmsg(&format!("WLAN: driver prepared in {} ms, interface down", began.elapsed().as_millis()));
+                }
+                Err(e) => {
+                    // An early preparation failure must not end the
+                    // worker: enabling WLAN still retries normally.
+                    let _ = skyward_sys::kmsg(&format!("WLAN: background preparation failed: {e:#}"));
+                }
+            }
+        }
         let mut told = self.state.clone();
         loop {
             let mut fds = vec![libc::pollfd { fd: asked.fd(), events: libc::POLLIN, revents: 0 }];
@@ -284,10 +299,13 @@ impl Station {
         }
         self.state.power = Power::Starting;
         self.tell.tell(Report::Wlan(self.state.clone()));
+        let began = Instant::now();
+        let _ = skyward_sys::kmsg("WLAN: enabling");
         match self.start() {
             Ok(r) => {
                 self.running = Some(r);
                 self.state.power = Power::On;
+                let _ = skyward_sys::kmsg(&format!("WLAN: ready to scan in {} ms", began.elapsed().as_millis()));
                 self.command(Command::Scan);
             }
             Err(e) => {
@@ -322,6 +340,7 @@ impl Station {
             monitor,
             mac,
             found: Vec::new(),
+            scanned: false,
             lease: None,
             asking: None,
             asked: 0,
@@ -397,6 +416,10 @@ impl Station {
         }
         self.state.networks = wlan::networks(&found);
         r.found = found;
+        if !r.scanned {
+            r.scanned = true;
+            let _ = skyward_sys::kmsg(&format!("WLAN: first scan returned {} networks", self.state.networks.len()));
+        }
         Ok(())
     }
 
@@ -623,6 +646,13 @@ impl Station {
 /// Load the driver where its interface is not there yet, and bring the
 /// interface up.
 fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
+    prepare_driver(cfg, modules)?;
+    iface::set_up(&cfg.interface, true)
+}
+
+/// Prepare only the driver and its firmware. No interface is enabled and
+/// no supplicant is started until WLAN is requested by the user.
+fn prepare_driver(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
     let net = Path::new("/sys/class/net").join(&cfg.interface);
     if !net.exists() {
         for file in &cfg.firmware {
@@ -640,7 +670,7 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
             thread::sleep(Duration::from_millis(100));
         }
     }
-    iface::set_up(&cfg.interface, true)
+    Ok(())
 }
 
 /// Put a file the driver asks for where the firmware loader looks.

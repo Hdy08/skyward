@@ -5,6 +5,7 @@
 use crate::parcel::Parcel;
 #[cfg(target_os = "android")]
 use crate::status;
+#[cfg(target_os = "android")]
 use anyhow::{Context, Result};
 
 /// The directory every program registers with and looks things up in.
@@ -44,6 +45,7 @@ fn methods_of(sdk: u32) -> Methods {
 /// The recovery's own version, which its property files give.
 const SDK: &str = "ro.build.version.sdk";
 
+#[cfg(target_os = "android")]
 fn methods() -> Result<Methods> {
     let sdk = skyward_sys::prop(SDK).with_context(|| format!("the recovery says no {SDK}"))?;
     Ok(methods_of(sdk.parse().with_context(|| format!("{SDK} is {sdk:?}"))?))

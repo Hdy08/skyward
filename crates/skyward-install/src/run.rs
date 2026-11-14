@@ -12,7 +12,7 @@ use crate::fuse::{self, Fault, LocalFile, Mount};
 use crate::image::{self, ImageKind};
 use crate::keep::Kept;
 use crate::ota::{self, Log, Status};
-use crate::package::{self, Build, Package, Phone, Update};
+use crate::package::{self, Package, Phone, Update};
 use crate::script::{self, Bar, Request};
 use crate::signature::{self, Verdict};
 use crate::{Command, Event, Failure, Options, Outcome, Reflash, Refusal, Stage, ENGINE_LOG, SCRIPT_LOG};
@@ -655,18 +655,7 @@ fn remount_metadata() -> Result<()> {
 /// The phone, and the system on it as its mounted partitions tell.
 fn phone(slot: Slot) -> Result<Phone> {
     let props = skyward_info::installed_props(slot)?;
-    let installed = match (props.get("ro.build.date.utc"), props.get("ro.build.version.security_patch")) {
-        (Some(time), Some(patch)) => Some(Build {
-            timestamp: time.parse().with_context(|| format!("ro.build.date.utc {time:?}"))?,
-            security_patch: patch.clone(),
-        }),
-        _ => None,
-    };
-    Ok(Phone {
-        device: prop("ro.product.device").context("ro.product.device is unset")?,
-        serial: prop("ro.serialno").unwrap_or_default(),
-        installed,
-    })
+    Phone::from_system(&props, prop("ro.product.device").as_deref(), prop("ro.serialno").unwrap_or_default())
 }
 
 /// Why there is too little charge to install, if there is.

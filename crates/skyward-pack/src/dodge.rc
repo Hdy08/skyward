@@ -1,0 +1,21 @@
+# OnePlus 13 board setup retained from the verified OrangeFox base.
+# Skyward starts the installed system's key services after mounting its
+# partitions and adopting its OS and security patch levels.
+on init
+    write /sys/class/backlight/panel0-backlight/brightness 200
+    setprop sys.usb.configfs 1
+    setprop sys.usb.config_disable 0
+
+on property:ro.boot.usbcontroller=*
+    setprop sys.usb.controller ${ro.boot.usbcontroller}
+    wait /sys/bus/platform/devices/${ro.boot.usb.dwc3_msm:-a600000.ssusb}/mode 1
+    write /sys/bus/platform/devices/${ro.boot.usb.dwc3_msm:-a600000.ssusb}/mode peripheral
+
+on fs
+    symlink /dev/block/platform/soc/${ro.boot.bootdevice} /dev/block/bootdevice
+    write /proc/sys/kernel/firmware_config/force_sysfs_fallback 1
+
+# The donor boots ADSP once its module and the modem firmware are ready.
+# Its PMIC firmware brings up the battery nodes read by Skyward.
+on property:skyward.modules.ready=1
+    write /sys/kernel/boot_adsp/ssr 1

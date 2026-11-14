@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 pub mod modprobe;
 
 /// Where a module source's files are in the recovery: the vendor_boot
@@ -14,9 +15,14 @@ pub fn source_dir(source: &str) -> Result<PathBuf> {
         "vendor_boot" => "/lib/modules",
         "vendor_dlkm" => "/vendor_dlkm/lib/modules",
         "vendor" => "/vendor/lib/modules",
-        "system_dlkm" => "/system_dlkm/flatten/lib/modules",
+        "system_dlkm" => return Ok(system_modules(Path::new("/system_dlkm"))),
         _ => bail!("unknown module source {source:?}"),
     }))
+}
+
+fn system_modules(root: &Path) -> PathBuf {
+    let direct = root.join("lib/modules");
+    if direct.is_dir() { direct } else { root.join("flatten/lib/modules") }
 }
 
 /// Load `names` (module names without `.ko`) with their dependencies. Each
@@ -34,8 +40,8 @@ pub fn load(dirs: &[PathBuf], names: &[String]) -> Result<Vec<PathBuf>> {
         let graph = parse_dep(dir)?;
         for m in graph.load_order(std::slice::from_ref(&file)) {
             let path = graph
-                .resolve_path(&m)
-                .ok_or_else(|| anyhow!("{m} is listed in {}/modules.dep but missing", dir.display()))?;
+                .resolve_from(&m, dirs)
+                .ok_or_else(|| anyhow!("{m} is listed in {}/modules.dep but missing from all module sources", dir.display()))?;
             insmod(&path, "")?;
             loaded.push(path);
         }
@@ -82,6 +88,15 @@ fn basename(p: &str) -> String {
 }
 
 impl ModuleGraph {
+    /// Vendor modules.dep also names dependencies shipped in system_dlkm.
+    /// Keep this graph's copy first, then look in the configured sources.
+    fn resolve_from(&self, module: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+        self.resolve_path(module).or_else(|| dirs.iter().filter(|dir| **dir != self.base).find_map(|dir| {
+            let direct = dir.join(module);
+            if direct.is_file() { Some(direct) } else { find_file(dir, module) }
+        }))
+    }
+
     /// Topologically ordered load list. With an empty `requested`, every module
     /// in the graph is scheduled; otherwise only the requested modules and
     /// their transitive dependencies, dependencies first.
@@ -181,5 +196,32 @@ mod tests {
     #[test]
     fn strips_paths_to_basenames() {
         assert_eq!(basename("kernel/drivers/foo/bar.ko"), "bar.ko");
+    }
+
+    #[test]
+    fn vendor_dependencies_can_be_shipped_in_system_dlkm() {
+        let root = tempfile::tempdir().unwrap();
+        let vendor = root.path().join("vendor");
+        let system = root.path().join("system/lib/modules");
+        fs::create_dir_all(&vendor).unwrap();
+        fs::create_dir_all(&system).unwrap();
+        fs::write(vendor.join("modules.dep"), "cfg80211.ko: /system/lib/modules/rfkill.ko\n").unwrap();
+        fs::write(vendor.join("cfg80211.ko"), []).unwrap();
+        fs::write(system.join("rfkill.ko"), []).unwrap();
+        let graph = parse_dep(&vendor).unwrap();
+        let dirs = [vendor.clone(), system.clone()];
+        let paths: Vec<_> = graph.load_order(&["cfg80211.ko".into()]).iter().map(|m| graph.resolve_from(m, &dirs).unwrap()).collect();
+        assert_eq!(paths, [system.join("rfkill.ko"), vendor.join("cfg80211.ko")]);
+        fs::write(vendor.join("rfkill.ko"), []).unwrap();
+        assert_eq!(graph.resolve_from("rfkill.ko", &dirs), Some(vendor.join("rfkill.ko")), "prefer the requesting graph's copy");
+    }
+
+    #[test]
+    fn system_dlkm_can_keep_modules_directly_or_under_flatten() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("flatten/lib/modules")).unwrap();
+        assert_eq!(system_modules(root.path()), root.path().join("flatten/lib/modules"));
+        fs::create_dir_all(root.path().join("lib/modules")).unwrap();
+        assert_eq!(system_modules(root.path()), root.path().join("lib/modules"));
     }
 }

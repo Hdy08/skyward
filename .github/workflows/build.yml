@@ -1,7 +1,9 @@
 name: Build
 
 # Every push is linted and tested, and the recovery is built for every
-# device in devices/, each image zipped. A tag starting with v publishes
+# stock-based device in devices/, each image zipped. Locally supplied
+# recovery bases are built with their device-specific instructions.
+# A tag starting with v publishes
 # those zips as a release, each shown as the phone it is for. Run by hand,
 # it can build for one device alone.
 on:
@@ -11,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       device:
-        description: The codename of the one device to build for; every device when empty
+        description: The codename of one stock-based device; all stock-based devices when empty
         required: false
         default: ""
 
@@ -97,12 +99,21 @@ jobs:
         env:
           DEVICE: ${{ inputs.device }}
         run: |
-          if [ -n "$DEVICE" ]; then
-            test -f "devices/$DEVICE.toml"
-            echo "devices=$(jq -nc --arg device "$DEVICE" '[$device]')" >> "$GITHUB_OUTPUT"
-          else
-            echo "devices=$(basename -s .toml devices/*.toml | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
-          fi
+          python3 - <<'PY'
+          import json, os, pathlib, tomllib
+          configs = {p.stem: tomllib.loads(p.read_text()) for p in pathlib.Path("devices").glob("*.toml")}
+          selected = os.environ.get("DEVICE", "")
+          if selected:
+              if selected not in configs:
+                  raise SystemExit(f"unknown device: {selected}")
+              if "stock" not in configs[selected]:
+                  raise SystemExit(f"{selected} needs a local recovery base; see docs/devices/{selected}.md")
+              devices = [selected]
+          else:
+              devices = sorted(name for name, config in configs.items() if "stock" in config)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"devices={json.dumps(devices)}\n")
+          PY
 
   recovery:
     name: Recovery for ${{ matrix.device }}
@@ -169,7 +180,7 @@ jobs:
   release:
     name: Publish the release
     if: github.ref_type == 'tag'
-    needs: [tag, check, recovery]
+    needs: [tag, check, recovery, devices]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -194,10 +205,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          DEVICES: ${{ needs.devices.outputs.devices }}
         run: |
           zips=()
-          for config in devices/*.toml; do
-            device=$(basename "$config" .toml)
+          for device in $(jq -r '.[]' <<< "$DEVICES"); do
+            config="devices/$device.toml"
             model=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["device"]["model"])' "$config")
             zip=$(ls images/skyward-"$GITHUB_REF_NAME"-"$device"-*.zip)
             zips+=("$zip#$model ($device)")

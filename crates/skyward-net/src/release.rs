@@ -8,6 +8,8 @@ use anyhow::{bail, ensure, Context, Result};
 use base64::Engine;
 use serde::Deserialize;
 
+pub mod oplus;
+
 /// The key and first block the stock updater seals its questions with,
 /// and the server its answers, when no account is signed in.
 const KEY: &[u8; 16] = b"miuiotavalided11";
@@ -34,6 +36,9 @@ pub struct Installed {
     /// ro.build.version.release.
     pub android: String,
     pub unlocked: bool,
+    /// The installed Oplus system's component and cryptography settings;
+    /// absent for Xiaomi's protocol.
+    pub oplus: Option<oplus::Installed>,
 }
 
 impl Installed {
@@ -173,6 +178,15 @@ pub fn release(answer: &str) -> Result<Option<Release>> {
     Ok(Some(Release { version: rom.version, name, urls, md5: rom.md5.to_lowercase(), size: rom.filesize, length: None }))
 }
 
+/// Resolve provider download checks before the common downloader sends a
+/// HEAD or resumes a ZIP. Xiaomi already supplies the package addresses.
+pub fn locate(agent: &ureq::Agent, server: &str, installed: &Installed, release: &Release) -> Result<Vec<String>> {
+    match &installed.oplus {
+        Some(oplus) => oplus::locate(agent, server, oplus, release),
+        None => Ok(release.urls.clone()),
+    }
+}
+
 /// How many bytes the package at `url` is, as its server says.
 pub fn length(agent: &ureq::Agent, url: &str) -> Result<u64> {
     let head = agent.head(url).call().context("ask the server about the package")?;
@@ -182,6 +196,9 @@ pub fn length(agent: &ureq::Agent, url: &str) -> Result<u64> {
 
 /// Ask `server` which system is the newest for `installed`.
 pub fn ask(agent: &ureq::Agent, server: &str, installed: &Installed) -> Result<Option<Release>> {
+    if let Some(oplus) = &installed.oplus {
+        return oplus::ask(agent, server, oplus, installed.unlocked);
+    }
     let q = seal(&installed.question());
     let mut response = agent
         .post(server)
@@ -198,7 +215,7 @@ mod tests {
     use super::*;
 
     fn thirteen_ultra() -> Installed {
-        Installed { device: "ishtar".into(), version: "OS3.0.306.0.WMACNXM".into(), android: "16".into(), unlocked: true }
+        Installed { device: "ishtar".into(), version: "OS3.0.306.0.WMACNXM".into(), android: "16".into(), unlocked: true, oplus: None }
     }
 
     #[test]

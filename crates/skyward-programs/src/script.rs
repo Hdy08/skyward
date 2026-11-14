@@ -96,6 +96,12 @@ pub fn read(text: &str) -> Result<Script> {
     let mut section = Section::None;
     for (number, words) in lines(text)? {
         let Some(first) = words.first() else { continue };
+        // Oplus leaves whole sections disabled with C++-style line
+        // comments. Init skips these as unknown keywords; they must not
+        // stop discovery of the unrelated credential services.
+        if first.starts_with("//") {
+            continue;
+        }
         match first.as_str() {
             "import" => {
                 ensure!(words.len() == 2, "line {number}: an import names one script");

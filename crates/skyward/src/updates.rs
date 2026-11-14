@@ -102,7 +102,7 @@ impl Worker {
                     let a = http::agent(servers.clone());
                     *using.lock().expect("the agent is not held by a thread that panicked") = Some(a.clone());
                     let mut answer = release::ask(&a, &server, &installed).map_err(|e| unanswered(&e, &server, &probe, &servers));
-                    if let Ok(Some(r)) = &mut answer {
+                    if let Ok(Some(r)) = &mut answer && r.length.is_none() {
                         match release::length(&a, &r.urls[0]) {
                             Ok(length) => r.length = Some(length),
                             Err(e) => {
@@ -110,12 +110,21 @@ impl Worker {
                             }
                         }
                     }
+                    match &answer {
+                        Ok(Some(r)) => {
+                            let _ = skyward_sys::kmsg(&format!("OTA query: {}, {:?} bytes", r.version, r.length));
+                        }
+                        Ok(None) => { let _ = skyward_sys::kmsg("OTA query: no update offered"); }
+                        Err(e) => { let _ = skyward_sys::kmsg(&format!("OTA query failed: {e:?}")); }
+                    }
                     tell(Event::Checked(answer));
                 }
                 // A signed address runs out a day after the server gave
                 // it: once one is turned down, the server is asked again
                 // for where the package is.
                 Task::Download { server, installed, release, path } => {
+                    let a = http::agent(servers.clone());
+                    *using.lock().expect("the agent is not held by a thread that panicked") = Some(a.clone());
                     let mut asked_again = false;
                     let mut refused = |a: &ureq::Agent| {
                         if asked_again {
@@ -123,7 +132,16 @@ impl Worker {
                         }
                         asked_again = true;
                         match release::ask(a, &server, &installed) {
-                            Ok(Some(fresh)) if fresh.md5 == release.md5 => Again::From(fresh.urls),
+                            Ok(Some(fresh)) if fresh.md5 == release.md5
+                                && fresh.length.zip(release.length).is_none_or(|(a, b)| a == b) => {
+                                match release::locate(a, &server, &installed, &fresh) {
+                                    Ok(urls) => Again::From(urls),
+                                    Err(e) => {
+                                        let _ = skyward_sys::kmsg(&format!("locating {} again: {e:#}", release.name));
+                                        Again::Retry
+                                    }
+                                }
+                            }
                             Ok(_) => Again::End(End::Failed(Failure::Changed)),
                             Err(again) => {
                                 let _ = skyward_sys::kmsg(&format!("asking where {} is: {again:#}", release.name));
@@ -131,8 +149,30 @@ impl Worker {
                             }
                         }
                     };
+                    let urls = match release::locate(&a, &server, &installed, &release) {
+                        Ok(urls) => urls,
+                        Err(e) => {
+                            let _ = skyward_sys::kmsg(&format!("locating {}: {e:#}", release.name));
+                            match refused(&a) {
+                                Again::From(urls) => urls,
+                                end => {
+                                    let end = if stopping.load(Ordering::Relaxed) { End::Stopped } else {
+                                        match end {
+                                            Again::End(end) => end,
+                                            _ => End::Failed(Failure::Other(format!("{e:#}"))),
+                                        }
+                                    };
+                                    tell(Event::Ended(end));
+                                    return;
+                                }
+                            }
+                        }
+                    };
                     let sum = Sum::Md5(release.md5.clone());
-                    let end = fetch(&servers, release.urls.clone(), &sum, &release.name, &path, &stopping, &using, &tell, &mut refused);
+                    let end = fetch(&servers, urls, &sum, &release.name, &path, &stopping, &using, &tell, &mut refused);
+                    if matches!(end, End::Downloaded) {
+                        let _ = skyward_sys::kmsg(&format!("OTA download complete: {}, MD5 verified", release.name));
+                    }
                     tell(Event::Ended(end));
                 }
                 Task::CheckSkyward { probe, codename } => {

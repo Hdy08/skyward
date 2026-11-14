@@ -5,6 +5,17 @@ use anyhow::{bail, Context, Result};
 /// the recovery's own programs are built from is the recovery copy.
 const HEADER: i32 = i32::from_be_bytes(*b"RECO");
 
+/// A locally supplied recovery may carry the system copy of libbinder.
+/// The packer records that base's mark in its property file; stock bases
+/// keep the recovery mark. All callers in a process use the same copy.
+fn header() -> i32 {
+    #[cfg(target_os = "android")]
+    if skyward_sys::prop("ro.skyward.binder.header").as_deref() == Some("SYST") {
+        return i32::from_be_bytes(*b"SYST");
+    }
+    HEADER
+}
+
 /// Strict mode gathers violations rather than acting on them; a caller with
 /// no policy of its own still sets that bit.
 const STRICT_MODE_PENALTY_GATHER: i32 = i32::MIN;
@@ -73,10 +84,14 @@ impl Parcel {
     /// A call to `interface`, opened with the header libbinder reads before
     /// it looks at anything the method itself takes.
     pub fn call(interface: &str) -> Parcel {
+        Self::call_with_header(interface, header())
+    }
+
+    fn call_with_header(interface: &str, header: i32) -> Parcel {
         let mut p = Parcel::default();
         p.i32(STRICT_MODE_PENALTY_GATHER);
         p.i32(UNSET_WORK_SOURCE);
-        p.i32(HEADER);
+        p.i32(header);
         p.string(interface);
         p
     }
@@ -315,6 +330,16 @@ mod tests {
         assert_eq!(r.i32().unwrap(), 0x5245_434f, "the recovery's mark, RECO");
         assert_eq!(r.string().unwrap(), "a.b.IC");
         assert_eq!(r.here(), p.bytes().len(), "the header is all of it");
+    }
+
+    #[test]
+    fn a_system_libbinder_base_gets_its_own_mark() {
+        let p = Parcel::call_with_header("android.hardware.weaver.IWeaver", i32::from_be_bytes(*b"SYST"));
+        let mut r = Reader::new(p.bytes());
+        assert_eq!(r.i32().unwrap(), i32::MIN);
+        assert_eq!(r.i32().unwrap(), -1);
+        assert_eq!(r.i32().unwrap(), 0x5359_5354);
+        assert_eq!(r.string().unwrap(), "android.hardware.weaver.IWeaver");
     }
 
     #[test]

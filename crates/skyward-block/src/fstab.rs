@@ -104,7 +104,19 @@ pub fn device(entry: &Entry) -> Result<String> {
 /// it, and say where. Whatever shows there already, as what an earlier run
 /// of the recovery service mounted does, is taken as it is.
 pub fn mount(name: &str) -> Result<PathBuf> {
-    let entry = partition(name)?.with_context(|| format!("the phone's own table does not mount {name}"))?;
+    mount_with_context(name, None)
+}
+
+/// Mount as the phone does, with an explicitly configured recovery-policy
+/// context. An empty context omits it; None keeps the installed fstab's.
+pub fn mount_with_context(name: &str, context: Option<&str>) -> Result<PathBuf> {
+    let mut entry = partition(name)?.with_context(|| format!("the phone's own table does not mount {name}"))?;
+    if let Some(context) = context {
+        entry.options.retain(|option| !option.starts_with("context="));
+        if !context.is_empty() {
+            entry.options.push(format!("context={context}"));
+        }
+    }
     let at = PathBuf::from(&entry.mount_point);
     if crate::mount::is_mount_point(&at)? {
         return Ok(at);

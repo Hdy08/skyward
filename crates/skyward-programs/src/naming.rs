@@ -12,6 +12,7 @@ use crate::phone::{Happens, Phone, DESCRIBING, STARTING};
 use crate::secure::{libraries_of, Started};
 use anyhow::{bail, ensure, Context, Result};
 use skyward_config::Service;
+use std::fs;
 
 /// One thing the phone's init does to name a build.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,12 @@ const SET: &str = "setprop";
 /// only where the one before it is.
 const PROGRAM_FOLLOWS: &str = "--";
 
+/// Qualcomm's init script selects which of its two credential services
+/// to enable. It is a runtime property, so reading build.prop alone would
+/// leave both services as possible candidates.
+pub const GATEKEEPER_LEVEL: &str = "vendor.gatekeeper.is_security_level_spu";
+const GATEKEEPER_SELECTOR: &str = "/vendor/bin/init.qti.keymaster.sh";
+
 /// What the phone's init does as the phone starts to name the builds its
 /// partitions describe, in the order it does it, for each build `phone` has
 /// no name of: of the first `on` section to set the property that names
@@ -56,17 +63,30 @@ pub fn steps(phone: &Phone) -> Result<Vec<Does>> {
         }
     }
     naming.sort_by_key(|(section, _)| turn(phone, *section));
-    let mut does = Vec::new();
+    let mut commands = Vec::new();
     for (section, last) in naming {
-        for command in &phone.actions[section].commands[..=last] {
-            match command.first().map(String::as_str) {
-                Some(RUN) => does.push(Does::Run(Box::new(run(phone, command)?))),
-                Some(SET) => {
-                    let [_, name, value] = &command[..] else { bail!("`{}` is not a property and its value", command.join(" ")) };
-                    does.push(Does::Set { name: name.clone(), value: value.clone() });
+        commands.extend(phone.actions[section].commands[..=last].iter().enumerate().map(|(at, _)| (section, at)));
+    }
+    if !phone.properties.contains_key(GATEKEEPER_LEVEL) {
+        for (section, action) in phone.actions.iter().enumerate().filter(|(_, a)| phone.holds(&a.triggers) == Happens::Yes) {
+            for (at, command) in action.commands.iter().enumerate() {
+                if command.first().map(String::as_str) == Some(RUN) && command.iter().any(|word| word == GATEKEEPER_SELECTOR) && !commands.contains(&(section, at)) {
+                    commands.push((section, at));
                 }
-                _ => {}
             }
+        }
+    }
+    commands.sort_by_key(|(section, at)| (turn(phone, *section), *at));
+    let mut does = Vec::new();
+    for (section, at) in commands {
+        let command = &phone.actions[section].commands[at];
+        match command.first().map(String::as_str) {
+            Some(RUN) => does.push(Does::Run(Box::new(run(phone, command)?))),
+            Some(SET) => {
+                let [_, name, value] = &command[..] else { bail!("`{}` is not a property and its value", command.join(" ")) };
+                does.push(Does::Set { name: name.clone(), value: value.clone() });
+            }
+            _ => {}
         }
     }
     Ok(does)
@@ -103,9 +123,20 @@ fn run(phone: &Phone, command: &[String]) -> Result<Started> {
         None => (&words[..0], &words[1..]),
     };
     ensure!(!program.is_empty(), "`{}` names no program", line());
+    // A vendor build of mksh resets PATH to /vendor/bin. Its toolbox may
+    // require a newer libc++ than the recovery carries, even for setprop.
+    // Use the recovery's shell and tools for these plain shell scripts.
+    let vendor_shell = phone.locate(&program[0]).and_then(|p| fs::read_to_string(p).ok()).is_some_and(|text| {
+        text.lines().next().and_then(|line| line.strip_prefix("#!")).is_some_and(|shell| shell.trim() == "/vendor/bin/sh")
+    });
+    let path = phone.started_from(&program[0]);
+    let (path, args) = match vendor_shell {
+        true => ("/system/bin/sh".to_string(), std::iter::once(path).chain(program[1..].iter().cloned()).collect()),
+        false => (path, program[1..].to_vec()),
+    };
     let service = Service {
-        path: phone.started_from(&program[0]),
-        args: program[1..].to_vec(),
+        path,
+        args,
         libraries: libraries_of(&program[0], phone.bundle.as_deref()),
         oneshot: true,
         ready_property: None,

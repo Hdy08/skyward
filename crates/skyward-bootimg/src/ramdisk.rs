@@ -1,10 +1,15 @@
 use anyhow::{bail, Context, Result};
 use cpio::{NewcBuilder, NewcReader};
+#[cfg(unix)]
 use std::ffi::{CString, OsStr};
+#[cfg(unix)]
 use std::fs;
 use std::io::{Cursor, Read, Write};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -27,9 +32,13 @@ const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 const S_IFLNK: u32 = 0o120000;
+#[cfg(unix)]
 const S_IFCHR: u32 = 0o020000;
+#[cfg(unix)]
 const S_IFBLK: u32 = 0o060000;
+#[cfg(unix)]
 const S_IFIFO: u32 = 0o010000;
+#[cfg(unix)]
 const S_IFSOCK: u32 = 0o140000;
 
 /// The permissions a stock ramdisk gives its links, such as the commands
@@ -122,6 +131,7 @@ impl Ramdisk {
     /// everything in it is in. Where a file is already there, the entry is
     /// made anew, where the kernel writes over it, so that a program
     /// running from that file is left alone.
+    #[cfg(unix)]
     pub fn unpack(&self, root: &Path) -> Result<()> {
         for e in &self.entries {
             let path = root.join(&e.name);
@@ -192,11 +202,13 @@ fn root_entry(name: &str, mode: u32, data: Vec<u8>) -> Entry {
     Entry { name: name.to_string(), mode, uid: 0, gid: 0, mtime: 0, nlink, dev: (0, 0), rdev: (0, 0), data }
 }
 
+#[cfg(unix)]
 fn c_path(path: &Path) -> Result<CString> {
     CString::new(path.as_os_str().as_bytes()).context("a NUL in the path")
 }
 
 /// One entry of [`Ramdisk::unpack`] at `path`.
+#[cfg(unix)]
 fn unpack(e: &Entry, path: &Path) -> Result<()> {
     let kind = e.mode & S_IFMT;
     let mode = e.mode & 0o7777;
@@ -243,6 +255,7 @@ fn unpack(e: &Entry, path: &Path) -> Result<()> {
 
 /// Give `path` itself, a link or not, `mtime` as the time it was last
 /// changed and read.
+#[cfg(unix)]
 fn set_time(path: &Path, mtime: u32) -> Result<()> {
     let at = libc::timespec { tv_sec: mtime as libc::time_t, tv_nsec: 0 };
     let times = [at, at];
@@ -372,12 +385,14 @@ mod tests {
     }
 
     /// An entry owned by whoever runs the tests, who can give it that owner.
+    #[cfg(unix)]
     fn mine(name: &str, mode: u32, data: &[u8]) -> Entry {
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         Entry { name: name.into(), mode, uid, gid, mtime: 1_500_000_000, nlink: 1, dev: (0, 0), rdev: (0, 0), data: data.to_vec() }
     }
 
     #[test]
+    #[cfg(unix)]
     fn unpacking_over_an_archive_unpacked_before_follows_the_kernel() {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let dir = tempfile::tempdir().unwrap();
@@ -421,6 +436,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_folder_with_files_in_it_keeps_its_place() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("lib")).unwrap();

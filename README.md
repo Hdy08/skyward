@@ -92,6 +92,20 @@ read and set properties.
 | Xiaomi 17 Ultra | `nezha` | OS4.0.4.0.XPACNXM (Android 17) |
 | Xiaomi 13 Ultra | `ishtar` | OS3.0.308.0.WMACNXM (Android 16) |
 
+OnePlus 13 (`dodge`) has an experimental local port using a pinned OrangeFox
+base. On `PJZ110_16.0.5.703(CN01)` (Android 16), Skyward has booted with working
+display and touch, and the owner has decrypted Data and browsed internal
+storage. A fresh boot of the integrated image also passed display, touch,
+vibration and Data decryption checks. MTP upload and download passed a hash
+comparison while ADB remained connected. The owner also verified boot partition
+backup and restoration, and kernel flashing, with no issues reported.
+WLAN scanning, connection, DHCP and
+internet access have also passed device checks. OnePlus OTA discovery uses
+the installed updater's component protocol. Official full packages use the
+existing download, resume, digest verification and A/B install flow, with
+the installed system's product identity and OTA certificates. See the
+[OnePlus 13 build and testing notes](docs/devices/dodge.md).
+
 ### 🚧 Under construction
 
 These images are built from each phone's stock firmware and have not been tried

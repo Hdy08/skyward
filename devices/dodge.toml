@@ -1,0 +1,92 @@
+[device]
+codename = "dodge"
+brand = "OnePlus"
+model = "OnePlus 13"
+ab = true
+soc = { hans = "骁龙®8至尊版移动平台", hant = "Snapdragon® 8 Elite 行動平台", en = "Snapdragon® 8 Elite Mobile Platform" }
+os_version_prop = "ro.build.display.id"
+
+[display]
+width = 1440
+height = 3168
+density = 560
+diagonal = 6.82
+
+# The user's data-decrypting OrangeFox-R11.3-dodge.img. This is a local
+# donor, not a stock OTA: never substitute another image without auditing
+# its init rules and testing it. 100 MiB, boot header v4, no kernel.
+[recovery]
+format = "orangefox"
+sha256 = "0c3f2fa01bf53f648ceb13e2ad19f7b9e10b68ca61f10cafbad10f1cd835afce"
+# Android 16's vendor programs use libc++ symbols absent from the base.
+# Binder remains the base's library and keeps its SYST header.
+libraries = ["/vendor/lib64/libc++.so"]
+# The old donor omits the current online_OTA certificate. The installed
+# system's trust store supplies update_engine's keys, without private keys.
+ota_certificates = "/mnt/my_engineering/etc/security/otacerts.zip"
+
+[modules]
+sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
+# The variant driver names come from the verified donor's recovery
+# executable (TW_LOAD_VENDOR_MODULES). Dependencies come from modules.dep.
+# A driver not shipped by the installed build or not matching this panel
+# must not prevent the remaining drivers and secure services from starting.
+optional = [
+    "oplus_bsp_synaptics_tcm2", "oplus_bsp_tp_common", "oplus_bsp_tp_custom",
+    "oplus_bsp_tp_focal_common", "oplus_bsp_tp_ft3518", "oplus_bsp_tp_ft3658u_spi",
+    "oplus_bsp_tp_ft3681", "oplus_bsp_tp_ft3683g", "oplus_bsp_tp_ft8057p",
+    "oplus_bsp_tp_goodix_comnon", "oplus_bsp_tp_gt9916", "oplus_bsp_tp_gt9966",
+    "oplus_bsp_tp_ilitek7807s", "oplus_bsp_tp_ilitek_common", "oplus_bsp_tp_notify",
+    "oplus_bsp_tp_novatek_common", "oplus_bsp_tp_nt36528_noflash",
+    "oplus_bsp_tp_nt36532_noflash", "oplus_bsp_tp_nt36672c_noflash",
+    "oplus_bsp_tp_syna_common", "oplus_bsp_tp_tcm_S3908", "oplus_bsp_tp_tcm_S3910",
+    "oplus_bsp_tp_td4377_noflash", "stm_st54se_gpio", "nxp-nci",
+    "q6_pdr_dlkm", "q6_notifier_dlkm", "snd_event_dlkm", "gpr_dlkm",
+    "spf_core_dlkm", "adsp_loader_dlkm", "oplus_chg_v2",
+]
+
+# As on the donor, expose modem firmware for ueventd and secure-world
+# loaders. Its installed fstab supplies the mount location and slot.
+[firmware]
+partition = "modem"
+# The verified donor mounts it without a context. The installed system's
+# firmware_file type is absent from this recovery's older SELinux policy.
+context = ""
+
+# The installed fstab mounts persist here for QSEE's secure storage.
+[partitions]
+mounted = ["persist"]
+
+# qcom-hv-haptics accepts custom FIFO samples through /dev/input. Its
+# lra_frequency_hz reports 0 before vendor calibration is restored and is
+# in whole hertz, unlike Xiaomi. Use the live driver period instead.
+[haptics]
+resonance = "/sys/class/qcom-haptics/t_lra_us"
+resonance_unit = "period-us"
+strength = { lightest = 0.4, strongest = 0.8 }
+
+[backup]
+efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
+data_skipped = ["vendor/tzstorage", "vendor/qtee", "vendor/fingerprint", "vendor/fpc", "vendor/goodix"]
+
+# Qualcomm Peach 2.0 (PCI device 0x110e), with modem firmware exposed at
+# /firmware/image. The factory NetworkStack overlay supplies the probe.
+[wlan]
+# Run the one-time calibration while the owner opens Data or the menus.
+# This leaves wlan0 down and does not start a supplicant or join a network.
+prepare_on_boot = true
+modules = ["rfkill", "qca_cld3_peach_v2"]
+writes = [{ path = "/sys/kernel/cnss/fs_ready", value = "1" }]
+firmware = [
+    { name = "wlan/qca_cld/peach_v2/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/peach_v2/WCNSS_qcom_cfg.ini" },
+]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/system/lib64", "/vendor/lib64"]
+service = "android.hardware.wifi.supplicant.ISupplicant/default"
+probe = "http://conn-service-cn-05.allawntech.com/generate204"
+
+[update]
+provider = "oplus"
+server = "https://component-ota-cn.allawntech.com/update/v6"
+features = "/mnt/my_stock/etc/extension/com.oplus.app-features.xml"

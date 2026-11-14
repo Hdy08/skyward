@@ -7,7 +7,7 @@
 use crate::image::{self, ImageKind};
 use crate::Refusal;
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use zip::{CompressionMethod, ZipArchive};
 
@@ -44,9 +44,12 @@ pub struct Update {
 }
 
 impl Update {
-    /// The version the package installs, as its build names it.
+    /// The version the package installs. Oplus packages carry their public
+    /// release name beside the internal build increment; use that name on
+    /// the confirmation and progress pages, including for offline files.
     pub fn version(&self) -> Option<&str> {
-        self.metadata.get("post-build-incremental")
+        ["version_name_show", "version_name", "post-build-incremental"]
+            .into_iter().find_map(|key| self.metadata.get(key))
     }
 
     /// Whether the system it installs needs all user data erased before it
@@ -128,6 +131,24 @@ pub struct Phone {
     /// ro.serialno
     pub serial: String,
     pub installed: Option<Build>,
+}
+
+impl Phone {
+    /// Prefer the installed system's canonical product name: a custom
+    /// recovery may use a different board codename (dodge / OP5D0DL1).
+    /// Without an installed system, retain recovery's product identity.
+    pub fn from_system(props: &HashMap<String, String>, recovery_device: Option<&str>, serial: String) -> Result<Self> {
+        let device = props.get("ro.product.device").map(String::as_str).filter(|s| !s.is_empty())
+            .or(recovery_device.filter(|s| !s.is_empty())).context("ro.product.device is unset")?.to_owned();
+        let installed = match (props.get("ro.build.date.utc"), props.get("ro.build.version.security_patch")) {
+            (Some(time), Some(patch)) => Some(Build {
+                timestamp: time.parse().with_context(|| format!("ro.build.date.utc {time:?}"))?,
+                security_patch: patch.clone(),
+            }),
+            _ => None,
+        };
+        Ok(Self { device, serial, installed })
+    }
 }
 
 /// The installed system, from its build.prop files.
@@ -231,6 +252,42 @@ METADATA_SIZE=1024
     #[test]
     fn a_full_package_for_this_phone_is_accepted() {
         assert_eq!(check(&update_with(METADATA_TEXT, PROPERTIES_TEXT), &phone()), Ok(()));
+    }
+
+    #[test]
+    fn an_oplus_package_names_its_public_release_before_its_internal_build() {
+        let base = "ota-type=AB\npre-device=OP5D0DL1\npost-build-incremental=V.3205195-ced00f-d0523d\n";
+        let named = format!("{base}version_name=PJZ110_16.0.10.501(CN01)\nversion_name_show=PJZ110_16.0.10.501(CN01)\n");
+        let zip = zip_with(&[
+            (PAYLOAD, b"payload", CompressionMethod::Stored),
+            (PROPERTIES, PROPERTIES_TEXT.as_bytes(), CompressionMethod::Stored),
+            (METADATA, named.as_bytes(), CompressionMethod::Stored),
+        ]);
+        let Package::Update(update) = identify(Cursor::new(zip)).unwrap() else { panic!("an update") };
+        assert_eq!(update.version(), Some("PJZ110_16.0.10.501(CN01)"));
+        assert_eq!(update.metadata.get("post-build-incremental"), Some("V.3205195-ced00f-d0523d"));
+        assert_eq!(update_with(&format!("{base}version_name=public\nversion_name_show=shown\n"), "").version(), Some("shown"));
+        assert_eq!(update_with(&format!("{base}version_name=public\nversion_name_show=  \n"), "").version(), Some("public"));
+        assert_eq!(update_with(&format!("{base}version_name=\nversion_name_show=\n"), "").version(), Some("V.3205195-ced00f-d0523d"));
+        assert_eq!(update_with("", "").version(), None);
+    }
+
+    #[test]
+    fn a_custom_recovery_codename_uses_the_installed_systems_ota_identity() {
+        let props = HashMap::from([
+            ("ro.product.device".into(), "OP5D0DL1".into()),
+            ("ro.build.date.utc".into(), "1775794505".into()),
+            ("ro.build.version.security_patch".into(), "2026-03-01".into()),
+        ]);
+        let phone = Phone::from_system(&props, Some("dodge"), String::new()).unwrap();
+        let metadata = "ota-type=AB\npre-device=OP5D0DL1\npost-timestamp=1785725462\npost-security-patch-level=2026-08-01\n";
+        assert_eq!(check(&update_with(metadata, PROPERTIES_TEXT), &phone), Ok(()));
+        assert_eq!(check(&update_with(&metadata.replace("OP5D0DL1", "OP5D2"), PROPERTIES_TEXT), &phone),
+            Err(Refusal::OtherDevice("OP5D2".into())));
+        let bare = Phone::from_system(&HashMap::new(), Some("dodge"), String::new()).unwrap();
+        assert_eq!(bare.device, "dodge");
+        assert_eq!(check(&update_with(metadata, PROPERTIES_TEXT), &bare), Err(Refusal::OtherDevice("OP5D0DL1".into())));
+        assert!(Phone::from_system(&HashMap::new(), None, String::new()).is_err());
     }
 
     #[test]

@@ -104,6 +104,45 @@ mod tests {
     }
 
     #[test]
+    fn a_oneplus_full_package_uses_the_existing_download_resume_and_install_flow() {
+        let f = fonts();
+        let i = info();
+        let mut app = App::new(Screen::Update, W, H, PPD);
+        app.state.update_server = true;
+        app.state.data = Data::Open;
+        app.set_wlan(connected("Skyward"));
+        let release = Release {
+            version: "PJZ110_16.0.10.501(CN01)".into(),
+            name: "PJZ110_11.C.93_1930_202608031342_all.zip".into(),
+            urls: vec!["https://component-ota-cn.allawntech.com/downloadCheck?test=manual".into()],
+            md5: "6bd2956979795c267a062462ad7fc50f".into(),
+            size: "8.36G".into(), length: Some(8_975_091_784),
+        };
+        app.update_checked(Ok(Some(release.clone())), Have::Nothing);
+        assert_eq!(tap(&mut app, &f, &i, Action::Download), vec![Effect::Download(release.clone())]);
+        assert_eq!(tap(&mut app, &f, &i, Action::StopDownload), vec![Effect::StopDownload]);
+        app.download_ended(DownloadEnd::Stopped, Have::Part(1024), 1000);
+        assert_eq!(tap_at(&mut app, &f, &i, Action::Download, 3000), vec![Effect::Download(release.clone())]);
+        app.download_ended(DownloadEnd::Downloaded, Have::Whole(8_975_091_784), 4000);
+        assert_eq!(tap_at(&mut app, &f, &i, Action::InstallDownloaded, 6000),
+            vec![Effect::InstallFile(Place::Storage, format!("downloaded_rom/{}", release.name))]);
+        assert_eq!(app.screen(), Screen::Installing);
+        // Use the signed package's public version even when installation
+        // is opened offline, without borrowing the latest queried name.
+        let package = skyward_install::package::Update {
+            payload_offset: 61, payload_size: 8_975_086_380, properties: String::new(),
+            metadata: skyward_install::package::Metadata::parse(
+                "post-build-incremental=V.3205195-ced00f-d0523d\nversion_name_show=PJZ110_16.0.10.501(CN01)\n"),
+        };
+        app.state.check = Check::Idle;
+        let version = package.version().map(str::to_owned);
+        app.install(skyward_install::Event::Ready { version: version.clone(), wipe: false }, 7000);
+        assert_eq!(app.state.install, Install::Confirming { version: Some(release.version.clone()), wipe: false });
+        app.install(skyward_install::Event::Installing { version }, 8000);
+        assert!(matches!(&app.state.install, Install::Updating { version: Some(v), .. } if *v == release.version));
+    }
+
+    #[test]
     fn the_update_page_asks_for_the_newest_system_and_downloads_its_full_package_to_install() {
         let f = fonts();
         let i = DeviceInfo { os_version: Some("OS3.0.308.0.WMACNXM".into()), ..info() };

@@ -240,7 +240,10 @@ pub fn installed_props(slot: Slot) -> Result<HashMap<String, String>> {
         let files: &[&str] = match base(m).as_str() {
             "system" => &["system/build.prop"],
             "vendor" => &["default.prop", "build.prop"],
-            _ => &["etc/build.prop"],
+            // OnePlus' my_manifest and other extension partitions keep
+            // build.prop at their root. Standard partitions often link
+            // that path to etc/build.prop; reading it twice is harmless.
+            _ => &["build.prop", "etc/build.prop"],
         };
         for f in files {
             let path = m.mount_point.join(f);

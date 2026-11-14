@@ -84,6 +84,32 @@ pub struct DeviceConfig {
     /// The stock build the recovery is made on.
     #[serde(default)]
     pub stock: Option<Stock>,
+    /// A locally supplied custom recovery used as the ramdisk base.
+    /// These images need their own init compatibility handling.
+    #[serde(default)]
+    pub recovery: Option<RecoveryBase>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RecoveryBase {
+    pub format: RecoveryFormat,
+    /// SHA-256 of the complete, unmodified donor partition image.
+    pub sha256: String,
+    /// Installed libraries needed by newer vendor programs when the
+    /// locally supplied base carries an older runtime. Copied atomically
+    /// into the recovery's library directory before starting its HALs.
+    #[serde(default)]
+    pub libraries: Vec<String>,
+    /// The installed system's OTA trust store, copied into RAM for the
+    /// base's update_engine when its bundled certificates are older.
+    #[serde(default)]
+    pub ota_certificates: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecoveryFormat {
+    Orangefox,
 }
 
 /// The stock build a recovery is made on: the phone maker's full update
@@ -104,6 +130,11 @@ pub struct Stock {
 /// wpa_supplicant, which joins networks.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Wlan {
+    /// Prepare the driver on the WLAN thread at startup, keeping the
+    /// interface down until the user enables it. Useful for chipsets whose
+    /// first probe performs a long calibration. Other devices stay lazy.
+    #[serde(default)]
+    pub prepare_on_boot: bool,
     /// The driver's kernel modules; what they depend on loads first.
     pub modules: Vec<String>,
     /// What is written once they are in, each value to its file, such as
@@ -147,6 +178,10 @@ pub struct Write {
 pub struct FirmwarePartition {
     /// The partition's name, without the slot it is of.
     pub partition: String,
+    /// Override the installed fstab's SELinux mount context for a recovery
+    /// with an older policy. An empty string omits that mount option.
+    #[serde(default)]
+    pub context: Option<String>,
 }
 
 /// A file a driver asks the firmware loader for, and where it is.
@@ -169,6 +204,20 @@ pub struct Firmware {
 pub struct Update {
     /// Where the questions are sent.
     pub server: String,
+    #[serde(default)]
+    pub provider: UpdateProvider,
+    /// The installed system's app features, containing the OTA public key
+    /// and its version. Required by Oplus, read afresh for each query.
+    #[serde(default)]
+    pub features: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateProvider {
+    #[default]
+    Xiaomi,
+    Oplus,
 }
 
 /// What a backup takes in and leaves out beyond what every Android phone
@@ -211,10 +260,34 @@ pub struct Haptics {
     /// driver plays the waveforms it keeps.
     #[serde(default)]
     pub click: Option<i16>,
-    /// The file the driver says the motor's resonant frequency in, in
-    /// tenths of a hertz whatever its label.
+    /// The file the driver says the motor's resonance in.
     pub resonance: String,
+    /// How the driver measures resonance. Existing Xiaomi drivers report
+    /// tenths of a hertz; OnePlus also exposes the period in microseconds.
+    #[serde(default)]
+    pub resonance_unit: ResonanceUnit,
     pub strength: Strength,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResonanceUnit {
+    #[default]
+    TenthsHz,
+    Hz,
+    PeriodUs,
+}
+
+impl ResonanceUnit {
+    /// A nonzero reading as hertz. Zero is an absent calibration, not a
+    /// frequency from which a waveform can be made.
+    pub fn hertz(self, reading: u32) -> Option<f32> {
+        (reading != 0).then(|| match self {
+            Self::TenthsHz => reading as f32 / 10.0,
+            Self::Hz => reading as f32,
+            Self::PeriodUs => 1_000_000.0 / reading as f32,
+        })
+    }
 }
 
 /// How strongly the click plays, each as a share of the most its waveform
@@ -300,11 +373,15 @@ pub struct Modules {
     /// source's modules.dep and load first.
     #[serde(default)]
     pub load: Vec<String>,
+    /// Drivers for hardware variants. Missing modules and probe failures
+    /// are logged without preventing other variants or key services.
+    #[serde(default)]
+    pub optional: Vec<String>,
 }
 
 impl Default for Modules {
     fn default() -> Self {
-        Self { sources: default_module_sources(), load: Vec::new() }
+        Self { sources: default_module_sources(), load: Vec::new(), optional: Vec::new() }
     }
 }
 
@@ -498,11 +575,26 @@ impl DeviceConfig {
 
     pub fn parse(text: &str) -> Result<Self> {
         let cfg: DeviceConfig = toml::from_str(text).context("parse device config")?;
+        if let Some(base) = &cfg.recovery {
+            ensure!(cfg.stock.is_none(), "a device names either [stock] or [recovery], not both");
+            ensure!(
+                base.sha256.len() == 64 && base.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "[recovery] sha256: {} is not a SHA-256 in lowercase hex",
+                base.sha256
+            );
+        }
+        if let Some(update) = &cfg.update
+            && update.provider == UpdateProvider::Oplus
+        {
+            ensure!(update.server.starts_with("https://") && update.server.ends_with("/update/v6"), "[update] Oplus needs an HTTPS /update/v6 server");
+            let features = update.features.as_deref().unwrap_or("");
+            ensure!(features.starts_with('/') && !features.split('/').any(|p| p == ".."), "[update] Oplus needs an absolute installed app features path");
+        }
         for log in &cfg.wipe.logs {
             let path = Path::new(log);
             let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
             ensure!(
-                path.is_absolute() && plain && path.starts_with(DATA) && path != Path::new(DATA),
+                log.starts_with('/') && plain && path.starts_with(DATA) && path != Path::new(DATA),
                 "[wipe] logs: {log} is not a folder inside {DATA}"
             );
         }
@@ -540,19 +632,25 @@ impl DeviceConfig {
         }
         if let Some(haptics) = &cfg.haptics {
             let file = &haptics.resonance;
-            ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
+            ensure!(file.starts_with('/'), "[haptics] resonance: {file} is not an absolute path");
             let Strength { lightest, strongest } = haptics.strength;
             ensure!(
                 0.0 < lightest && lightest < strongest && strongest <= 1.0,
                 "[haptics] strength: {lightest} and {strongest} are not shares rising from above 0 to at most 1"
             );
         }
-        if let Some(logd) = &cfg.logd {
-            for library in &logd.libraries {
+        // These are paths on the Android device, including when the packer
+        // runs on Windows, where a leading slash has no drive letter.
+        for (section, libraries) in cfg.logd.iter().map(|l| ("logd", &l.libraries)).chain(cfg.recovery.iter().map(|r| ("recovery", &r.libraries))) {
+            for library in libraries {
                 let path = Path::new(library);
                 let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
-                ensure!(path.is_absolute() && plain && path.file_name().is_some(), "[logd] libraries: {library} is not an absolute path to a file");
+                ensure!(library.starts_with('/') && plain && path.file_name().is_some(), "[{section}] libraries: {library} is not an absolute path to a file");
             }
+        }
+        if let Some(path) = cfg.recovery.as_ref().and_then(|r| r.ota_certificates.as_ref()) {
+            ensure!(path.starts_with("/mnt/") && !path.split('/').any(|p| p == "..") && path.ends_with("/otacerts.zip"),
+                "[recovery] ota_certificates must name otacerts.zip on a mounted system partition");
         }
         for owners in &cfg.owners {
             for name in [&owners.user, &owners.group] {
@@ -563,7 +661,7 @@ impl DeviceConfig {
             for file in &owners.paths {
                 let path = Path::new(file);
                 let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
-                ensure!(path.is_absolute() && plain && path.file_name().is_some(), "[[owners]] paths: {file} is not an absolute path to a file");
+                ensure!(file.starts_with('/') && plain && path.file_name().is_some(), "[[owners]] paths: {file} is not an absolute path to a file");
             }
         }
         if let Some(stock) = &cfg.stock {
@@ -596,7 +694,7 @@ impl DeviceConfig {
                         );
                         ensure!(plain && !file.path.is_empty(), "[wlan] firmware: {} is not a path from the top of {partition}", file.path);
                     }
-                    None => ensure!(path.is_absolute(), "[wlan] firmware: {} is not an absolute path", file.path),
+                    None => ensure!(file.path.starts_with('/'), "[wlan] firmware: {} is not an absolute path", file.path),
                 }
             }
         }
@@ -629,6 +727,39 @@ mod tests {
     }
 
     #[test]
+    fn dodge_pins_a_local_recovery_base_and_allows_panel_variants() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/dodge.toml")).unwrap();
+        assert_eq!((cfg.device.codename.as_str(), cfg.device.brand.as_str()), ("dodge", "OnePlus"));
+        assert_eq!((cfg.display.width, cfg.display.height), (1440, 3168));
+        let recovery = cfg.recovery.unwrap();
+        assert_eq!(recovery.format, RecoveryFormat::Orangefox);
+        assert_eq!(recovery.libraries, ["/vendor/lib64/libc++.so"]);
+        assert_eq!(recovery.ota_certificates.as_deref(), Some("/mnt/my_engineering/etc/security/otacerts.zip"));
+        assert!(cfg.stock.is_none());
+        assert!(cfg.modules.load.is_empty());
+        assert!(cfg.modules.optional.iter().any(|name| name == "oplus_bsp_tp_tcm_S3910"));
+        let wlan = cfg.wlan.unwrap();
+        assert!(wlan.prepare_on_boot, "dodge prepares its long first calibration before WLAN is enabled");
+        assert_eq!(wlan.modules, ["rfkill", "qca_cld3_peach_v2"]);
+        assert_eq!(wlan.probe, "http://conn-service-cn-05.allawntech.com/generate204");
+        let update = cfg.update.expect("OnePlus' OTA query provider is configured");
+        assert_eq!(update.provider, UpdateProvider::Oplus);
+        assert_eq!(update.server, "https://component-ota-cn.allawntech.com/update/v6");
+        let haptics = cfg.haptics.unwrap();
+        assert_eq!(haptics.resonance, "/sys/class/qcom-haptics/t_lra_us");
+        assert_eq!(haptics.resonance_unit, ResonanceUnit::PeriodUs);
+    }
+
+    #[test]
+    fn a_local_recovery_requires_a_complete_lowercase_hash() {
+        let config = "[device]\ncodename='dodge'\n[recovery]\nformat='orangefox'\n";
+        for hash in ["", "abcd", &"A".repeat(64), &"g".repeat(64)] {
+            assert!(DeviceConfig::parse(&format!("{config}sha256='{hash}'\n")).is_err());
+        }
+        assert!(DeviceConfig::parse(&format!("{config}sha256='{}'\n", "a".repeat(64))).is_ok());
+    }
+
+    #[test]
     fn nezha_gives_its_logd_the_libraries_its_recovery_leaves_out() {
         let cfg = DeviceConfig::parse(include_str!("../../../devices/nezha.toml")).unwrap();
         let logd = cfg.logd.expect("the 17 Ultra's recovery leaves out what its logd loads");
@@ -657,6 +788,18 @@ mod tests {
         for (lightest, strongest) in [(0.0, 0.5), (0.5, 0.5), (0.5, 0.25), (0.25, 1.5)] {
             let s = format!("{resonance}\nstrength = {{ lightest = {lightest:?}, strongest = {strongest:?} }}");
             assert!(with(&s).is_err(), "{lightest} to {strongest} is refused");
+        }
+    }
+
+    #[test]
+    fn resonance_readings_keep_the_driver_units() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
+        assert_eq!(cfg.haptics.unwrap().resonance_unit, ResonanceUnit::TenthsHz);
+        assert_eq!(ResonanceUnit::TenthsHz.hertz(1724), Some(172.4));
+        assert_eq!(ResonanceUnit::Hz.hertz(133), Some(133.0));
+        assert!((ResonanceUnit::PeriodUs.hertz(7692).unwrap() - 130.0052).abs() < 0.001);
+        for unit in [ResonanceUnit::TenthsHz, ResonanceUnit::Hz, ResonanceUnit::PeriodUs] {
+            assert_eq!(unit.hertz(0), None);
         }
     }
 
@@ -699,7 +842,7 @@ mod tests {
             [Write { path: "/sys/class/touch/touch_dev/enable_touch_raw".into(), value: "0".into() }],
             "its controller reports positions itself"
         );
-        assert_eq!(cfg.firmware, Some(FirmwarePartition { partition: "modem".into() }));
+        assert_eq!(cfg.firmware, Some(FirmwarePartition { partition: "modem".into(), context: None }));
         assert_eq!(cfg.partitions.mounted, ["persist"], "the secure world keeps its own files there");
         let [post_boot] = &cfg.services[..] else { panic!("one program: those that use the phone's keys are read from the phone's own partitions") };
         assert_eq!(post_boot.path, "/vendor/bin/sh");
@@ -891,6 +1034,7 @@ mod tests {
     fn ishtar_brings_its_wlan_up_from_its_own_partitions() {
         let cfg = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
         let wlan = cfg.wlan.expect("the 13 Ultra's WLAN is described");
+        assert!(!wlan.prepare_on_boot, "existing devices keep preparing their driver on demand");
         assert_eq!(wlan.modules, ["qca_cld3_kiwi_v2"]);
         assert_eq!(wlan.writes, [Write { path: "/sys/kernel/cnss/fs_ready".into(), value: "1".into() }]);
         assert_eq!(wlan.firmware[0].partition, None);

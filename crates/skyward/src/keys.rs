@@ -49,7 +49,10 @@ pub fn found(slot: skyward_vab::Slot, libraries: Option<&Path>) -> Result<Found>
 /// phone's init sets them, and the installed build's. `libraries` is as
 /// [`found`] takes it.
 fn read(slot: skyward_vab::Slot, libraries: Option<&Path>) -> Result<Phone> {
-    let properties = skyward_info::installed_props(slot)?;
+    let mut properties = skyward_info::installed_props(slot)?;
+    if let Some(value) = skyward_sys::prop(naming::GATEKEEPER_LEVEL) {
+        properties.insert(naming::GATEKEEPER_LEVEL.to_string(), value);
+    }
     let mounted = skyward_vab::mounted_partitions(slot)?;
     let mut partitions = Vec::new();
     for name in PARTITIONS {

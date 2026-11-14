@@ -51,9 +51,12 @@ enum Through {
 /// longer endings first: Thales' and NXP's go through Android's secure
 /// element service, and Goodix's, whose program is named after no maker,
 /// through Goodix's own.
-const WEAVERS: [(&str, Through); 3] = [
+const WEAVERS: [(&str, Through); 4] = [
     (".thales", Through::ElementService),
     (".nxp-qti", Through::ElementService),
+    // OnePlus/Oplus' NXP implementation uses the same Android OMAPI
+    // transport, without the -qti suffix used on Xiaomi.
+    (".nxp", Through::ElementService),
     ("weaver-service", Through::Own("vendor.goodix.hardware.secure_element_aidl.IGdxEse")),
 ];
 

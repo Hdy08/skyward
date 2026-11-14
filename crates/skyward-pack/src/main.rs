@@ -7,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 mod avb;
+mod base;
 mod described;
 
 use skyward_bootimg::{BootImage, Ramdisk};
@@ -44,9 +45,9 @@ enum Cmd {
     /// service becomes Skyward. The image fills the whole partition and ends
     /// in an unsigned AVB footer of its own.
     Recovery {
-        /// The device's stock recovery image: the whole partition, as the
-        /// phone or a full update package holds it, ending in its AVB footer.
-        #[arg(long)]
+        /// The whole recovery partition, ending in its AVB footer. A
+        /// custom base must be explicitly pinned in [recovery].
+        #[arg(long, alias = "base")]
         stock: PathBuf,
         /// Skyward built for the device (aarch64-linux-android).
         #[arg(long)]
@@ -126,16 +127,14 @@ fn main() -> Result<()> {
             write(&out, &img, &img.to_bytes()?)
         }
         Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, out } => {
+            let cfg = skyward_config::DeviceConfig::load(&config)?;
             let size = partition_size(&stock)?;
-            let mut img = BootImage::read(&stock)?;
+            let base_bytes = std::fs::read(&stock).with_context(|| format!("read {}", stock.display()))?;
+            base::verify(&cfg, &base_bytes)?;
+            let mut img = BootImage::parse(&base_bytes)?;
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
-            // A stock recovery ramdisk has no third-party tree; refuse to build
-            // on top of another custom recovery.
-            if let Some(e) = rd.entries.iter().find(|e| e.name == "FFiles" || e.name.starts_with("twres")) {
-                anyhow::bail!("{} holds {}, which is not a stock recovery", stock.display(), e.name);
-            }
+            base::prepare(&cfg, &img, &mut rd)?;
             let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
-            skyward_config::DeviceConfig::load(&config)?;
             rd.replace(paths::RECOVERY, read(&binary)?)?;
             // Install scripts look for the commands a stock recovery lacks
             // among its programs, and its unzip there too, a link to ziptool

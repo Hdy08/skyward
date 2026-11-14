@@ -29,7 +29,7 @@ use skyward_files::Ownership;
 use skyward_block::usb::{self, Drive};
 use skyward_net::download::{self, Failure};
 use skyward_net::http::Servers;
-use skyward_net::release::{Installed, Release, Unanswered};
+use skyward_net::release::{self, Installed, Release, Unanswered};
 use skyward_net::wlan::{Power as WlanPower, Stage as Joining, Wlan};
 use skyward_sys::sleep::{Sleeper, Slept};
 use skyward_sys::uevent;
@@ -137,10 +137,11 @@ impl Backlight {
 /// their factory tests drive the panel to, on the backlight's own scale:
 /// the 13 Ultra's panels give that level as well, and it comes to the same
 /// half of their range as the normal maximum they give.
-const NORMAL_MAX: [(&str, &str); 3] = [
+const NORMAL_MAX: [(&str, &str); 4] = [
     ("mi,normal-max-brightness-clone", "mi,max-brightness-clone"),
     ("mi,max-brightness-normal", "qcom,mdss-dsi-bl-max-level"),
     ("mi,mdss-dsi-fac-bl-max-level", "qcom,mdss-dsi-bl-max-level"),
+    ("oplus,dsi-brightness-normal-max-level", "qcom,mdss-dsi-bl-max-level"),
 ];
 
 /// The raw backlight level, out of `max`, at the panel's normal maximum.
@@ -1026,11 +1027,20 @@ fn installed(cfg: &DeviceConfig, info: &skyward_info::DeviceInfo) -> Result<Inst
     let slot = info.slot.context("only an A/B phone is updated")?;
     let props = skyward_info::installed_props(slot)?;
     let prop = |name: &str| props.get(name).cloned().with_context(|| format!("the installed system says no {name}"));
+    let update = cfg.update.as_ref().context("no update server is configured")?;
+    let oplus = if update.provider == skyward_config::UpdateProvider::Oplus {
+        let path = update.features.as_deref().context("the Oplus update provider needs its installed app features")?;
+        let features = fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+        Some(release::oplus::Installed::from_system(props.clone(), &features, &update.server)?)
+    } else {
+        None
+    };
     Ok(Installed {
-        device: prop("ro.product.mod_device")?,
+        device: prop(if oplus.is_some() { "ro.product.name" } else { "ro.product.mod_device" })?,
         version: prop(&cfg.device.os_version_prop)?,
         android: prop("ro.build.version.release")?,
         unlocked: skyward_block::boot_param("androidboot.flash.locked")?.as_deref() == Some("0"),
+        oplus,
     })
 }
 
