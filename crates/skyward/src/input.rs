@@ -189,12 +189,13 @@ pub struct Inputs {
     seen: HashSet<PathBuf>,
     /// What the touchscreen is told each time its panel is taken in.
     touch_writes: Vec<Write>,
+    touch_name: Option<String>,
     w: f32,
     h: f32,
 }
 
 impl Inputs {
-    pub fn open(w: u32, h: u32, touch_writes: Vec<Write>) -> Result<Self> {
+    pub fn open(w: u32, h: u32, touch_writes: Vec<Write>, touch_name: Option<String>) -> Result<Self> {
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error()).context("create inotify instance");
@@ -215,6 +216,7 @@ impl Inputs {
             buttons: Vec::new(),
             seen: HashSet::new(),
             touch_writes,
+            touch_name,
             w: w as f32,
             h: h as f32,
         };
@@ -240,7 +242,7 @@ impl Inputs {
                 .is_some_and(|a| a.contains(AbsoluteAxisCode::ABS_MT_POSITION_X) && a.contains(AbsoluteAxisCode::ABS_MT_POSITION_Y));
             let keys = dev.supported_keys().is_some_and(|k| KEYS.iter().any(|c| k.contains(*c)));
             eprintln!("input {}: {:?} direct={direct} multitouch={mt} keys={keys}", path.display(), dev.name().unwrap_or("?"));
-            if direct && mt && self.panel.is_none() {
+            if direct && mt && self.panel.is_none() && self.touch_name.as_deref().is_none_or(|name| dev.name() == Some(name)) {
                 self.wakeful.add(dev.as_raw_fd())?;
                 self.panel = Some(Panel::new(path, dev)?);
                 for w in &self.touch_writes {
@@ -278,6 +280,10 @@ impl Inputs {
     /// Whether a touch panel has come up.
     pub fn has_panel(&self) -> bool {
         self.panel.is_some()
+    }
+
+    pub fn resize(&mut self, w: u32, h: u32) {
+        (self.w, self.h) = (w as f32, h as f32);
     }
 
     /// Readable while a device has something queued, or /dev/input changed.

@@ -1,0 +1,123 @@
+[device]
+codename = "zizhan"
+brand = "Xiaomi"
+model = "Xiaomi MIX Fold 2"
+ab = true
+soc = { hans = "第一代骁龙®8+移动平台", hant = "Snapdragon® 8+ Gen 1 行動平台", en = "Snapdragon® 8+ Gen 1 Mobile Platform" }
+os_version_prop = "ro.mi.os.version.incremental"
+
+# Both DSI connectors report connected even with the phone closed. The
+# cover comes up first; the fold sensor selects the inner panel when open.
+[display]
+width = 1080
+height = 2520
+density = 440
+diagonal = 6.56
+connector = "DSI-2"
+backlight = "panel1-backlight"
+dsi_display = "dsi_display1"
+# The L18 cover panel has no separate normal-maximum DT property.
+brightness_max = 4095
+
+[touch]
+name = "fts-sec"
+
+[fold]
+sensor = "fold_status"
+folded_value = 1.0
+unfolded_value = 0.0
+registry_partition = "persist"
+registry_path = "sensors"
+registry_target = "/mnt/vendor/persist/sensors"
+writes = [{ path = "/sys/kernel/boot_slpi/boot", value = "1" }]
+
+[fold.display]
+width = 1916
+height = 2160
+density = 440
+diagonal = 8.02
+connector = "DSI-1"
+backlight = "panel0-backlight"
+dsi_display = "dsi_display0"
+brightness_max = 2047
+rotation = 270
+
+[fold.touch]
+name = "fts-pri"
+
+[[owners]]
+user = "root"
+group = "wakelock"
+mode = 0o660
+paths = ["/sys/power/wake_lock", "/sys/power/wake_unlock"]
+
+[[service]]
+path = "/vendor/bin/diag-router"
+user = "system"
+groups = ["system"]
+capabilities = ["KILL"]
+
+[[service]]
+path = "/vendor/bin/pd-mapper"
+user = "system"
+groups = ["system"]
+
+[[service]]
+path = "/vendor/bin/sscrpcd"
+args = ["sensorspd"]
+user = "system"
+groups = ["system", "wakelock"]
+capabilities = ["BLOCK_SUSPEND"]
+
+[[service]]
+path = "/vendor/bin/sensors.qti"
+user = "system"
+groups = ["system"]
+
+[modules]
+sources = ["vendor_boot", "vendor_dlkm", "vendor"]
+load = ["fts_touch_spi_pri", "fts_touch_spi_sec"]
+
+[firmware]
+partition = "modem"
+
+[haptics]
+# The stored effects run below the motor's resonance. Drive a generated
+# click for four swings to make menu feedback more distinct.
+click_cycles = 4
+resonance = "/sys/class/qcom-haptics/lra_frequency_hz"
+strength = { lightest = 0.5, strongest = 1.0 }
+
+# The unmodified stock recovery supplied in the owner's local ROM, also
+# byte-identical to both recovery partitions read from the test device.
+# No third-party recovery is required or downloaded.
+[recovery]
+format = "stock"
+sha256 = "e10f55fad2f218a26c347cb0d9d0e2cd3c39a0cbdc3fe81effec58d21e62c60e"
+binder_header = "SYST"
+
+[wlan]
+# Calibrate the radio while the owner opens Data or the menus. Keep the
+# interface down and start no supplicant until WLAN is enabled.
+prepare_on_boot = true
+modules = ["qca_cld3_qca6490"]
+writes = [{ path = "/sys/kernel/cnss/fs_ready", value = "1" }]
+firmware = [
+    { name = "wlan/qca_cld/qca6490/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/qca6490/WCNSS_qcom_cfg.ini" },
+    { name = "wlan/qca_cld/qca6490/wlan_mac.bin", partition = "persist", path = "qca6490/wlan_mac.bin" },
+]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/system/lib64", "/vendor/lib64"]
+service = "android.hardware.wifi.supplicant@1.4::ISupplicant/default"
+probe = "http://connect.rom.miui.com/generate_204"
+
+[update]
+server = "https://update.miui.com/updates/miotaV3.php"
+
+[backup]
+efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
+data_skipped = ["vendor/tzstorage", "vendor/qtee", "vendor/fingerprint", "vendor/fpc", "vendor/goodix"]
+
+[wipe]
+logs = ["/data/miuilog", "/data/vendor/diag", "/data/vendor/log", "/data/vendor/ramdump", "/data/vendor/ssrdump", "/data/vendor/tombstones", "/data/vendor/wlan_logs"]

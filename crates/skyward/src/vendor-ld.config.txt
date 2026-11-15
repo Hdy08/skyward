@@ -1,0 +1,15 @@
+dir.vendor = /vendor/bin
+dir.vendor = /odm/bin
+dir.vendor = /skyward/run/vendor
+
+[vendor]
+additional.namespaces = system
+namespace.default.isolated = false
+namespace.default.search.paths = /vendor/${LIB}:/vendor/${LIB}/hw:/odm/${LIB}:@VNDK_LIBRARIES@:/apex/com.android.runtime/${LIB}/bionic
+namespace.default.links = system
+namespace.default.link.system.allow_all_shared_libs = true
+
+namespace.system.isolated = false
+namespace.system.search.paths = /mnt/system/system/${LIB}:/mnt/system_ext/${LIB}
+namespace.system.links = default
+namespace.system.link.default.shared_libs = libc.so:libdl.so:libm.so:libdl_android.so

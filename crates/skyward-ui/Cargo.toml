@@ -41,3 +41,6 @@ syn = { version = "2.0.119", features = ["full", "visit"] }
 drm = "0.15.0"
 drm-ffi = "0.9.1"
 libc = { workspace = true }
+# Keep large-frame painting on two persistent workers so Android's
+# scheduler can track their load across frames.
+rayon = "1.12.0"

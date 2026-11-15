@@ -1,6 +1,7 @@
 use crate::backup;
 use crate::decrypt::{self, Decryptor};
 use crate::filework;
+use crate::fold;
 use crate::haptics::Haptics;
 use crate::relabel;
 use crate::input::{monotonic_ms, Event, Inputs};
@@ -90,7 +91,7 @@ struct Backlight {
 }
 
 impl Backlight {
-    fn open() -> Result<Self> {
+    fn open(display: &skyward_config::Display) -> Result<Self> {
         let mut dirs: Vec<PathBuf> = fs::read_dir("/sys/class/backlight")
             .context("read /sys/class/backlight")?
             .map(|e| e.map(|e| e.path()))
@@ -99,8 +100,14 @@ impl Backlight {
         // Qualcomm panels expose panel0-backlight; take it when present.
         let dir = dirs
             .iter()
-            .find(|d| d.file_name().is_some_and(|n| n == "panel0-backlight"))
-            .or(dirs.first())
+            .find(|d| display.backlight.as_deref().is_some_and(|name| d.file_name().is_some_and(|n| n == name)))
+            .or_else(|| {
+                if display.backlight.is_some() {
+                    None
+                } else {
+                    dirs.iter().find(|d| d.file_name().is_some_and(|n| n == "panel0-backlight")).or(dirs.first())
+                }
+            })
             .ok_or_else(|| anyhow!("no backlight device"))?
             .clone();
         let read = |name: &str| -> Result<u32> {
@@ -110,7 +117,14 @@ impl Backlight {
                 .parse()
                 .with_context(|| format!("parse {name}"))
         };
-        let top = normal_max(read("max_brightness")?)?;
+        let max = read("max_brightness")?;
+        let top = match display.brightness_max {
+            Some(top) => {
+                ensure!(top <= max, "configured brightness {top} exceeds {}'s maximum {max}", dir.display());
+                top
+            }
+            None => normal_max(max, display.dsi_display.as_deref().unwrap_or("dsi_display0"))?,
+        };
         let level = read("brightness")?;
         Ok(Backlight { path: dir.join("brightness"), top, level })
     }
@@ -148,9 +162,9 @@ const NORMAL_MAX: [(&str, &str); 4] = [
 /// Above it the panel runs in high brightness mode, which the stock system
 /// keeps for strong sunlight and its slider does not reach. The panel the
 /// display driver booted with gives that maximum in the device tree.
-fn normal_max(max: u32) -> Result<u32> {
-    let param = "/sys/module/msm_drm/parameters/dsi_display0";
-    let boot = fs::read_to_string(param).with_context(|| format!("read {param}"))?;
+fn normal_max(max: u32, display: &str) -> Result<u32> {
+    let param = format!("/sys/module/msm_drm/parameters/{display}");
+    let boot = fs::read_to_string(&param).with_context(|| format!("read {param}"))?;
     // The panel's node, then its configuration after a colon, as in
     // "qcom,mdss_dsi_m1_42_02_0a_dsc_cmd:"; the driver takes no name
     // without the colon either.
@@ -1098,8 +1112,26 @@ fn job_end(end: filework::End) -> JobEnd {
 /// first of them; asking for nothing, they start at `start`. `programs`
 /// are the phone's own that the recovery keeps running: the
 /// configuration's, and those the phone's partitions name for its keys.
-pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
-    let mut pages = Pages::open(cfg, programs, font, mono, request, start, dump)?;
+#[allow(clippy::too_many_arguments)]
+pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>, fold_monitor: Option<fold::Monitor>) -> Result<()> {
+    let fold_monitor = match fold_monitor {
+        Some(monitor) => Some(monitor),
+        None if cfg.fold.is_some() => match fold::Monitor::start() {
+            Ok(monitor) => Some(monitor),
+            Err(error) => {
+                skyward_sys::kmsg(&format!("fold sensor client did not start: {error:#}"))?;
+                None
+            }
+        },
+        None => None,
+    };
+    let mut pages = Pages::open(cfg, programs, font, mono, request, start, dump, fold_monitor)?;
+    if cfg.fold.is_some() && matches!(pages.request.work, Work::Menu) {
+        let now = monotonic_ms();
+        pages.fold_told(now)?;
+        pages.show(now)?;
+        skyward_sys::kmsg("fold display: first recovery frame presented")?;
+    }
     pages.begin()?;
     // The phone sleeps while its screen is off and nothing needs it awake.
     let sleeper = Sleeper::start()?;
@@ -1131,6 +1163,8 @@ struct Pages<'a> {
     /// The frame last drawn.
     screen: Canvas,
     inputs: Inputs,
+    fold: Option<fold::Monitor>,
+    unfolded: bool,
     started: Instant,
     /// Whether the wait for a touch panel to come up is over.
     touch_known: bool,
@@ -1155,6 +1189,9 @@ struct Pages<'a> {
     blanked: bool,
     /// When the panel gone dark began to rest.
     rested_at: Option<Instant>,
+    /// Keep the render caller ready while the large About page animates;
+    /// release the hint on another page, the cover, or a dark display.
+    painting: Option<skyward_ui::glow::PaintPerformance>,
     /// Started for fastboot, the port goes to the phone's own fastbootd. The
     /// page says whether it came up and how far a computer has the port;
     /// why it did not come up goes to the kernel log and on screen.
@@ -1236,7 +1273,8 @@ impl<'a> Pages<'a> {
     /// Bring up the panel, the touchscreen and the pages, as the settings
     /// kept from the starts before leave them, with none of the work the
     /// request asks for started yet.
-    fn open(cfg: &'a DeviceConfig, programs: &'a [Service], font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&'a Path>) -> Result<Pages<'a>> {
+    #[allow(clippy::too_many_arguments)]
+    fn open(cfg: &'a DeviceConfig, programs: &'a [Service], font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&'a Path>, fold_monitor: Option<fold::Monitor>) -> Result<Pages<'a>> {
         if cfg.display.density == 0 {
             return Err(anyhow!("{}: [display] density is required to lay out the UI", cfg.device.codename));
         }
@@ -1248,25 +1286,14 @@ impl<'a> Pages<'a> {
         untaken(&mut unread.battery, "the battery", battery.as_ref().err())?;
         let info = skyward_info::collect_with(cfg, battery.unwrap_or_default())?;
         let fonts = Fonts::load(font, 0, mono)?;
-        let mut surface = KmsSurface::open("/dev/dri/card0")?;
-        let (w, h) = surface.size();
-        // A touch controller that follows the panel wakes as the panel goes
-        // from rest to running, and at no other time. The recovery service
-        // running again finds it as the earlier run left it, at rest where the
-        // panel rested then, so the panel is put to rest and woken with a dark
-        // frame, as every later wake wakes it, before the touchscreen is taken
-        // in and told its settings: a controller at rest answers none of them.
-        if skyward_sys::runs_again() {
-            surface.rest()?;
-            surface.present(&Canvas::new(w, h))?;
-            surface.settle()?;
-        }
-        eprintln!("display {}", surface.describe());
-        let inputs = Inputs::open(w, h, cfg.touch.writes.clone())?;
-        let started = Instant::now();
+        // A foldable's configured upright dimensions let its first page,
+        // fonts and canvas cache be prepared while the boot logo remains.
+        let surface = if cfg.fold.is_none() {
+            Some(KmsSurface::open_panel("/dev/dri/card0", cfg.display.connector.as_deref(), cfg.display.rotation)?)
+        } else { None };
+        let (w, h) = surface.as_ref().map_or((cfg.display.width, cfg.display.height), Surface::size);
         let control = Control::open()?;
         let haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
-        let backlight = Backlight::open()?;
         let first = match &request.work {
             Work::Fastboot => Screen::Fastboot,
             Work::PromptWipeData => Screen::CantStart,
@@ -1307,7 +1334,7 @@ impl<'a> Pages<'a> {
             app.set_boot_slots(read_slots());
         }
         app.set_asked(asked(&request));
-        let screen = Canvas::new(w, h);
+        let mut screen = Canvas::new(w, h);
         // A page sliding over another draws on three screens' worth of canvas
         // besides the panel's: made ready now, the first slide finds them so.
         Canvas::keep_ready(w, h, 3);
@@ -1375,6 +1402,36 @@ impl<'a> Pages<'a> {
                 app.report(&format!("{e:#}"), monotonic_ms());
             }
         }
+        if cfg.fold.is_some() && matches!(request.work, Work::Menu) {
+            app.compose(&mut screen, &fonts, &info, &clock(app.state.time_zone)?, monotonic_ms());
+            // The client has been discovering the sensor throughout the
+            // preparation above. Wait only for its first event, with the
+            // boot logo still visible, and retain that event for the pages.
+            if let Some(monitor) = &fold_monitor { wait(&[monitor.fd()], 2500)?; }
+            skyward_sys::kmsg("fold display: first-frame resources ready; taking over the boot display")?;
+        }
+        let mut surface = match surface {
+            Some(surface) => surface,
+            None => KmsSurface::open_panel("/dev/dri/card0", cfg.display.connector.as_deref(), cfg.display.rotation)?,
+        };
+        ensure!(surface.size() == (w, h), "configured upright display {w}x{h} differs from {:?}", surface.size());
+        if let Some(fold) = &cfg.fold {
+            Backlight::open(&cfg.display)?.show(None)?;
+            Backlight::open(&fold.display)?.show(None)?;
+            surface.prepare_panel(fold.display.connector.as_deref().context("a foldable panel has a connector")?, fold.display.rotation)?;
+            skyward_sys::kmsg("fold display: the inactive panel's boot splash is cleared and its display rests")?;
+        }
+        // A controller following a rested panel must be woken before its
+        // settings are written, including when the UI service runs again.
+        if skyward_sys::runs_again() {
+            surface.rest()?;
+            surface.present(&Canvas::new(w, h))?;
+            surface.settle()?;
+        }
+        eprintln!("display {}", surface.describe());
+        let inputs = Inputs::open(w, h, cfg.touch.writes.clone(), cfg.touch.name.clone())?;
+        let started = Instant::now();
+        let backlight = Backlight::open(&cfg.display)?;
         Ok(Pages {
             cfg,
             programs,
@@ -1386,6 +1443,8 @@ impl<'a> Pages<'a> {
             surface,
             screen,
             inputs,
+            fold: fold_monitor,
+            unfolded: false,
             started,
             touch_known: false,
             control,
@@ -1399,6 +1458,7 @@ impl<'a> Pages<'a> {
             asked: None,
             blanked: false,
             rested_at: None,
+            painting: None,
             fastboot,
             port_at,
             transfer,
@@ -1577,6 +1637,7 @@ impl<'a> Pages<'a> {
                 self.app.touchscreen_missing();
             }
         }
+        self.fold_told(now)?;
         self.tick(now)?;
         self.take_readings(now)?;
         // In fastboot the page follows fastbootd and the cable each second.
@@ -1617,6 +1678,8 @@ impl<'a> Pages<'a> {
         self.skyward_told(now)?;
         self.decrypt_told(now)?;
         self.shell_told()?;
+        self.fold_told(now)?;
+        self.tick(now)?;
         self.take_in(drive_told, now)?;
         self.offer_storage(now)
     }
@@ -1657,6 +1720,59 @@ impl<'a> Pages<'a> {
         Ok(())
     }
 
+    fn fold_told(&mut self, now: u64) -> Result<()> {
+        let events = self.fold.as_ref().map(fold::Monitor::events).unwrap_or_default();
+        for state in events {
+            match state {
+                Ok(folded) => {
+                    if let Err(error) = self.select_panel(folded, now) {
+                        skyward_sys::kmsg(&format!("fold sensor: panel switch failed: {error:#}"))?;
+                        self.app.report(&format!("{error:#}"), now);
+                    }
+                }
+                Err(error) => {
+                    skyward_sys::kmsg(&format!("fold sensor: {error}"))?;
+                    self.fold = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn select_panel(&mut self, folded: bool, now: u64) -> Result<()> {
+        if self.unfolded != folded {
+            return Ok(());
+        }
+        let fold = self.cfg.fold.as_ref().context("a fold event without a foldable display")?;
+        let (display, touch) = if folded { (&self.cfg.display, &self.cfg.touch) } else { (&fold.display, &fold.touch) };
+        let backlight = Backlight::open(display)?;
+        let mut inputs = Inputs::open(display.width, display.height, touch.writes.clone(), touch.name.clone())?;
+        self.backlight.show(None)?;
+        if let Err(error) = self.surface.switch_panel(display.connector.as_deref().context("a foldable panel has a connector")?, display.rotation) {
+            self.backlight.show(self.app.panel(now))?;
+            return Err(error);
+        }
+        let (w, h) = self.surface.size();
+        inputs.resize(w, h);
+        self.inputs = inputs;
+        self.backlight = backlight;
+        self.screen = Canvas::new(w, h);
+        self.app.resize(w, h, display.density as f32 / 160.0, now);
+        self.app.set_screen_corners(display.corner_radius as f32);
+        let (rows, cols) = self.app.term_size(&self.fonts);
+        self.app.resize_terminal(rows, cols);
+        if let Some(shell) = &self.shell {
+            shell.resize(rows, cols)?;
+        }
+        self.info.panel = Some((w, h));
+        self.info.screen = display.diagonal;
+        self.blanked = false;
+        self.rested_at = None;
+        self.unfolded = !folded;
+        skyward_sys::kmsg(&format!("fold sensor: {} — {}", if folded { "closed" } else { "open" }, self.surface.describe()))?;
+        Ok(())
+    }
+
     /// Take in the readings taken since the last turn.
     fn take_readings(&mut self, now: u64) -> Result<()> {
         for reading in self.readings.taken() {
@@ -1679,13 +1795,16 @@ impl<'a> Pages<'a> {
                         self.asked = None;
                     }
                     untaken(&mut self.unread.details, "the phone's details", all.as_ref().as_ref().err())?;
-                    if let Ok(all) = *all
-                        && at >= self.read_at
-                        && all != self.info
-                    {
-                        plug(&mut self.app, &self.info.battery, &all.battery, now)?;
-                        self.info = all;
-                        self.app.refresh();
+                    if let Ok(mut all) = *all && at >= self.read_at {
+                        if let Some(fold) = &self.cfg.fold {
+                            all.panel = Some(self.surface.size());
+                            all.screen = if self.unfolded { fold.display.diagonal } else { self.cfg.display.diagonal };
+                        }
+                        if all != self.info {
+                            plug(&mut self.app, &self.info.battery, &all.battery, now)?;
+                            self.info = all;
+                            self.app.refresh();
+                        }
                     }
                 }
             }
@@ -1698,6 +1817,13 @@ impl<'a> Pages<'a> {
     /// lit, and whether a frame was shown.
     fn show(&mut self, now: u64) -> Result<(bool, bool)> {
         let panel = self.app.panel(now);
+        let (w, h) = self.surface.size();
+        let painting = panel.is_some() && self.app.screen() == Screen::About && u64::from(w) * u64::from(h) >= 3_000_000;
+        if painting && self.painting.is_none() {
+            self.painting = Some(skyward_ui::glow::PaintPerformance::request());
+        } else if !painting {
+            self.painting = None;
+        }
         let mut shown = false;
         if panel.is_some() {
             // A display turned off comes on again with a frame drawn for it.
@@ -1764,6 +1890,9 @@ impl<'a> Pages<'a> {
         let timeout = if ahead { 0 } else { until_due.into_iter().chain(rest_left).min().map_or(1000, |t| t.clamp(floor, 1000)) };
         sleeper.allow(self.may_sleep()?);
         let mut fds = vec![self.inputs.fd(), uevents.fd(), sleeper.fd()];
+        if let Some(fold) = &self.fold {
+            fds.push(fold.fd());
+        }
         if let Some(i) = &self.installer {
             fds.push(i.fd());
         }
@@ -2985,7 +3114,7 @@ impl Pages<'_> {
     fn enter_recovery(&mut self) -> Result<()> {
         skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)?;
         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-        crate::prepare(self.cfg, slot)?;
+        crate::prepare(self.cfg, slot, &mut self.fold)?;
         self.read_at = Instant::now();
         read_details(self.cfg, &mut self.info, &mut self.unread.details)?;
         self.fastboot = false;

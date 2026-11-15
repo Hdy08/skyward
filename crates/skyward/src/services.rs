@@ -392,6 +392,7 @@ fn run(s: &Service, who: &Credentials, given: &Given) -> Result<String> {
 fn command(s: &Service, who: &Credentials, given: &Given, handed: &[(String, OwnedFd)]) -> Command {
     let mut cmd = Command::new(&s.path);
     cmd.args(&s.args).current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let private_runtime = crate::secure::uses_vendor_runtime(&s.path);
     let mut libraries = s.libraries.clone();
     for (name, value) in &given.environment {
         match name == LIBRARY_PATH {
@@ -400,6 +401,10 @@ fn command(s: &Service, who: &Credentials, given: &Given, handed: &[(String, Own
                 cmd.env(name, value);
             }
         }
+    }
+    if private_runtime {
+        libraries.retain(|p| p.starts_with("/vendor/") || p.starts_with("/odm/") || p.starts_with("/apex/"));
+        cmd.env_remove(LIBRARY_PATH);
     }
     if !libraries.is_empty() {
         cmd.env(LIBRARY_PATH, libraries.join(":"));
@@ -415,6 +420,11 @@ fn command(s: &Service, who: &Credentials, given: &Given, handed: &[(String, Own
     // run they have to stay open through the exec.
     unsafe {
         cmd.pre_exec(move || {
+            if private_runtime {
+                // Keep the recovery and the other services on their own
+                // linker and runtime. Do this before dropping root.
+                crate::secure::enter_vendor_runtime()?;
+            }
             for socket in &sockets {
                 if libc::fcntl(*socket, libc::F_SETFD, 0) != 0 {
                     return Err(io::Error::last_os_error());

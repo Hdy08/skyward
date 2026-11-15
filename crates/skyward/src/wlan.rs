@@ -16,6 +16,7 @@ use std::fs;
 use std::net::Ipv4Addr;
 use std::os::fd::RawFd;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -713,15 +714,22 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     if let Some(dir) = libraries {
         path.push(dir.to_string_lossy().into_owned());
     }
-    let mut child = Process::new(&cfg.supplicant)
-        .args(["-i", &cfg.interface, "-D", "nl80211", "-c"])
+    let private_runtime = crate::secure::uses_vendor_runtime(&cfg.supplicant);
+    if private_runtime {
+        path.retain(|p| p.starts_with("/vendor/") || p.starts_with("/odm/") || p.starts_with("/apex/"));
+    }
+    let mut command = Process::new(&cfg.supplicant);
+    command.args(["-i", &cfg.interface, "-D", "nl80211", "-c"])
         .arg(&settings)
         .env("LD_LIBRARY_PATH", path.join(":"))
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    if private_runtime {
+        unsafe { command.pre_exec(|| crate::secure::enter_vendor_runtime()); }
+    }
+    let mut child = command.spawn()
         .with_context(|| format!("start {}", cfg.supplicant))?;
     let until = Instant::now() + SOCKET_WAIT;
     while !socket.exists() {

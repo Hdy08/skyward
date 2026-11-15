@@ -64,7 +64,7 @@ impl Haptics {
             }
             None => {
                 eprintln!("haptics {}: clicks and ticks made for a motor swinging at {hz} Hz", path.display());
-                Click::Samples { data: made(hz), rate: RATE }
+                Click::Samples { data: made(hz, cfg.click_cycles), rate: RATE }
             }
         };
         let ticks = Click::Samples { data: ticks(hz), rate: TICKS_RATE };

@@ -2,14 +2,14 @@ use std::collections::HashMap;
 
 /// Where the phone keeps the rules for its own device nodes, and the names
 /// its own partitions give to the accounts those rules name.
-pub const RULE_FILES: [&str; 2] = ["/vendor/etc/ueventd.rc", "/odm/etc/ueventd.rc"];
+pub const RULE_FILES: [&str; 4] = ["/vendor/ueventd.rc", "/vendor/etc/ueventd.rc", "/odm/ueventd.rc", "/odm/etc/ueventd.rc"];
 pub const PASSWD_FILES: [&str; 2] = ["/vendor/etc/passwd", "/odm/etc/passwd"];
 pub const GROUP_FILES: [&str; 2] = ["/vendor/etc/group", "/odm/etc/group"];
 
 /// The accounts Android fixes once and for all. The rules, and the init
 /// scripts of the phone's own programs, name them rather than their
 /// numbers, and a recovery has no list of its own to look them up in.
-const ACCOUNTS: [(&str, u32); 33] = [
+const ACCOUNTS: [(&str, u32); 34] = [
     ("root", 0),
     ("system", 1000),
     ("radio", 1001),
@@ -39,6 +39,7 @@ const ACCOUNTS: [(&str, u32); 33] = [
     ("audioserver", 1041),
     ("cameraserver", 1047),
     ("shell", 2000),
+    ("inet", 3003),
     ("readproc", 3009),
     ("wakelock", 3010),
     ("uhid", 3011),
@@ -240,6 +241,7 @@ mod tests {
         let known = accounts(&[passwd.to_str().unwrap()]);
         assert_eq!(account(&known, "vendor_qti_diag"), Some(2901));
         assert_eq!(account(&known, "system"), Some(1000));
+        assert_eq!(account(&known, "inet"), Some(3003));
         assert_eq!(account(&known, "nothing"), None);
     }
 }

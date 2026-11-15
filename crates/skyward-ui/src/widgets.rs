@@ -852,7 +852,12 @@ fn mask(c: &mut Canvas, h: f32, stops: &[(f32, f32)], color: Rgba, level: f32, s
         // one multiply, then its green; its alpha kept.
         let lit: [(u32, u32, u32); 4] = k.map(|k| ((ink[0] | ink[2] << 16) * k + 0x0080_0080, ink[1] * k + 0x80, 256 - k));
         let start = y as usize * row_len;
-        for quad in c.data[start..start + row_len].as_chunks_mut::<16>().0 {
+        let row = &mut c.data[start..start + row_len];
+        #[cfg(target_arch = "aarch64")]
+        let done = mask_vectors(row, k, ink);
+        #[cfg(not(target_arch = "aarch64"))]
+        let done = 0;
+        for quad in row[done..].as_chunks_mut::<16>().0 {
             for (px, &(lit_rb, lit_g, keep)) in quad.as_chunks_mut::<4>().0.iter_mut().zip(&lit) {
                 let v = u32::from_le_bytes(*px);
                 let rb = ((lit_rb + (v & 0x00ff_00ff) * keep) >> 8) & 0x00ff_00ff;
@@ -861,6 +866,30 @@ fn mask(c: &mut Canvas, h: f32, stops: &[(f32, f32)], color: Rgba, level: f32, s
             }
         }
     }
+}
+
+/// Eight pixels share the row's four-step opacity pattern. Widening each
+/// colour to sixteen bits lets its rounded blend use one multiply-add,
+/// keeping the source alpha without packed-channel masks and shifts.
+#[cfg(target_arch = "aarch64")]
+fn mask_vectors(row: &mut [u8], k: [u32; 4], ink: [u32; 3]) -> usize {
+    use std::arch::aarch64::*;
+    let done = row.len() / 32 * 32;
+    let weights: [u16; 8] = std::array::from_fn(|i| k[i % 4] as u16);
+    // SAFETY: every iteration reads and writes exactly eight complete
+    // pixels inside this row. Weights total 256, so the blend and rounding
+    // fit in sixteen bits; NEON is baseline on AArch64.
+    unsafe {
+        let weights = vld1q_u16(weights.as_ptr());
+        let keep = vsubq_u16(vdupq_n_u16(256), weights);
+        let (r, g, b) = (vmulq_n_u16(weights, ink[0] as u16), vmulq_n_u16(weights, ink[1] as u16), vmulq_n_u16(weights, ink[2] as u16));
+        for at in (0..done).step_by(32) {
+            let p = vld4_u8(row.as_ptr().add(at));
+            let blend = |p, lit| vrshrn_n_u16::<8>(vmlaq_u16(lit, vmovl_u8(p), keep));
+            vst4_u8(row.as_mut_ptr().add(at), uint8x8x4_t(blend(p.0, r), blend(p.1, g), blend(p.2, b), p.3));
+        }
+    }
+    done
 }
 
 /// The piecewise-linear value of `stops` at `f`.
@@ -2759,6 +2788,37 @@ fn theme_tile(c: &mut Canvas, t: &Theme, x: f32, y: f32, w: f32, h: f32, dark: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bar_mask_keeps_rounding_dither_alpha_and_skipped_rows() {
+        const BAYER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+        for w in [4, 8, 12, 16, 32, 36] {
+            for level in [0.0, 0.4, 1.0] {
+                let color = Rgba { r: 1, g: 100, b: 254, a: 17 };
+                let mut frame = Canvas::new(w, 11);
+                for (i, v) in frame.data.iter_mut().enumerate() { *v = (i * 37 + i / 7) as u8; }
+                let original = frame.data.clone();
+                mask(&mut frame, 7.5, &ABOUT_BAR_MASK, color, level, 2..4);
+                for y in 0..11 {
+                    for x in 0..w as usize {
+                        let at = (y * w as usize + x) * 4;
+                        let mut expected: [u8; 4] = original[at..at + 4].try_into().unwrap();
+                        if y < 8 && !(2..4).contains(&y) {
+                            let a = ramp(&ABOUT_BAR_MASK, (y as f32 + 0.5) / 7.5) * level * 255.0;
+                            if a > 0.0 {
+                                let a = (a + f32::from(BAYER[y % 4][x % 4]) / 16.0 - 0.5).clamp(0.0, 255.0).round() as u32;
+                                let a = a + (a >> 7);
+                                for (v, ink) in expected[..3].iter_mut().zip([color.r, color.g, color.b]) {
+                                    *v = ((u32::from(ink) * a + u32::from(*v) * (256 - a) + 128) >> 8) as u8;
+                                }
+                            }
+                        }
+                        assert_eq!(&frame.data[at..at + 4], &expected, "width {w}, level {level}, ({x}, {y})");
+                    }
+                }
+            }
+        }
+    }
 
     /// The battery's pixel at (`x`, `y`) on screen.
     fn pixel(art: &(Canvas, i32, i32), x: f32, y: f32) -> [u8; 4] {

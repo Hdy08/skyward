@@ -1,8 +1,5 @@
-//! Opening the data partition. A phone encrypts the whole of it with a key
-//! its storage hardware holds, and encrypts each user's files again with a
-//! key only that user's credential leads to. This is the first of the two:
-//! what it opens holds every file, with the names and contents of the ones
-//! that are a user's own still encrypted.
+//! Opening the data partition, with the layers of encryption the installed
+//! system declares: the whole filesystem, each user's files, or neither.
 
 use crate::encryption::{key_dir, target, Encryption};
 use crate::gatekeeper::Gatekeeper;
@@ -61,8 +58,8 @@ pub struct Opened {
     pub checked: Option<Checked>,
 }
 
-/// Open the phone's data partition: unwrap the key it is encrypted with,
-/// give that to the storage hardware, check the filesystem where the
+/// Open the phone's data partition: where it is encrypted whole, unwrap
+/// its key and give that to the storage hardware; check the filesystem where the
 /// phone's table asks for it, and mount it writable, as the phone mounts
 /// it. The names and contents of each user's own files stay encrypted
 /// until that user's key is let in as well. A partition that does not
@@ -84,21 +81,29 @@ fn open(service: &KeyMint) -> Result<Opened> {
     })();
     match mounted {
         Ok((checked, filesystem)) => Ok(Opened { mapped, filesystem, checked }),
-        Err(e) => match dm::remove(MAPPED) {
+        Err(e) => match unmap() {
             Ok(()) => Err(e),
             Err(r) => Err(e.context(format!("removing {MAPPED} afterwards failed too: {r:#}"))),
         },
     }
 }
 
-/// Map the data partition decrypted, under the key the phone keeps for it,
-/// and give its table's entries, the first the one the key is found by,
-/// and the device the filesystem is read and written through.
+/// Reach the filesystem through the mapping its encryption needs, or
+/// directly where the phone declares no whole-filesystem encryption.
 fn map(service: &KeyMint) -> Result<(Vec<Entry>, PathBuf)> {
     let entries = skyward_block::fstab::read(MOUNT)?;
     let entry = entries.first().with_context(|| format!("the phone's own table says nothing about {MOUNT}"))?;
-    let encryption = Encryption::of(entry)?;
     let device = skyward_block::fstab::device(entry)?;
+    if entry.extra("metadata_encryption").is_none() {
+        let device = PathBuf::from(device);
+        anyhow::ensure!(
+            skyward_block::probe::filesystem(&device)?.is_some(),
+            "{} has no readable filesystem and the phone declares no metadata encryption",
+            device.display()
+        );
+        return Ok((entries, device));
+    }
+    let encryption = Encryption::of(entry)?;
     let key = storage_key(service, entry, &encryption)?;
     let sectors = skyward_block::size_bytes(&device)? / 512;
     let mapped = dm::create(MAPPED, &[target(&device, sectors, &key, &encryption)], false)?;
@@ -109,13 +114,16 @@ fn map(service: &KeyMint) -> Result<(Vec<Entry>, PathBuf)> {
 /// filesystem to be repaired, and give the device it is reached through;
 /// [`unmap`] takes it away again. The partition is to be closed.
 pub fn map_unmounted(service: &KeyMint) -> Result<PathBuf> {
-    anyhow::ensure!(dm::status(MAPPED)?.is_none(), "the data partition is open");
+    anyhow::ensure!(!mount::is_mount_point(Path::new(MOUNT))? && dm::status(MAPPED)?.is_none(), "the data partition is open");
     map(service).map(|(_, mapped)| mapped)
 }
 
-/// Take away the mapping [`map_unmounted`] made.
+/// Take away the mapping [`map_unmounted`] made, where it needed one.
 pub fn unmap() -> Result<()> {
-    dm::remove(MAPPED)
+    if dm::status(MAPPED)?.is_some() {
+        dm::remove(MAPPED)?;
+    }
+    Ok(())
 }
 
 /// Show the owner's shared storage at /sdcard; shown already, it stays.
@@ -172,6 +180,15 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
         true => None,
         false => Some(open(service)?),
     };
+    let encrypted_files = skyward_block::fstab::read(MOUNT)?.iter().any(|entry| entry.extra("fileencryption").is_some())
+        || Path::new(FILE_MODE).exists()
+        || Path::new(USER_KEYS).exists();
+    if !encrypted_files {
+        let owner = Path::new(SHARED_STORAGE).join(OWNER.to_string());
+        anyhow::ensure!(crate::fscrypt::unlocked(&owner)?, "the owner's shared storage is encrypted, but the phone describes no file encryption");
+        show_owner_storage()?;
+        return Ok(Opening { mounted, closed: Vec::new() });
+    }
     open_shared(service)?;
     let mut closed = Vec::new();
     let mut owner = Note::default();

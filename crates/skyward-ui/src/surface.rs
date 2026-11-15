@@ -14,6 +14,206 @@ pub trait Surface {
     fn settle(&mut self) -> Result<()>;
 }
 
+/// Copy an upright RGBA frame into the panel's native orientation. Rows in
+/// a dumb buffer may have padding; quarter turns use small tiles so reads
+/// down the source columns stay in the CPU cache.
+#[cfg(any(target_os = "android", test))]
+fn scanout(canvas: &Canvas, dst: &mut [u8], pitch: usize, rotation: u16, bgra: bool) {
+    let (w, h) = (canvas.w as usize, canvas.h as usize);
+    if rotation == 0 {
+        for y in 0..h {
+            let src = &canvas.data[y * w * 4..(y + 1) * w * 4];
+            let out = &mut dst[y * pitch..y * pitch + w * 4];
+            if bgra {
+                for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
+                    *o = [s[2], s[1], s[0], s[3]];
+                }
+            } else {
+                out.copy_from_slice(src);
+            }
+        }
+        return;
+    }
+    let (out_w, out_h) = if rotation == 180 { (w, h) } else { (h, w) };
+    #[cfg(target_arch = "aarch64")]
+    if matches!(rotation, 90 | 270) {
+        quarter_turn(canvas, dst, pitch, rotation, bgra);
+        return;
+    }
+    for ty in (0..out_h).step_by(32) {
+        for tx in (0..out_w).step_by(32) {
+            for y in ty..(ty + 32).min(out_h) {
+                for x in tx..(tx + 32).min(out_w) {
+                    let (sx, sy) = match rotation {
+                        90 => (y, h - 1 - x),
+                        180 => (w - 1 - x, h - 1 - y),
+                        270 => (w - 1 - y, x),
+                        _ => unreachable!("the panel rotation is validated before use"),
+                    };
+                    let src = &canvas.data[(sy * w + sx) * 4..][..4];
+                    let out = &mut dst[y * pitch + x * 4..][..4];
+                    if bgra {
+                        out.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+                    } else {
+                        out.copy_from_slice(src);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Transpose four RGBA pixels from four rows at a time. The inner panel's
+/// scanout mapping is write-combined memory: full vector stores avoid the
+/// per-pixel writes and bounds checks of a scalar transpose. The remaining
+/// rows and columns still work for panels not divisible by four.
+#[cfg(all(any(target_os = "android", test), target_arch = "aarch64"))]
+fn quarter_turn(canvas: &Canvas, dst: &mut [u8], pitch: usize, rotation: u16, bgra: bool) {
+    let (w, h) = (canvas.w as usize, canvas.h as usize);
+    assert!(canvas.whole() && pitch >= h * 4 && dst.len() >= pitch * w);
+    if w == 0 || h == 0 { return; }
+    let dst = &mut dst[..pitch * w];
+    match (rotation, bgra) {
+        (90, false) => quarter_vectors::<true, false, 128>(canvas, dst, pitch),
+        (90, true) => quarter_vectors::<true, true, 128>(canvas, dst, pitch),
+        (270, false) => quarter_vectors::<false, false, 128>(canvas, dst, pitch),
+        (270, true) => quarter_vectors::<false, true, 128>(canvas, dst, pitch),
+        _ => unreachable!("a quarter turn is 90 or 270 degrees"),
+    }
+}
+
+/// Specialize direction and colour order before entering the tile loops.
+/// Keeping those choices dynamic makes even RGBA output shuffle channels
+/// and select source rows for every four-pixel block.
+#[cfg(all(any(target_os = "android", test), target_arch = "aarch64"))]
+fn quarter_vectors<const CLOCKWISE: bool, const BGRA: bool, const TILE: usize>(canvas: &Canvas, dst: &mut [u8], pitch: usize) {
+    use std::arch::aarch64::*;
+    let (w, h) = (canvas.w as usize, canvas.h as usize);
+    let (rows, cols) = (w / 4 * 4, h / 4 * 4);
+    // SAFETY: each load covers four pixels within a source row and each
+    // store covers four pixels within an output row. The dimensions above
+    // check both allocations; the scalar edges never overlap these tiles.
+    unsafe {
+        let swap = vld1q_u8([2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15].as_ptr());
+        for ty in (0..rows).step_by(TILE) {
+            for tx in (0..cols).step_by(TILE) {
+                for y in (ty..(ty + TILE).min(rows)).step_by(4) {
+                    let sx = if CLOCKWISE { y } else { w - y - 4 };
+                    let transpose = |x: usize| {
+                        let sy = if CLOCKWISE { h - x - 1 } else { x };
+                        let load = |row: usize| {
+                            let bytes = vld1q_u8(canvas.data.as_ptr().add((row * w + sx) * 4));
+                            vreinterpretq_u32_u8(if BGRA { vqtbl1q_u8(bytes, swap) } else { bytes })
+                        };
+                        let a = load(sy);
+                        let b = load(if CLOCKWISE { sy - 1 } else { sy + 1 });
+                        let c = load(if CLOCKWISE { sy - 2 } else { sy + 2 });
+                        let d = load(if CLOCKWISE { sy - 3 } else { sy + 3 });
+                        let ab0 = vreinterpretq_u64_u32(vtrn1q_u32(a, b));
+                        let ab1 = vreinterpretq_u64_u32(vtrn2q_u32(a, b));
+                        let cd0 = vreinterpretq_u64_u32(vtrn1q_u32(c, d));
+                        let cd1 = vreinterpretq_u64_u32(vtrn2q_u32(c, d));
+                        [vzip1q_u64(ab0, cd0), vzip1q_u64(ab1, cd1), vzip2q_u64(ab0, cd0), vzip2q_u64(ab1, cd1)].map(|p| vreinterpretq_u8_u64(p))
+                    };
+                    let end = (tx + TILE).min(cols);
+                    let mut x = tx;
+                    while x < end {
+                        let a = transpose(x);
+                        if x + 16 <= end {
+                            let (b, c, d) = (transpose(x + 4), transpose(x + 8), transpose(x + 12));
+                            // Complete a cache line in each output row
+                            // before moving to the next row, so adjacent
+                            // stores can combine instead of alternating
+                            // 16-byte writes to four write-combined rows.
+                            for i in 0..4 {
+                                let row = if CLOCKWISE { i } else { 3 - i };
+                                vst1q_u8_x4(dst.as_mut_ptr().add((y + row) * pitch + x * 4), uint8x16x4_t(a[i], b[i], c[i], d[i]));
+                            }
+                            x += 16;
+                            continue;
+                        }
+                        for (i, px) in a.into_iter().enumerate() {
+                            let row = if CLOCKWISE { i } else { 3 - i };
+                            vst1q_u8(dst.as_mut_ptr().add((y + row) * pitch + x * 4), px);
+                        }
+                        x += 4;
+                    }
+                }
+            }
+        }
+    }
+    for y in 0..w {
+        let from = if y < rows { cols } else { 0 };
+        for x in from..h {
+            let (sx, sy) = if CLOCKWISE { (y, h - x - 1) } else { (w - y - 1, x) };
+            let s = &canvas.data[(sy * w + sx) * 4..][..4];
+            let p = &mut dst[y * pitch + x * 4..][..4];
+            if BGRA {
+                p.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+            } else {
+                p.copy_from_slice(s);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scanout_tests {
+    use super::*;
+
+    #[test]
+    fn quarter_turns_preserve_pixels_across_vector_blocks_and_scalar_edges() {
+        for (w, h) in [(4, 4), (4, 5), (5, 4), (31, 37), (35, 33), (64, 68), (129, 131), (137, 133)] {
+            let mut frame = Canvas::new(w, h);
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    frame.data[(y * w as usize + x) * 4..][..4].copy_from_slice(&[x as u8, y as u8, (x ^ y) as u8, (x * 7 + y * 19) as u8]);
+                }
+            }
+            for rotation in [90, 270] {
+                let pitch = h as usize * 4 + 12;
+                for bgra in [false, true] {
+                    let mut out = vec![0xa5; pitch * w as usize];
+                    scanout(&frame, &mut out, pitch, rotation, bgra);
+                    for y in 0..w as usize {
+                        for x in 0..h as usize {
+                            let (sx, sy) = if rotation == 90 { (y, h as usize - x - 1) } else { (w as usize - y - 1, x) };
+                            let mut expected = [sx as u8, sy as u8, (sx ^ sy) as u8, (sx * 7 + sy * 19) as u8];
+                            if bgra { expected.swap(0, 2); }
+                            assert_eq!(&out[y * pitch + x * 4..][..4], &expected, "{w}x{h}, rotation {rotation}, ({x}, {y}), bgra {bgra}");
+                        }
+                        assert!(out[y * pitch + h as usize * 4..(y + 1) * pitch].iter().all(|&v| v == 0xa5));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn asymmetric_frame_rotates_with_padding_and_both_colour_orders() {
+        let mut frame = Canvas::new(2, 3);
+        for (i, pixel) in frame.data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *pixel = [i as u8 + 1, 20, i as u8 + 40, 255];
+        }
+        for (rotation, expected) in [(0, [1, 2, 3, 4, 5, 6]), (90, [5, 3, 1, 6, 4, 2]), (180, [6, 5, 4, 3, 2, 1]), (270, [2, 4, 6, 1, 3, 5])] {
+            let (w, h) = if matches!(rotation, 0 | 180) { (2, 3) } else { (3, 2) };
+            let pitch = w * 4 + 8;
+            for bgra in [false, true] {
+                let mut out = vec![0xa5; pitch * h];
+                scanout(&frame, &mut out, pitch, rotation, bgra);
+                for (i, &n) in expected.iter().enumerate() {
+                    let at = (i / w) * pitch + (i % w) * 4;
+                    let pixel = if bgra { [n + 39, 20, n, 255] } else { [n, 20, n + 39, 255] };
+                    assert_eq!(&out[at..at + 4], &pixel, "rotation {rotation}, pixel {i}");
+                }
+                for row in out.chunks_exact(pitch) {
+                    assert!(row[w * 4..].iter().all(|&v| v == 0xa5));
+                }
+            }
+        }
+    }
+}
+
 /// How Qualcomm's display driver drives a mode, from the text of the
 /// connector's mode_properties blob: key=value lines, a block per mode_name.
 #[cfg(any(target_os = "android", test))]
@@ -213,6 +413,7 @@ pub mod kms {
     use std::collections::HashMap;
     use std::fs::{File, OpenOptions};
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     /// How long the display may take to complete a commit.
@@ -262,12 +463,42 @@ pub mod kms {
     }
 
     struct Buf {
+        card: Arc<Card>,
         db: DumbBuffer,
         fb: framebuffer::Handle,
         /// The buffer mapped for writing for as long as the surface lives;
         /// mapping it per frame costs a page fault per page on every frame.
         map: *mut u8,
         len: usize,
+    }
+
+    impl Drop for Buf {
+        fn drop(&mut self) {
+            unsafe { libc::munmap(self.map.cast(), self.len) };
+            let _ = self.card.destroy_framebuffer(self.fb);
+            let _ = self.card.destroy_dumb_buffer(self.db);
+        }
+    }
+
+    struct Blobs {
+        card: Arc<Card>,
+        ids: Vec<u64>,
+    }
+
+    impl Blobs {
+        fn create<T: ?Sized>(&mut self, data: &T) -> Result<property::Value<'static>> {
+            let value = self.card.create_property_blob(data).context("create display property blob")?;
+            self.ids.push(value.as_blob().expect("a property blob"));
+            Ok(value)
+        }
+    }
+
+    impl Drop for Blobs {
+        fn drop(&mut self) {
+            for &id in &self.ids {
+                let _ = self.card.destroy_property_blob(id);
+            }
+        }
     }
 
     /// A KMS object's properties by name, with their current values.
@@ -478,7 +709,10 @@ pub mod kms {
     }
 
     pub struct KmsSurface {
-        card: Card,
+        card: Arc<Card>,
+        /// The other panel retains its mode, planes and buffers while resting.
+        parked: Option<Box<KmsSurface>>,
+        _blobs: Blobs,
         bufs: [Buf; 3],
         /// The buffer the next frame goes into.
         back: usize,
@@ -510,24 +744,41 @@ pub mod kms {
         slow: bool,
         w: u32,
         h: u32,
+        rotation: u16,
+        connector: String,
         order: Order,
         summary: String,
     }
 
     impl KmsSurface {
         pub fn open(path: &str) -> Result<Self> {
-            let card = open_card(path)?;
+            Self::open_connector(path, None)
+        }
+
+        /// Select a particular built-in screen when more than one stays
+        /// connected, as on a foldable with independent inner and cover panels.
+        pub fn open_connector(path: &str, wanted: Option<&str>) -> Result<Self> {
+            Self::open_panel(path, wanted, 0)
+        }
+
+        pub fn open_panel(path: &str, wanted: Option<&str>, rotation: u16) -> Result<Self> {
+            anyhow::ensure!(matches!(rotation, 0 | 90 | 180 | 270), "invalid panel rotation {rotation}");
+            Self::on_card(Arc::new(open_card(path)?), wanted, rotation)
+        }
+
+        fn on_card(card: Arc<Card>, wanted: Option<&str>, rotation: u16) -> Result<Self> {
             let res = card.resource_handles().context("read KMS resources")?;
 
             let mut panel = None;
             for &h in res.connectors() {
                 let info = card.get_connector(h, true).context("read connector")?;
-                if is_panel(info.interface()) && info.state() == connector::State::Connected {
+                let name = format!("{:?}-{}", info.interface(), info.interface_id());
+                if is_panel(info.interface()) && info.state() == connector::State::Connected && wanted.is_none_or(|wanted| wanted == name) {
                     panel = Some(info);
                     break;
                 }
             }
-            let conn = panel.ok_or_else(|| anyhow!("no connected built-in panel"))?;
+            let conn = panel.ok_or_else(|| anyhow!("no connected built-in panel matching {wanted:?}"))?;
             let preferred = conn
                 .modes()
                 .iter()
@@ -599,7 +850,9 @@ pub mod kms {
                 if on_crtc {
                     attached.push(p);
                 }
-                if props.value("type")? == PlaneType::Primary as u64 && res.filter_crtcs(info.possible_crtcs()).contains(&crtc) {
+                if props.value("type")? == PlaneType::Primary as u64 && res.filter_crtcs(info.possible_crtcs()).contains(&crtc)
+                    && (on_crtc || info.crtc().is_none())
+                {
                     candidates.push((p, info.formats().to_vec(), props, on_crtc));
                 }
             }
@@ -622,15 +875,24 @@ pub mod kms {
 
             let make = || -> Result<Buf> {
                 let db = card.create_dumb_buffer((w, h), fourcc, 32).context("create dumb buffer")?;
-                let fb = card.add_planar_framebuffer(&Planar(&db), FbCmd2Flags::empty()).context("add framebuffer")?;
+                let fb = match card.add_planar_framebuffer(&Planar(&db), FbCmd2Flags::empty()) {
+                    Ok(fb) => fb,
+                    Err(e) => {
+                        let _ = card.destroy_dumb_buffer(db);
+                        return Err(e).context("add framebuffer");
+                    }
+                };
                 let len = buffer::Buffer::pitch(&db) as usize * h as usize;
                 let offset = drm_ffi::mode::dumbbuffer::map(card.as_fd(), buffer::Buffer::handle(&db).into(), 0, 0).context("map dumb buffer")?.offset;
                 let fd = card.as_fd().as_raw_fd();
                 let map = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, offset as libc::off_t) };
                 if map == libc::MAP_FAILED {
-                    return Err(std::io::Error::last_os_error()).context("mmap dumb buffer");
+                    let err = std::io::Error::last_os_error();
+                    let _ = card.destroy_framebuffer(fb);
+                    let _ = card.destroy_dumb_buffer(db);
+                    return Err(err).context("mmap dumb buffer");
                 }
-                Ok(Buf { db, fb, map: map.cast(), len })
+                Ok(Buf { card: card.clone(), db, fb, map: map.cast(), len })
             };
             let bufs = [make()?, make()?, make()?];
 
@@ -643,8 +905,9 @@ pub mod kms {
                 }
             }
             let crtc_props = Props::read(&card, crtc)?;
-            let blob = card.create_property_blob(&mode).context("create mode blob")?;
-            let first = card.create_property_blob(preferred).context("create mode blob")?;
+            let mut blobs = Blobs { card: card.clone(), ids: Vec::new() };
+            let blob = blobs.create(&mode)?;
+            let first = blobs.create(preferred)?;
             req.add_property(conn.handle(), conn_props.handle("CRTC_ID")?, property::Value::CRTC(Some(crtc)));
             // The mode is DSC-compressed: select its DSC variant, as Android's
             // compositor does.
@@ -673,7 +936,7 @@ pub mod kms {
                                 .into_iter()
                                 .find(|name| crtc_props.get(name).is_ok())
                                 .ok_or_else(|| anyhow!("the panel leaves its {pack_type} sub-pixel rendering to a CRTC that takes no setup for it"))?;
-                            let setup = card.create_property_blob(spr::setup(pack_type, name)?.as_slice()).context("create sub-pixel rendering blob")?;
+                            let setup = blobs.create(spr::setup(pack_type, name)?.as_slice())?;
                             Some((crtc_props.handle(name)?, setup, name))
                         }
                         None => None,
@@ -727,9 +990,12 @@ pub mod kms {
                 Ok((id, _)) => Some((id, enum_value(&card, id, "ON")?, enum_value(&card, id, "LP2")?)),
                 Err(_) => None,
             };
+            let connector = format!("{:?}-{}", conn.interface(), conn.interface_id());
             let conn = conn.handle();
             let s = KmsSurface {
                 card,
+                parked: None,
+                _blobs: blobs,
                 bufs,
                 back: 1,
                 flipping: false,
@@ -746,6 +1012,8 @@ pub mod kms {
                 slow: false,
                 w,
                 h,
+                rotation,
+                connector,
                 order,
                 summary,
             };
@@ -755,6 +1023,50 @@ pub mod kms {
 
         pub fn describe(&self) -> &str {
             &self.summary
+        }
+
+        /// Replace the other panel's boot splash with black and park it
+        /// before it is ever selected. Keep its normal KMS resources for
+        /// later switches, just as for a panel that has already shown UI.
+        pub fn prepare_panel(&mut self, wanted: &str, rotation: u16) -> Result<()> {
+            anyhow::ensure!(matches!(rotation, 0 | 90 | 180 | 270), "invalid panel rotation {rotation}");
+            anyhow::ensure!(self.connector != wanted, "the other panel must differ from the active one");
+            if let Some(parked) = &self.parked {
+                anyhow::ensure!(parked.connector == wanted && parked.rotation == rotation, "the cached panel does not match {wanted}");
+                return Ok(());
+            }
+            self.rest()?;
+            let mut parked = Self::on_card(self.card.clone(), Some(wanted), rotation).context("prepare the other panel")?;
+            let (w, h) = parked.size();
+            parked.present(&Canvas::new(w, h))?;
+            parked.settle()?;
+            parked.rest()?;
+            self.parked = Some(Box::new(parked));
+            Ok(())
+        }
+
+        /// Keep both panels on one DRM client, retaining the inactive
+        /// panel's buffers and mode for its next wake. Removing its last
+        /// framebuffer tears down the route behind the connector as well.
+        pub fn switch_panel(&mut self, wanted: &str, rotation: u16) -> Result<()> {
+            anyhow::ensure!(matches!(rotation, 0 | 90 | 180 | 270), "invalid panel rotation {rotation}");
+            if self.connector == wanted && self.rotation == rotation {
+                return Ok(());
+            }
+            // A fold parks the panel in the same low-power state as the
+            // power key. Waking it through LP's ON transition sends the
+            // panel's resume commands; a full power cycle on every fold
+            // intermittently leaves the MIX Fold 2's panels dark.
+            self.rest()?;
+            let mut next = if let Some(parked) = self.parked.take() {
+                anyhow::ensure!(parked.connector == wanted && parked.rotation == rotation, "the cached panel does not match {wanted}");
+                parked
+            } else {
+                Box::new(Self::on_card(self.card.clone(), Some(wanted), rotation).context("switch the panel")?)
+            };
+            std::mem::swap(self, &mut *next);
+            self.parked = Some(next);
+            Ok(())
         }
 
         pub fn is_on(&self) -> bool {
@@ -833,17 +1145,9 @@ pub mod kms {
         }
     }
 
-    impl Drop for KmsSurface {
-        fn drop(&mut self) {
-            for buf in &self.bufs {
-                unsafe { libc::munmap(buf.map.cast(), buf.len) };
-            }
-        }
-    }
-
     impl Surface for KmsSurface {
         fn size(&self) -> (u32, u32) {
-            (self.w, self.h)
+            if self.rotation.is_multiple_of(180) { (self.w, self.h) } else { (self.h, self.w) }
         }
 
         /// A command-mode panel is sent a frame from one of its TE signals
@@ -856,26 +1160,13 @@ pub mod kms {
         /// A display turned off comes on again with the frame, in the
         /// panel's preferred mode, as it first came up.
         fn present(&mut self, canvas: &Canvas) -> Result<()> {
-            if (canvas.w, canvas.h) != (self.w, self.h) {
-                return Err(anyhow!("canvas {}x{} does not match the display {}x{}", canvas.w, canvas.h, self.w, self.h));
+            if (canvas.w, canvas.h) != self.size() {
+                return Err(anyhow!("canvas {}x{} does not match the display {:?}", canvas.w, canvas.h, self.size()));
             }
-            let order = self.order;
             let buf = &self.bufs[self.back];
             let pitch = buffer::Buffer::pitch(&buf.db) as usize;
-            let row = self.w as usize * 4;
             let dst = unsafe { std::slice::from_raw_parts_mut(buf.map, buf.len) };
-            for y in 0..self.h as usize {
-                let src = &canvas.data[y * row..(y + 1) * row];
-                let out = &mut dst[y * pitch..y * pitch + row];
-                match order {
-                    Order::Rgba => out.copy_from_slice(src),
-                    Order::Bgra => {
-                        for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
-                            *o = [s[2], s[1], s[0], s[3]];
-                        }
-                    }
-                }
-            }
+            scanout(canvas, dst, pitch, self.rotation, matches!(self.order, Order::Bgra));
             let mut req = atomic::AtomicModeReq::new();
             for &(plane, fb_prop) in &self.planes {
                 req.add_property(plane, fb_prop, property::Value::Framebuffer(Some(buf.fb)));

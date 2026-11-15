@@ -21,6 +21,14 @@ impl App {
         (l.rows, l.cols)
     }
 
+    /// Keep the shell's existing screen when the panel geometry changes.
+    pub fn resize_terminal(&mut self, rows: u16, cols: u16) {
+        if let Some(term) = &mut self.term {
+            term.resize(rows, cols);
+        }
+        self.refresh();
+    }
+
     /// A shell has started for the terminal page, on a blank screen of
     /// `rows` by `cols`.
     pub fn term_started(&mut self, rows: u16, cols: u16) {

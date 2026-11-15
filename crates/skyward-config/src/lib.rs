@@ -50,6 +50,9 @@ pub struct DeviceConfig {
     pub modules: Modules,
     #[serde(default)]
     pub touch: Touch,
+    /// The other panel and the Qualcomm SSC sensor that selects it.
+    #[serde(default)]
+    pub fold: Option<Fold>,
     #[serde(default)]
     pub partitions: Partitions,
     /// Where the firmware the phone's drivers ask for is, on phones whose
@@ -84,7 +87,7 @@ pub struct DeviceConfig {
     /// The stock build the recovery is made on.
     #[serde(default)]
     pub stock: Option<Stock>,
-    /// A locally supplied custom recovery used as the ramdisk base.
+    /// A locally supplied recovery used as the ramdisk base.
     /// These images need their own init compatibility handling.
     #[serde(default)]
     pub recovery: Option<RecoveryBase>,
@@ -95,6 +98,9 @@ pub struct RecoveryBase {
     pub format: RecoveryFormat,
     /// SHA-256 of the complete, unmodified donor partition image.
     pub sha256: String,
+    /// Binder parcel header used by the libraries in this local base.
+    #[serde(default)]
+    pub binder_header: Option<String>,
     /// Installed libraries needed by newer vendor programs when the
     /// locally supplied base carries an older runtime. Copied atomically
     /// into the recovery's library directory before starting its HALs.
@@ -109,6 +115,7 @@ pub struct RecoveryBase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RecoveryFormat {
+    Stock,
     Orangefox,
 }
 
@@ -260,6 +267,10 @@ pub struct Haptics {
     /// driver plays the waveforms it keeps.
     #[serde(default)]
     pub click: Option<i16>,
+    /// Whole resonant swings driving a generated click before braking.
+    /// A motor that responds weakly to a short click can use more swings.
+    #[serde(default = "default_click_cycles")]
+    pub click_cycles: u8,
     /// The file the driver says the motor's resonance in.
     pub resonance: String,
     /// How the driver measures resonance. Existing Xiaomi drivers report
@@ -267,6 +278,10 @@ pub struct Haptics {
     #[serde(default)]
     pub resonance_unit: ResonanceUnit,
     pub strength: Strength,
+}
+
+fn default_click_cycles() -> u8 {
+    2
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -361,6 +376,22 @@ pub struct Display {
     /// sliding over another rounds its leading corners to it.
     #[serde(default)]
     pub corner_radius: u32,
+    /// Built-in connector, such as DSI-2 on a foldable's cover screen.
+    #[serde(default)]
+    pub connector: Option<String>,
+    /// Backlight class entry corresponding to the chosen connector.
+    #[serde(default)]
+    pub backlight: Option<String>,
+    /// msm_drm parameter naming this screen's device-tree panel.
+    #[serde(default)]
+    pub dsi_display: Option<String>,
+    /// Raw brightness at the slider's upper end when a panel does not
+    /// describe a separate normal maximum in its device tree.
+    #[serde(default)]
+    pub brightness_max: Option<u32>,
+    /// Clockwise rotation from the upright UI to the panel's scanout.
+    #[serde(default)]
+    pub rotation: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -389,9 +420,29 @@ impl Default for Modules {
 /// something before a recovery can read touches from it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct Touch {
+    /// Input device belonging to the selected screen on a foldable.
+    #[serde(default)]
+    pub name: Option<String>,
     /// What is written once the touchscreen's input device has appeared,
     /// each value to its file: the driver makes that device as the last
     /// step of starting the controller.
+    #[serde(default)]
+    pub writes: Vec<Write>,
+}
+
+/// The normal display is the cover; this display is used while unfolded.
+/// The sensor registry is copied from its partition into RAM before the
+/// sensor processor starts, so recovery never updates factory calibration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Fold {
+    pub display: Display,
+    pub touch: Touch,
+    pub sensor: String,
+    pub folded_value: f32,
+    pub unfolded_value: f32,
+    pub registry_partition: String,
+    pub registry_path: String,
+    pub registry_target: String,
     #[serde(default)]
     pub writes: Vec<Write>,
 }
@@ -582,6 +633,26 @@ impl DeviceConfig {
                 "[recovery] sha256: {} is not a SHA-256 in lowercase hex",
                 base.sha256
             );
+            ensure!(base.binder_header.as_deref().is_none_or(|h| matches!(h, "RECO" | "SYST")), "[recovery] binder_header must be RECO or SYST");
+        }
+        for display in std::iter::once(&cfg.display).chain(cfg.fold.iter().map(|f| &f.display)) {
+            for name in display.backlight.iter().chain(&display.dsi_display) {
+                ensure!(!name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != "..", "[display] {name} is not a sysfs entry name");
+            }
+            ensure!(display.brightness_max != Some(0), "[display] brightness_max must be positive");
+            ensure!(matches!(display.rotation, 0 | 90 | 180 | 270), "[display] rotation must be 0, 90, 180 or 270");
+        }
+        if let Some(fold) = &cfg.fold {
+            ensure!(cfg.display.connector.is_some() && fold.display.connector.is_some() && cfg.display.connector != fold.display.connector, "[fold] needs two distinct panel connectors");
+            ensure!(cfg.display.density > 0 && fold.display.density > 0 && cfg.touch.name.is_some() && fold.touch.name.is_some(), "[fold] needs each panel's density and touch device");
+            ensure!(!fold.sensor.is_empty() && fold.folded_value.is_finite() && fold.unfolded_value.is_finite() && fold.folded_value != fold.unfolded_value, "[fold] needs a sensor and two distinct finite state values");
+            let relative = |s: &str| !s.is_empty() && Path::new(s).components().all(|c| matches!(c, std::path::Component::Normal(_)));
+            ensure!(relative(&fold.registry_partition) && !fold.registry_partition.contains('/'), "[fold] registry_partition must be a partition name");
+            ensure!(relative(&fold.registry_path), "[fold] registry_path must stay inside its partition");
+            ensure!(fold.registry_target.starts_with('/') && !Path::new(&fold.registry_target).components().any(|c| matches!(c, std::path::Component::ParentDir)), "[fold] registry_target must be an absolute directory");
+            for write in &fold.writes {
+                ensure!(write.path.starts_with("/sys/") && !write.path.split('/').any(|p| p == ".."), "[fold] writes must name sysfs files");
+            }
         }
         if let Some(update) = &cfg.update
             && update.provider == UpdateProvider::Oplus
@@ -631,6 +702,7 @@ impl DeviceConfig {
             ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
         }
         if let Some(haptics) = &cfg.haptics {
+            ensure!((1..=8).contains(&haptics.click_cycles), "[haptics] click_cycles must be between 1 and 8");
             let file = &haptics.resonance;
             ensure!(file.starts_with('/'), "[haptics] resonance: {file} is not an absolute path");
             let Strength { lightest, strongest } = haptics.strength;
@@ -727,6 +799,43 @@ mod tests {
     }
 
     #[test]
+    fn zizhan_pins_stock_recovery_and_pairs_the_cover_panel_with_its_touch_and_backlight() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/zizhan.toml")).unwrap();
+        assert_eq!(cfg.recovery.as_ref().unwrap().format, RecoveryFormat::Stock);
+        assert_eq!(cfg.recovery.as_ref().unwrap().binder_header.as_deref(), Some("SYST"));
+        assert!(cfg.stock.is_none());
+        assert_eq!(cfg.display.connector.as_deref(), Some("DSI-2"));
+        assert_eq!(cfg.display.backlight.as_deref(), Some("panel1-backlight"));
+        assert_eq!(cfg.display.dsi_display.as_deref(), Some("dsi_display1"));
+        assert_eq!(cfg.touch.name.as_deref(), Some("fts-sec"));
+        assert_eq!(cfg.modules.load, ["fts_touch_spi_pri", "fts_touch_spi_sec"]);
+        let fold = cfg.fold.unwrap();
+        assert_eq!(fold.display.connector.as_deref(), Some("DSI-1"));
+        assert_eq!((fold.display.width, fold.display.height, fold.display.rotation), (1916, 2160, 270));
+        assert_eq!(fold.touch.name.as_deref(), Some("fts-pri"));
+        assert_eq!(fold.registry_partition, "persist");
+        assert!(cfg.wlan.unwrap().service.contains("::"));
+        let other = DeviceConfig::parse(include_str!("../../../devices/dodge.toml")).unwrap();
+        assert!(other.display.connector.is_none());
+        assert!(other.touch.name.is_none());
+        assert!(other.fold.is_none());
+    }
+
+    #[test]
+    fn foldable_panels_require_distinct_outputs_and_safe_registry_paths() {
+        let text = include_str!("../../../devices/zizhan.toml");
+        for (before, after) in [
+            ("rotation = 270", "rotation = 45"),
+            ("connector = \"DSI-1\"", "connector = \"DSI-2\""),
+            ("registry_path = \"sensors\"", "registry_path = \"../sensors\""),
+            ("registry_target = \"/mnt/vendor/persist/sensors\"", "registry_target = \"/mnt/../sensors\""),
+            ("unfolded_value = 0.0", "unfolded_value = 1.0"),
+        ] {
+            assert!(DeviceConfig::parse(&text.replace(before, after)).is_err(), "{after}");
+        }
+    }
+
+    #[test]
     fn dodge_pins_a_local_recovery_base_and_allows_panel_variants() {
         let cfg = DeviceConfig::parse(include_str!("../../../devices/dodge.toml")).unwrap();
         assert_eq!((cfg.device.codename.as_str(), cfg.device.brand.as_str()), ("dodge", "OnePlus"));
@@ -781,6 +890,13 @@ mod tests {
         let with = |body: &str| DeviceConfig::parse(&format!("[device]\ncodename = \"x\"\n[haptics]\n{body}\n"));
         let (strength, resonance) = ("strength = { lightest = 0.25, strongest = 1.0 }", "resonance = \"/sys/class/qcom-haptics/lra_frequency_hz\"");
         assert!(with(&format!("{resonance}\n{strength}")).is_ok(), "a click made");
+        assert_eq!(with(&format!("{resonance}\n{strength}")).unwrap().haptics.unwrap().click_cycles, 2, "existing motors keep their click length");
+        for cycles in [1, 4, 8] {
+            assert_eq!(with(&format!("{resonance}\n{strength}\nclick_cycles = {cycles}")).unwrap().haptics.unwrap().click_cycles, cycles);
+        }
+        for cycles in [0, 9] {
+            assert!(with(&format!("{resonance}\n{strength}\nclick_cycles = {cycles}")).is_err(), "{cycles} drive cycles refused");
+        }
         assert!(with(&format!("click = 0\n{resonance}\n{strength}")).is_ok(), "a click kept");
         assert!(with(&format!("click = 0\n{strength}")).is_err(), "no motor's resonance to make the ticks at");
         assert!(with(&format!("resonance = \"sys/f\"\n{strength}")).is_err(), "a file named from nowhere");

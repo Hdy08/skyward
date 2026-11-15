@@ -1268,6 +1268,47 @@ impl App {
         self.corners = radius;
     }
 
+    /// Reflow the current page onto another panel while keeping its page
+    /// stack, text fields, display power and work in progress. A gesture
+    /// never crosses panels, especially a swipe that confirms a partition
+    /// write.
+    pub fn resize(&mut self, w: u32, h: u32, px_per_dp: f32, now: u64) {
+        assert!(w > 0 && h > 0 && px_per_dp.is_finite() && px_per_dp > 0.0);
+        let scale = px_per_dp / self.px_per_dp;
+        for (_, scroll, _) in &mut self.stack {
+            *scroll *= scale;
+        }
+        (self.w, self.h, self.px_per_dp) = (w, h, px_per_dp);
+        self.button = None;
+        self.chord = None;
+        self.drag = Drag::Idle;
+        self.tracker.clear();
+        self.state.confirm = 0.0;
+        self.turn = None;
+        self.morph = None;
+        self.cue = None;
+        self.backdrop = None;
+        self.search_words = None;
+        self.chip = None;
+        self.button_chip = None;
+        self.dither = None;
+        self.charge_art = None;
+        self.charge_canvas = None;
+        self.drawn.clear();
+        self.spare.clear();
+        self.settle_page();
+        self.refresh();
+        if self.display_on {
+            self.wake(now);
+        } else {
+            // A fold chooses the next panel; it is not a wake request.
+            // Finish any fade to black before changing panels so the new
+            // backlight cannot light briefly during that fade.
+            self.darkening = None;
+            self.curtain.jump(false);
+        }
+    }
+
     pub fn theme(&self) -> Theme {
         if self.state.dark {
             Theme::dark(self.w, self.h, self.px_per_dp)
@@ -1600,5 +1641,69 @@ impl App {
         self.shown = None;
         self.layer = None;
         self.dirty = true;
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+    use crate::app::testing::*;
+
+    #[test]
+    fn switching_panels_preserves_the_page_and_text_but_cancels_confirmation() {
+        let mut app = App::new(Screen::Home, 1080, 2520, 2.75);
+        app.open(Screen::Settings);
+        app.state.data = Data::Open;
+        app.state.search = "ongoing work".into();
+        app.state.password = "typed on the phone".into();
+        let f = fonts();
+        app.frame(&f, &info());
+        app.drag = Drag::Confirm { which: Confirm::Install, track: Rect { x: 0.0, y: 0.0, w: 900.0, h: 160.0 }, grab: 0.0 };
+        app.state.confirm = 0.9;
+        app.resize(1916, 2160, 2.75, 1000);
+        assert_eq!(app.screen(), Screen::Settings);
+        assert_eq!(app.stack.len(), 2);
+        assert_eq!(app.state.data, Data::Open);
+        assert_eq!(app.state.search, "ongoing work");
+        assert_eq!(app.state.password, "typed on the phone");
+        assert_eq!(app.state.confirm, 0.0);
+        assert!(app.display_on(), "switching a lit panel keeps it lit");
+        assert!(app.touch(Touch::Up, &f, 1001).is_empty(), "lifting a finger on the other panel must not install anything");
+        assert_eq!(app.frame(&f, &info()).canvas.w, 1916);
+        app.resize(1080, 2520, 2.75, 2000);
+        assert_eq!(app.frame(&f, &info()).canvas.w, 1080);
+        assert_eq!(app.screen(), Screen::Settings);
+    }
+
+    #[test]
+    fn switching_dark_panels_stays_dark_until_the_power_key_wakes_them() {
+        for manual in [true, false] {
+            for wait in [0, 8000] {
+                let mut app = App::new(Screen::Home, 1916, 2160, 2.75);
+                app.open(Screen::Settings);
+                app.tick(0);
+                let off = if manual {
+                    press(&mut app, Key::Power, 1000);
+                    1000
+                } else {
+                    app.tick(120_000);
+                    120_000
+                };
+                let now = off + wait;
+                app.tick(now);
+                assert!(!app.display_on());
+                app.resize(1080, 2520, 2.75, now);
+                assert!(!app.display_on(), "closing the phone must not wake it");
+                assert_eq!(app.panel(now), None, "even a fold during the fade must not flash the new panel");
+                app.resize(1916, 2160, 2.75, now + 10);
+                assert!(!app.display_on(), "opening the phone must not wake it");
+                assert_eq!(app.panel(now + 10), None);
+                assert_eq!(app.screen(), Screen::Settings);
+                press(&mut app, Key::Power, now + 100);
+                assert!(app.display_on(), "one power-key press wakes the selected panel");
+                assert!(app.panel(now + 100).is_some());
+                assert_eq!(app.screen(), Screen::Settings);
+            }
+        }
     }
 }

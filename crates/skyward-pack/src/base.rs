@@ -11,6 +11,7 @@ pub fn verify(cfg: &DeviceConfig, bytes: &[u8]) -> Result<()> {
         let sum = hex::encode(Sha256::digest(bytes));
         ensure!(sum == base.sha256, "the recovery base has SHA-256 {sum}; [recovery] requires {}", base.sha256);
         match base.format {
+            RecoveryFormat::Stock => {}
             RecoveryFormat::Orangefox => {
                 ensure!(cfg.device.codename == "dodge", "OrangeFox base compatibility is implemented only for dodge");
                 ensure!(bytes.len() == 104_857_600, "dodge's recovery partition is 104857600 bytes");
@@ -26,7 +27,25 @@ pub fn prepare(cfg: &DeviceConfig, image: &BootImage, rd: &mut Ramdisk) -> Resul
         ensure!(!custom, "this is a custom recovery; its compatibility and SHA-256 must be configured in [recovery]");
         return Ok(());
     };
+    if let Some(header) = &base.binder_header {
+        let mut props = rd.find(ramdisk::PROP_DEFAULT).context("the base has no prop.default")?.data.clone();
+        props.extend_from_slice(format!("\nro.skyward.binder.header={header}\n").as_bytes());
+        rd.replace(ramdisk::PROP_DEFAULT, props)?;
+    }
     match base.format {
+        RecoveryFormat::Stock => {
+            ensure!(!custom, "the configured stock base contains a custom recovery ramdisk");
+            let props = &rd.find(ramdisk::PROP_DEFAULT).context("the base has no prop.default")?.data;
+            let device = format!("ro.product.system.device={}", cfg.device.codename);
+            ensure!(props.split(|b| *b == b'\n').any(|l| l == device.as_bytes()), "the stock base's product is not {}", cfg.device.codename);
+            // Android 12 stock recoveries do not carry Binder's service
+            // directory. Supply only its init declaration here; Skyward
+            // takes the binary and runtime from the installed system in RAM.
+            if rd.find("system/bin/servicemanager").is_none() {
+                rd.add("system/etc/init/skyward-servicemanager.rc", 0o644, include_bytes!("servicemanager.rc").to_vec())?;
+                rd.add("skyward/installed-servicemanager", 0o644, Vec::new())?;
+            }
+        }
         RecoveryFormat::Orangefox => {
             ensure!(custom, "the configured OrangeFox base has no OrangeFox ramdisk");
             ensure!(image.header.header_version() == 4 && image.kernel.is_empty(), "dodge requires a v4 recovery image without a kernel");
@@ -87,6 +106,28 @@ mod tests {
         let mut rd = Ramdisk { entries: Vec::new() };
         rd.add("twres/ui.xml", 0o644, Vec::new()).unwrap();
         assert!(prepare(&cfg, &image(), &mut rd).unwrap_err().to_string().contains("custom recovery"));
+    }
+
+    #[test]
+    fn an_older_stock_base_gets_a_service_directory_declaration_without_foreign_binaries() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/zizhan.toml")).unwrap();
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add(ramdisk::PROP_DEFAULT, 0o644, b"ro.product.system.device=zizhan\n".to_vec()).unwrap();
+        rd.add("system/bin/init", 0o755, b"stock init".to_vec()).unwrap();
+        prepare(&cfg, &image(), &mut rd).unwrap();
+        assert_eq!(rd.find("system/bin/init").unwrap().data, b"stock init");
+        assert!(rd.find("system/bin/servicemanager").is_none());
+        assert!(rd.find("skyward/installed-servicemanager").is_some());
+        assert!(rd.find("system/etc/init/skyward-servicemanager.rc").is_some());
+        assert!(rd.find(ramdisk::PROP_DEFAULT).unwrap().data.ends_with(b"ro.skyward.binder.header=SYST\n"));
+    }
+
+    #[test]
+    fn a_stock_base_of_another_device_is_refused() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/zizhan.toml")).unwrap();
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add(ramdisk::PROP_DEFAULT, 0o644, b"ro.product.system.device=another\n".to_vec()).unwrap();
+        assert!(prepare(&cfg, &image(), &mut rd).unwrap_err().to_string().contains("product is not zizhan"));
     }
 
     #[test]

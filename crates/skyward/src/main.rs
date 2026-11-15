@@ -14,6 +14,8 @@ mod decrypt;
 #[cfg(target_os = "android")]
 mod filework;
 #[cfg(target_os = "android")]
+mod fold;
+#[cfg(target_os = "android")]
 mod haptics;
 #[cfg(target_os = "android")]
 mod input;
@@ -80,6 +82,12 @@ enum Cmd {
     },
     /// Run as the recovery service (what init starts as /system/bin/recovery).
     Recovery,
+    /// Read fold state changes using the installed vendor sensor runtime.
+    #[cfg(target_os = "android")]
+    FoldWatch {
+        #[arg(long, default_value = "/skyward/device.toml")]
+        config: PathBuf,
+    },
     /// Reboot through init: system, recovery, fastboot, bootloader, edl, or
     /// off.
     Reboot { target: String },
@@ -248,6 +256,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Recovery => recovery(),
+        #[cfg(target_os = "android")]
+        Cmd::FoldWatch { config } => fold::watch(&DeviceConfig::load(config)?.fold.context("this device has no fold sensor")?),
         Cmd::Reboot { target } => {
             let p = Power::parse(&target).ok_or_else(|| anyhow!("unknown target {target:?}"))?;
             skyward_sys::power(p)
@@ -447,7 +457,7 @@ fn main() -> Result<()> {
                 Ok(steps) => programs.extend(keys::programs(&steps)),
                 Err(e) => eprintln!("the programs of the phone's keys are not known: {e:#}"),
             }
-            ui::run(&cfg, &programs, &font, &mono, bcb::Request::default(), start, dump.as_deref())
+            ui::run(&cfg, &programs, &font, &mono, bcb::Request::default(), start, dump.as_deref(), None)
         }
     }
 }
@@ -518,7 +528,7 @@ fn load_modules(cfg: &DeviceConfig, names: &[String]) -> Result<Vec<PathBuf>> {
 /// among the phone's partitions: where what the partitions say could not
 /// be made out, the phone's devices are up before that is said.
 #[cfg(target_os = "android")]
-fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Found>) -> Result<()> {
+fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Found>, fold_monitor: &mut Option<fold::Monitor>) -> Result<()> {
     let nodes = skyward_sys::ueventd::apply()?;
     skyward_sys::kmsg(&format!("{nodes} device nodes given the owner their phone describes"))?;
     let props = skyward_info::installed_props(slot)?;
@@ -565,6 +575,8 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
             Err(e) => skyward_sys::kmsg(&format!("optional module {name}: {e:#}"))?,
         }
     }
+    let nodes = skyward_sys::ueventd::apply()?;
+    skyward_sys::kmsg(&format!("{nodes} device nodes given their installed permissions after module loading"))?;
     if cfg.recovery.is_some() {
         skyward_sys::set_prop("skyward.modules.ready", "1")?;
     }
@@ -583,11 +595,13 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     // programs and of those that use the phone's keys together.
     let key_programs = found.as_deref().map(keys::programs).unwrap_or_default();
     let programs = || services.iter().map(|p| &p.service).chain(&key_programs);
-    let hardware: Vec<String> = programs().filter_map(|s| s.ready_hardware_service.clone()).collect();
+    let mut hardware: Vec<String> = programs().filter_map(|s| s.ready_hardware_service.clone()).collect();
+    hardware.extend(cfg.wlan.iter().filter(|w| w.service.contains("::")).map(|w| w.service.clone()));
     if !hardware.is_empty() {
         secure::prepare_hardware_directory(&hardware)?;
         skyward_sys::kmsg("the directory for the phone's hardware services can run")?;
     }
+    secure::prepare_service_directory()?;
     // A program that registers with the service directory needs the
     // directory to know the phone describes what it registers, and so does
     // the secure element service where the recovery serves it. The WLAN's
@@ -598,7 +612,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     if found.as_deref().is_ok_and(keys::serves_elements) {
         registering.push(skyward_omapi::SERVICE.to_string());
     }
-    registering.extend(cfg.wlan.iter().map(|w| w.service.clone()));
+    registering.extend(cfg.wlan.iter().filter(|w| !w.service.contains("::")).map(|w| w.service.clone()));
     // A program may register more than the recovery waits for, as the
     // WLAN's supplicant registers its maker's own service beside
     // Android's, and ends where the directory turns one of them away. So
@@ -614,7 +628,28 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     if let Some(dir) = &libraries {
         skyward_sys::kmsg(&format!("the phone's own libraries are at {}", dir.display()))?;
     }
+    let fold_ready = match &cfg.fold {
+        Some(config) => match fold::prepare(config) {
+            Ok(()) => true,
+            Err(error) => {
+                skyward_sys::kmsg(&format!("fold sensor registry preparation failed: {error:#}"))?;
+                false
+            }
+        },
+        None => false,
+    };
     services::start(&services, libraries.as_deref())?;
+    if fold_ready {
+        fold::boot(cfg.fold.as_ref().expect("a prepared fold sensor"))?;
+        // Subscribe while the key services finish starting, before any
+        // display is taken from the bootloader or WLAN changes mounts.
+        if fold_monitor.is_none() {
+            match fold::Monitor::start() {
+                Ok(monitor) => *fold_monitor = Some(monitor),
+                Err(error) => skyward_sys::kmsg(&format!("fold sensor client did not start early: {error:#}"))?,
+            }
+        }
+    }
     let steps = found.context("make out from the phone's partitions how its keys are used")?;
     for line in keys::describe(&steps) {
         skyward_sys::kmsg(&format!("for the phone's keys: {}", line.replace("\n  ", ", ")))?;
@@ -848,11 +883,12 @@ fn recovery() -> Result<()> {
             // erasing them, which may take super with them, and undoing
             // shared blocks, which writes to the slot's own.
             let mut programs = cfg.services.clone();
+            let mut fold_monitor = None;
             if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
-                programs.extend(prepare(&cfg, booted_slot()?)?);
+                programs.extend(prepare(&cfg, booted_slot()?, &mut fold_monitor)?);
             }
             let root = Path::new("/");
-            ui::run(&cfg, &programs, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), request, Screen::Home, None)
+            ui::run(&cfg, &programs, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), request, Screen::Home, None, fold_monitor)
         }
         #[cfg(not(target_os = "android"))]
         {
@@ -870,7 +906,7 @@ fn recovery() -> Result<()> {
 /// stay usable when super cannot be mounted, as after it is wiped, so the
 /// reason goes to the kernel log instead.
 #[cfg(target_os = "android")]
-fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<Vec<skyward_config::Service>> {
+fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot, fold_monitor: &mut Option<fold::Monitor>) -> Result<Vec<skyward_config::Service>> {
     match skyward_vab::mount_partitions(slot) {
         Ok(mounts) => {
             for d in &mounts.damaged {
@@ -884,7 +920,7 @@ fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<Vec<skyward_co
             let programs = steps.map(keys::programs).unwrap_or_default();
             // Without them the screen still shows and the keys still work,
             // so this reason goes to the kernel log as well.
-            if let Err(e) = bring_up(cfg, slot, found) {
+            if let Err(e) = bring_up(cfg, slot, found, fold_monitor) {
                 skyward_sys::kmsg(&format!("devices not brought up: {e:#}"))?;
             }
             Ok(programs)

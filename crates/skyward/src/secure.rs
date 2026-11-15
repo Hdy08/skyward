@@ -52,6 +52,36 @@ const EARLY_LOADER: &str = "/system/bin/bootstrap/linker64";
 const RUNTIME_BUNDLE: &str = "com.android.runtime";
 const BUNDLE_LOADER: &str = "bin/linker64";
 
+/// The installed framework and an older vendor need separate copies of
+/// Binder's C++ library. Vendor services that need framework libraries
+/// use this configuration inside a private mount namespace.
+pub(crate) const VENDOR_LINKER_CONFIG: &str = "/skyward/run/vendor-ld.config.txt";
+
+/// Whether an old stock recovery has prepared a private vendor runtime
+/// for this installed program.
+pub fn uses_vendor_runtime(program: &str) -> bool {
+    (program.starts_with("/vendor/") || program.starts_with("/odm/")) && Path::new(VENDOR_LINKER_CONFIG).is_file()
+}
+
+/// Enter the installed vendor's runtime without changing the recovery's
+/// own loader, libraries, or mount namespace.
+///
+/// # Safety
+/// Call only in a child's pre-exec hook, before dropping root. This uses
+/// only system calls and does not allocate between fork and exec.
+pub unsafe fn enter_vendor_runtime() -> std::io::Result<()> {
+    if unsafe {
+        libc::unshare(libc::CLONE_NEWNS) != 0
+            || libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_PRIVATE | libc::MS_REC, std::ptr::null()) != 0
+            || libc::mount(c"/skyward/run/vendor-ld.config.txt".as_ptr(), c"/linkerconfig/ld.config.txt".as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) != 0
+            || libc::mount(c"/system/bin/bootstrap/linker64".as_ptr(), c"/system/bin/linker64".as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) != 0
+    } {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Which programs may register which hardware services, and where the
 /// directory for those services looks for that.
 const SERVICE_LABELS: &str = "/mnt/system/system/etc/selinux/plat_hwservice_contexts";
@@ -85,6 +115,32 @@ const RECOVERY_MANIFEST: &str = "/system/etc/vintf/manifest.xml";
 ///
 /// `wanted` names the hardware services that will be asked for.
 pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
+    prepare_binder_devices()?;
+    prepare_system_loader()?;
+    let driver = Path::new(HARDWARE_DRIVER);
+    if !driver.exists() {
+        std::os::unix::fs::symlink(HARDWARE_DRIVER_NODE, driver)
+            .with_context(|| format!("point {HARDWARE_DRIVER} at {HARDWARE_DRIVER_NODE}"))?;
+    }
+    fs::set_permissions(driver, std::os::unix::fs::PermissionsExt::from_mode(0o666))
+        .with_context(|| format!("open {HARDWARE_DRIVER} to every program"))?;
+    let from = Path::new(SERVICE_LABELS);
+    let into = Path::new(RECOVERY_LABELS).join(from.file_name().expect("a named file"));
+    fs::create_dir_all(RECOVERY_LABELS).with_context(|| format!("make {RECOVERY_LABELS}"))?;
+    fs::set_permissions(RECOVERY_LABELS, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
+    let manifest = Path::new(RECOVERY_MANIFEST);
+    let parent = manifest.parent().expect("the manifest is in a directory");
+    fs::create_dir_all(parent).with_context(|| format!("make {}", parent.display()))?;
+    fs::set_permissions(parent, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    fs::write(manifest, describe_hardware(wanted)?).with_context(|| format!("write {RECOVERY_MANIFEST}"))?;
+    fs::set_permissions(RECOVERY_MANIFEST, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
+    skyward_sys::set_prop(DIRECTORY_OFF, "false")?;
+    Ok(())
+}
+
+/// Use the installed loader together with the installed system libraries.
+fn prepare_system_loader() -> Result<()> {
     // A loader and the lowest libraries are built together and agree
     // between them on how a program's own storage is laid out, so the
     // installed system's programs are loaded by the installed system's
@@ -105,33 +161,93 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
         fs::remove_file(loader).with_context(|| format!("take away {}", loader.display()))?;
     }
     std::os::unix::fs::symlink(&from, loader).with_context(|| format!("point {} at {}", loader.display(), from.display()))?;
-    let driver = Path::new(HARDWARE_DRIVER);
-    if !driver.exists() {
-        std::os::unix::fs::symlink(HARDWARE_DRIVER_NODE, driver)
-            .with_context(|| format!("point {HARDWARE_DRIVER} at {HARDWARE_DRIVER_NODE}"))?;
+    Ok(())
+}
+
+/// Android 12 stock recovery omits servicemanager. Its init declaration
+/// is packed only for such a base, and starts after the installed binary,
+/// loader and label file have been supplied in the recovery's RAM.
+pub fn prepare_service_directory() -> Result<()> {
+    if !Path::new("/skyward/installed-servicemanager").exists() {
+        return Ok(());
     }
-    // The system's own init opens the driver to every program, as it does
-    // /dev/binder; a recovery's, which uses none of it, leaves it root's
-    // alone, and the directory and the services that register with it run
-    // as the users their init scripts name.
-    fs::set_permissions(driver, std::os::unix::fs::PermissionsExt::from_mode(0o666))
-        .with_context(|| format!("open {HARDWARE_DRIVER} to every program"))?;
-    let from = Path::new(SERVICE_LABELS);
-    let into = Path::new(RECOVERY_LABELS).join(from.file_name().expect("a named file"));
-    fs::create_dir_all(RECOVERY_LABELS).with_context(|| format!("make {RECOVERY_LABELS}"))?;
-    // The directory reads both of these as the user its init script names,
-    // and what the recovery makes under its own umask is root's alone: they
-    // are given the modes the system's own copies have.
-    fs::set_permissions(RECOVERY_LABELS, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .with_context(|| format!("open {RECOVERY_LABELS} to every user"))?;
-    fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
-    fs::write(RECOVERY_MANIFEST, describe_hardware(wanted)?).with_context(|| format!("write {RECOVERY_MANIFEST}"))?;
-    fs::set_permissions(RECOVERY_MANIFEST, std::os::unix::fs::PermissionsExt::from_mode(0o644))
-        .with_context(|| format!("let every user read {RECOVERY_MANIFEST}"))?;
-    // The directory turns itself off when it cannot find its own
-    // description, and a run of it before this was written may have left
-    // that behind.
-    skyward_sys::set_prop(DIRECTORY_OFF, "false")?;
+    prepare_binder_devices()?;
+    prepare_system_loader()?;
+    let driver = Path::new("/dev/binder");
+    if !driver.exists() {
+        std::os::unix::fs::symlink("/dev/binderfs/binder", driver)?;
+    }
+    fs::set_permissions(driver, std::os::unix::fs::PermissionsExt::from_mode(0o666))?;
+    if crate::services::running(DIRECTORY_PROGRAM).is_none() {
+        let work = format!("{DIRECTORY_PROGRAM}.skyward");
+        fs::copy("/mnt/system/system/bin/servicemanager", &work).context("take the installed service directory")?;
+        fs::set_permissions(&work, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+        fs::rename(work, DIRECTORY_PROGRAM)?;
+        fs::create_dir_all(RECOVERY_LABELS)?;
+        fs::copy("/mnt/system/system/etc/selinux/plat_service_contexts", Path::new(RECOVERY_LABELS).join("plat_service_contexts"))?;
+        skyward_sys::set_prop("ctl.start", DIRECTORY_SERVICE)?;
+        let until = Instant::now() + REGISTER_TIMEOUT;
+        loop {
+            if skyward_binder::driver::Binder::open().and_then(|b| skyward_binder::service::names(&b)).is_ok() {
+                break;
+            }
+            ensure!(Instant::now() < until, "the installed service directory did not answer in recovery");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        skyward_sys::kmsg("the installed service directory runs with its own runtime in recovery RAM")?;
+    }
+    if let Some(vndk) = libraries()? {
+        let config = include_str!("vendor-ld.config.txt").replace("@VNDK_LIBRARIES@", &vndk.to_string_lossy());
+        fs::write(VENDOR_LINKER_CONFIG, config).context("prepare the installed vendor's linker namespaces")?;
+        fs::set_permissions(VENDOR_LINKER_CONFIG, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
+    }
+    Ok(())
+}
+
+/// A stock Android 12 recovery's init may leave binderfs unmounted when
+/// paired with a newer GKI that exposes no legacy Binder device nodes.
+/// Allocate the three independent drivers through binder-control; their
+/// major/minor numbers belong to this mount and must never be guessed.
+fn prepare_binder_devices() -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    let names = ["binder", "hwbinder", "vndbinder"];
+    if names.iter().all(|name| Path::new("/dev").join(name).exists()) {
+        return Ok(());
+    }
+    let root = Path::new("/dev/binderfs");
+    fs::create_dir_all(root)?;
+    if !root.join("binder-control").exists() {
+        let rc = unsafe { libc::mount(c"binder".as_ptr(), c"/dev/binderfs".as_ptr(), c"binder".as_ptr(), libc::MS_NOSUID, std::ptr::null()) };
+        ensure!(rc == 0, "mount binderfs: {}", std::io::Error::last_os_error());
+    }
+    let control = fs::OpenOptions::new().read(true).write(true).open(root.join("binder-control"))?;
+    #[repr(C)]
+    struct Device {
+        name: [u8; 256],
+        major: u32,
+        minor: u32,
+    }
+    const ADD: libc::c_ulong = (3 << 30) | ((size_of::<Device>() as libc::c_ulong) << 16) | ((b'b' as libc::c_ulong) << 8) | 1;
+    for name in names {
+        let link = Path::new("/dev").join(name);
+        if link.exists() {
+            continue;
+        }
+        let device = root.join(name);
+        if !device.exists() {
+            let mut request = Device { name: [0; 256], major: 0, minor: 0 };
+            request.name[..name.len()].copy_from_slice(name.as_bytes());
+            let rc = unsafe { libc::ioctl(control.as_raw_fd(), ADD as _, &mut request) };
+            ensure!(rc == 0, "make {name} in binderfs: {}", std::io::Error::last_os_error());
+        }
+        if !link.is_symlink() {
+            std::os::unix::fs::symlink(&device, &link)?;
+        }
+        fs::set_permissions(&link, fs::Permissions::from_mode(0o666))?;
+        skyward_sys::kmsg(&format!("prepared {name} through binderfs"))?;
+    }
     Ok(())
 }
 

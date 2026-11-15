@@ -11,7 +11,6 @@ pub(crate) const RATE: u32 = 8000;
 
 /// A made click: swings of the motor at its resonant frequency that drive
 /// it, then swings turned over that stop it, so that it does not ring on.
-const DRIVE_SWINGS: f32 = 2.0;
 const BRAKE_SWINGS: f32 = 1.5;
 /// The ticks of the screen going off by the power key, as the phone's own
 /// system plays them on the 17 Ultra, whose motor swings at [`TICKS_HZ`]:
@@ -42,9 +41,9 @@ pub(crate) fn share(strength: &Strength, position: f32) -> f32 {
 
 /// A click's samples at [`RATE`] for a motor that swings at `hz`: whole
 /// swings that drive it, then swings turned over that stop it.
-pub(crate) fn made(hz: f32) -> Vec<i8> {
+pub(crate) fn made(hz: f32, cycles: u8) -> Vec<i8> {
     let at = |swings: f32| (swings * RATE as f32 / hz).round() as usize;
-    let (drive, all) = (at(DRIVE_SWINGS), at(DRIVE_SWINGS + BRAKE_SWINGS));
+    let (drive, all) = (at(f32::from(cycles)), at(f32::from(cycles) + BRAKE_SWINGS));
     (0..all)
         .map(|i| {
             let wave = (TAU * hz * i as f32 / RATE as f32).sin() * f32::from(i8::MAX);
@@ -80,14 +79,28 @@ mod tests {
 
     #[test]
     fn a_made_click_drives_whole_swings_then_turns_over() {
-        let samples = made(172.4);
-        let drive = (DRIVE_SWINGS * RATE as f32 / 172.4).round() as usize;
+        let samples = made(172.4, 2);
+        let drive = (2.0 * RATE as f32 / 172.4).round() as usize;
         assert_eq!(samples.len(), (3.5 * RATE as f32 / 172.4).round() as usize);
         assert_eq!(samples[0], 0);
         assert_eq!(*samples.iter().max().unwrap(), i8::MAX);
         let quarter = (RATE as f32 / 172.4 / 4.0).round() as usize;
         assert!(samples[quarter] > 120, "it rises first");
         assert!(samples[drive + quarter] < -120, "it falls first once turned over");
+    }
+
+    #[test]
+    fn a_longer_click_extends_the_drive_at_the_same_peak_and_keeps_the_brake() {
+        let hz = 195.4;
+        let short = made(hz, 2);
+        let long = made(hz, 4);
+        let drive = (4.0 * RATE as f32 / hz).round() as usize;
+        let short_drive = (2.0 * RATE as f32 / hz).round() as usize;
+        assert_eq!(&long[..short_drive], &short[..short_drive]);
+        assert_eq!(long.len(), (5.5 * RATE as f32 / hz).round() as usize);
+        assert_eq!(long.iter().map(|v| v.unsigned_abs()).max(), Some(i8::MAX as u8));
+        let quarter = (RATE as f32 / hz / 4.0).round() as usize;
+        assert!(long[drive + quarter] < -120, "the extra drive is followed by reversed braking");
     }
 
     #[test]

@@ -270,7 +270,9 @@ fn shade(g: &Glow, discs: &[(f32, f32, f32); 4], colors: &[[f32; 4]; 4], t: f32,
     let mut c = [0.0f32; 3];
     let mut a = 0.0f32;
     for (i, &(x, y, r)) in discs.iter().enumerate() {
-        let d = (bx - x).hypot(by - y);
+        let (dx, dy) = (bx - x, by - y);
+        if dx * dx + dy * dy >= r * r { continue; }
+        let d = dx.hypot(dy);
         if d >= r {
             continue;
         }
@@ -377,12 +379,92 @@ pub fn paint(out: &mut Canvas, field: &Field, fade: f32, layer: &Layer, dither: 
     let w = out.w as usize;
     assert_eq!(dither.w, w, "the dither was made for this screen");
     assert!(out.whole() && layer.canvas.whole(), "the field fills a whole screen under a whole page");
+    #[cfg(target_os = "android")]
+    if w * out.h as usize >= 3_000_000 && let Some(pool) = paint_pool() {
+        let top = out.h as usize / 2;
+        let (upper, lower) = out.data.split_at_mut(top * w * 4);
+        pool.install(|| rayon::join(
+            || paint_rows(upper, 0, w, field, fade, layer, dither),
+            || paint_rows(lower, top, w, field, fade, layer, dither),
+        ));
+        return;
+    }
+    paint_rows(&mut out.data, 0, w, field, fade, layer, dither);
+}
+
+/// Reuse a private pair of workers. Creating a thread for each frame
+/// discards its scheduling history and made the device migrate the UI
+/// between cores and lower its clock even while frames were late.
+#[cfg(target_os = "android")]
+fn paint_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|i| format!("skyward-glow-{i}"))
+            .build().ok()?;
+        // A brief frame separated by idle time otherwise runs before the
+        // governor has ramped up. Keep the performance hint on the workers
+        // that paint it; they park when there is no large field to draw.
+        pool.broadcast(|_| paint_minimum(1024)).into_iter().all(|ok| ok).then_some(pool)
+    }).as_ref()
+}
+
+// linux/sched/types.h, including the utilization-clamp extension.
+#[cfg(target_os = "android")]
+#[derive(Default)]
+#[repr(C)]
+struct SchedAttr {
+    size: u32, policy: u32, flags: u64, nice: i32, priority: u32,
+    runtime: u64, deadline: u64, period: u64, util_min: u32, util_max: u32,
+}
+
+#[cfg(target_os = "android")]
+fn paint_minimum(minimum: u32) -> bool {
+    const _: () = assert!(std::mem::size_of::<SchedAttr>() == 56);
+    // KEEP_POLICY | KEEP_PARAMS | UTIL_CLAMP_MIN: retain the normal
+    // scheduler and priority, changing only this thread's capacity hint.
+    let attr = SchedAttr { size: 56, flags: 0x38, util_min: minimum, ..Default::default() };
+    unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0) == 0 }
+}
+
+#[cfg(target_os = "android")]
+fn paint_minimum_now() -> Option<u32> {
+    let mut attr = SchedAttr { size: 56, ..Default::default() };
+    (unsafe { libc::syscall(libc::SYS_sched_getattr, 0, &mut attr as *mut SchedAttr, 56, 0) } == 0).then_some(attr.util_min)
+}
+
+/// Keep the caller ready for a large animated page, including frame
+/// submission and waits between frames. Drop it when that page is left or
+/// the display goes dark to restore the caller's original capacity hint.
+#[cfg(target_os = "android")]
+pub struct PaintPerformance(Option<u32>, std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(target_os = "android")]
+impl PaintPerformance {
+    pub fn request() -> Self {
+        Self(paint_minimum_now().filter(|&was| was != 1024 && paint_minimum(1024)), std::marker::PhantomData)
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Drop for PaintPerformance {
+    fn drop(&mut self) {
+        if let Some(was) = self.0 { paint_minimum(was); }
+    }
+}
+
+/// Each row uses only the sampled field and the cached page. Independent
+/// bands can be painted together on a large display without changing the
+/// field, dither coordinates, alpha rounding, or scrolling position.
+fn paint_rows(pixels: &mut [u8], top: usize, w: usize, field: &Field, fade: f32, layer: &Layer, dither: &Dither) {
     let clear = [Run { x0: 0, x1: w as u16, cover: Cover::Clear }];
     let mut start = vec![[0i32; 3]; field.cols - 1];
     let mut step = vec![[0i32; 3]; field.cols - 1];
     // A dither value in sixteenths times this gives 16.16 fixed point.
     let shade = (fade * 4096.0).round() as i32;
-    for (y, row) in out.data.chunks_exact_mut(w * 4).enumerate() {
+    for (r, row) in pixels.chunks_exact_mut(w * 4).enumerate() {
+        let y = top + r;
         field.row(y, &mut start, &mut step);
         let row = row.as_chunks_mut::<4>().0;
         let noise = &dither.steps[y * w..(y + 1) * w];
@@ -396,8 +478,7 @@ pub fn paint(out: &mut Canvas, field: &Field, fade: f32, layer: &Layer, dither: 
             match (run.cover, src) {
                 (Cover::Solid, Some(src)) => px.copy_from_slice(&src[x0..x1]),
                 (Cover::Partial, Some(src)) => {
-                    field_span(px, &noise[x0..x1], x0, field.cell, &start, &step, shade);
-                    lay_span(px, &src[x0..x1]);
+                    field_layer(px, &noise[x0..x1], (x0, field.cell), &start, &step, shade, Some(&src[x0..x1]));
                 }
                 _ => field_span(px, &noise[x0..x1], x0, field.cell, &start, &step, shade),
             }
@@ -409,13 +490,24 @@ pub fn paint(out: &mut Canvas, field: &Field, fade: f32, layer: &Layer, dither: 
 /// per entry of `px`, dithered by `noise` at `shade`. Each cell's loop is
 /// straight enough for the compiler to run on vector registers.
 fn field_span(px: &mut [[u8; 4]], noise: &[i8], x0: usize, cell: usize, start: &[[i32; 3]], step: &[[i32; 3]], shade: i32) {
+    field_layer(px, noise, (x0, cell), start, step, shade, None);
+}
+
+/// Blend a translucent card while its background is still in registers.
+/// A separate pass would store, reload and store the same field pixels.
+fn field_layer(px: &mut [[u8; 4]], noise: &[i8], (x0, cell): (usize, usize), start: &[[i32; 3]], step: &[[i32; 3]], shade: i32, over: Option<&[[u8; 4]]>) {
     let x1 = x0 + px.len();
     let mut x = x0;
     while x < x1 {
         let i = (x / cell).min(start.len() - 1);
         let end = if i + 1 == start.len() { x1 } else { ((i + 1) * cell).min(x1) };
         let (s, st, from) = (start[i], step[i], (x - i * cell) as i32);
-        for (j, (p, &d)) in px[x - x0..end - x0].iter_mut().zip(&noise[x - x0..end - x0]).enumerate() {
+        let (pixels, noise) = (&mut px[x - x0..end - x0], &noise[x - x0..end - x0]);
+        #[cfg(target_arch = "aarch64")]
+        let done = field_vectors(pixels, noise, s, st, from, shade, over.map(|o| &o[x - x0..end - x0]));
+        #[cfg(not(target_arch = "aarch64"))]
+        let done = 0;
+        for (j, (p, &d)) in pixels.iter_mut().zip(noise).enumerate().skip(done) {
             let (k, d) = (from + j as i32, d as i32 * shade);
             *p = [
                 ((s[0] + st[0] * k + d) >> 16).clamp(0, 255) as u8,
@@ -423,9 +515,57 @@ fn field_span(px: &mut [[u8; 4]], noise: &[i8], x0: usize, cell: usize, start: &
                 ((s[2] + st[2] * k + d) >> 16).clamp(0, 255) as u8,
                 255,
             ];
+            if let Some(over) = over {
+                let src = over[x - x0 + j];
+                let a = src[3] as u32 + (src[3] as u32 >> 7);
+                for k in 0..3 {
+                    p[k] = ((src[k] as u32 * a + p[k] as u32 * (256 - a) + 128) >> 8) as u8;
+                }
+            }
         }
         x = end;
     }
+}
+
+/// Eight adjacent RGB pixels, including signed dither and saturated
+/// 16.16-to-byte conversion. Interleaved stores write RGBA directly instead
+/// of shuffling each channel through temporary widened pixel vectors.
+#[cfg(target_arch = "aarch64")]
+fn field_vectors(px: &mut [[u8; 4]], noise: &[i8], s: [i32; 3], st: [i32; 3], from: i32, shade: i32, over: Option<&[[u8; 4]]>) -> usize {
+    use std::arch::aarch64::*;
+    let n = px.len() / 8 * 8;
+    assert!(noise.len() >= n);
+    assert!(over.is_none_or(|o| o.len() >= n));
+    let monochrome = s[0] == s[1] && s[1] == s[2] && st[0] == st[1] && st[1] == st[2];
+    // SAFETY: each iteration reads eight dither bytes and writes eight
+    // RGBA pixels within the checked slices. NEON is baseline on AArch64.
+    unsafe {
+        let mut at = vaddq_s32(vld1q_s32([0, 1, 2, 3].as_ptr()), vdupq_n_s32(from));
+        for i in (0..n).step_by(8) {
+            let d = vmovl_s8(vld1_s8(noise.as_ptr().add(i)));
+            let dl = vmulq_n_s32(vmovl_s16(vget_low_s16(d)), shade);
+            let dh = vmulq_n_s32(vmovl_high_s16(d), shade);
+            let next = vaddq_s32(at, vdupq_n_s32(4));
+            let channel = |k: usize| {
+                let lo = vmlaq_n_s32(vaddq_s32(vdupq_n_s32(s[k]), dl), at, st[k]);
+                let hi = vmlaq_n_s32(vaddq_s32(vdupq_n_s32(s[k]), dh), next, st[k]);
+                vqmovn_u16(vcombine_u16(vqshrun_n_s32::<16>(lo), vqshrun_n_s32::<16>(hi)))
+            };
+            let red = channel(0);
+            let pixels = if monochrome {
+                uint8x8x4_t(red, red, red, vdup_n_u8(255))
+            } else {
+                uint8x8x4_t(red, channel(1), channel(2), vdup_n_u8(255))
+            };
+            let pixels = match over {
+                Some(over) => blend_vectors(pixels, vld4_u8(over.as_ptr().add(i).cast())),
+                None => pixels,
+            };
+            vst4_u8(px.as_mut_ptr().add(i).cast(), pixels);
+            at = vaddq_s32(at, vdupq_n_s32(8));
+        }
+    }
+    n
 }
 
 /// Fill the rows of `out` from `top` down with `field`, whose first grid
@@ -446,12 +586,50 @@ pub fn paint_band(out: &mut Canvas, field: &Field, top: usize, dither: &Dither) 
 }
 
 /// Lay straight-alpha pixels `src` over opaque pixels `dst`.
+#[cfg(test)]
 fn lay_span(dst: &mut [[u8; 4]], src: &[[u8; 4]]) {
-    for (p, s) in dst.iter_mut().zip(src) {
+    #[cfg(target_arch = "aarch64")]
+    let done = lay_vectors(dst, src);
+    #[cfg(not(target_arch = "aarch64"))]
+    let done = 0;
+    for (p, s) in dst.iter_mut().zip(src).skip(done) {
         let a = s[3] as u32 + (s[3] as u32 >> 7);
         for k in 0..3 {
             p[k] = ((s[k] as u32 * a + p[k] as u32 * (256 - a) + 128) >> 8) as u8;
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+fn lay_vectors(dst: &mut [[u8; 4]], src: &[[u8; 4]]) -> usize {
+    use std::arch::aarch64::*;
+    let n = dst.len().min(src.len()) / 8 * 8;
+    // SAFETY: each load/store covers eight pixels within both slices. The
+    // weights sum to 256, so the rounded blend fits in sixteen bits.
+    unsafe {
+        for i in (0..n).step_by(8) {
+            let p = vld4_u8(dst.as_ptr().add(i).cast());
+            let s = vld4_u8(src.as_ptr().add(i).cast());
+            vst4_u8(dst.as_mut_ptr().add(i).cast(), blend_vectors(p, s));
+        }
+    }
+    n
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn blend_vectors(p: std::arch::aarch64::uint8x8x4_t, s: std::arch::aarch64::uint8x8x4_t) -> std::arch::aarch64::uint8x8x4_t {
+    use std::arch::aarch64::*;
+    // NEON is baseline on AArch64. These operations access registers only.
+    unsafe {
+        let a = vmovl_u8(s.3);
+        let a = vaddq_u16(a, vshrq_n_u16::<7>(a));
+        let inv = vsubq_u16(vdupq_n_u16(256), a);
+        let channel = |under, over| {
+            let v = vmlaq_u16(vmulq_u16(vmovl_u8(over), a), vmovl_u8(under), inv);
+            vshrn_n_u16::<8>(vaddq_u16(v, vdupq_n_u16(128)))
+        };
+        uint8x8x4_t(channel(p.0, s.0), channel(p.1, s.1), channel(p.2, s.2), p.3)
     }
 }
 
@@ -551,6 +729,62 @@ fn from_lab([l, a, b]: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn the_paint_callers_capacity_hint_is_restored() {
+        let was = paint_minimum_now();
+        {
+            let hint = PaintPerformance::request();
+            if hint.0.is_some() {
+                assert_eq!(paint_minimum_now(), Some(1024));
+            } else {
+                assert_eq!(paint_minimum_now(), was);
+            }
+        }
+        assert_eq!(paint_minimum_now(), was, "painting never leaves a new hint on the calling thread");
+    }
+
+    #[test]
+    fn rgb_spans_keep_rounding_saturation_and_alpha_at_vector_edges() {
+        for (start, step) in [
+            ([[-2 * 65536, 127 * 65536, 254 * 65536]; 4], [[15000, -31000, 12000]; 4]),
+            ([[243 * 65536 + 0x8000; 3]; 4], [[0; 3]; 4]),
+            ([[128 * 65536; 3]; 4], [[-31000; 3]; 4]),
+        ] {
+            for count in 0..80 {
+                for x0 in [0, 3, 13, 31] {
+                    for shade in [0, 1234, 4096] {
+                        let noise: Vec<i8> = (0..count).map(|i| (((i * 53) % 160) as i16 - 80) as i8).collect();
+                        let mut pixels = vec![[0; 4]; count];
+                        field_span(&mut pixels, &noise, x0, 32, &start, &step, shade);
+                        for (i, p) in pixels.iter().enumerate() {
+                            let x = x0 + i;
+                            let cell = (x / 32).min(3);
+                            for c in 0..3 {
+                                let v = start[cell][c] + step[cell][c] * (x - cell * 32) as i32 + i32::from(noise[i]) * shade;
+                                assert_eq!(p[c], (v >> 16).clamp(0, 255) as u8, "length {count}, offset {x0}, pixel {i}, channel {c}");
+                            }
+                            assert_eq!(p[3], 255);
+                        }
+                        let mut blended = pixels.clone();
+                        let source: Vec<[u8; 4]> = (0..count).map(|i| [i as u8, (255 - i) as u8, (i * 73) as u8, [0, 1, 127, 128, 254, 255][i % 6]]).collect();
+                        lay_span(&mut blended, &source);
+                        let mut fused = vec![[0; 4]; count];
+                        field_layer(&mut fused, &noise, (x0, 32), &start, &step, shade, Some(&source));
+                        assert_eq!(fused, blended, "fused field and alpha: length {count}, offset {x0}, shade {shade}");
+                        for (i, p) in blended.iter().enumerate() {
+                            let a = u32::from(source[i][3]) + (u32::from(source[i][3]) >> 7);
+                            for c in 0..3 {
+                                assert_eq!(p[c], ((u32::from(source[i][c]) * a + u32::from(pixels[i][c]) * (256 - a) + 128) >> 8) as u8);
+                            }
+                            assert_eq!(p[3], pixels[i][3]);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn the_light_ink_matches_the_wordmark_measured_over_its_backdrop() {
