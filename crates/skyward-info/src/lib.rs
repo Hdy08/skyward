@@ -374,17 +374,18 @@ fn battery(root: &Path) -> Result<Option<Battery>> {
     let mut dirs: Vec<_> = entries.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>()?;
     dirs.sort();
     let mut first = None;
-    let mut plugged = false;
+    let mut supplies = Vec::new();
     for dir in dirs {
         match read_opt(dir.join("type"))?.as_deref() {
             Some("Battery") => {
                 first.get_or_insert(dir);
             }
-            Some(_) => plugged |= online(&dir)?,
+            Some(_) => supplies.push(online(&dir)?),
             None => {}
         }
     }
     let Some(dir) = first else { return Ok(None) };
+    let plugged = supplied(&supplies).context("whether external power is supplied is not known yet")?;
     let charge = match read(dir.join("status"))?.as_str() {
         "Charging" => Charge::Charging,
         "Discharging" => Charge::Discharging,
@@ -411,7 +412,7 @@ fn battery(root: &Path) -> Result<Option<Battery>> {
 
 /// Whether the power supply in `dir` says a charger or a computer is
 /// attached to it.
-fn online(dir: &Path) -> Result<bool> {
+fn online(dir: &Path) -> Result<Option<bool>> {
     let path = dir.join("online");
     said_online(fs::read_to_string(&path)).with_context(|| format!("read {}", path.display()))
 }
@@ -419,12 +420,26 @@ fn online(dir: &Path) -> Result<bool> {
 /// What a power supply's `online` file says, as reading it went. A supply
 /// without one has no say, and one whose driver cannot tell yet, as
 /// Qualcomm's USB-C connector cannot early in a boot, answers "try again":
-/// either is taken as offline, and the next reading asks again.
-fn said_online(read: std::io::Result<String>) -> std::io::Result<bool> {
+/// a missing file has no say, while "try again" remains unknown.
+fn said_online(read: std::io::Result<String>) -> std::io::Result<Option<bool>> {
     match read {
-        Ok(s) => Ok(s.trim() == "1"),
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::WouldBlock) => Ok(false),
+        Ok(s) => Ok(Some(s.trim() == "1")),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Some(false)),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// One known online source proves power is supplied. All sources must
+/// have answered before their zeros can prove it is not; a driver still
+/// starting must not manufacture an unplugged reading.
+fn supplied(sources: &[Option<bool>]) -> std::io::Result<bool> {
+    if sources.contains(&Some(true)) {
+        Ok(true)
+    } else if sources.contains(&None) {
+        Err(std::io::Error::from(ErrorKind::WouldBlock))
+    } else {
+        Ok(false)
     }
 }
 
@@ -510,12 +525,22 @@ mod tests {
     }
 
     #[test]
-    fn a_power_supply_that_cannot_tell_yet_is_taken_as_offline() {
+    fn a_power_supply_that_cannot_tell_yet_remains_unknown() {
         use std::io::Error;
-        assert!(said_online(Ok("1\n".into())).unwrap());
-        assert!(!said_online(Ok("0\n".into())).unwrap());
-        assert!(!said_online(Err(Error::from(ErrorKind::WouldBlock))).unwrap(), "Qualcomm's USB-C connector early in a boot");
-        assert!(!said_online(Err(Error::from(ErrorKind::NotFound))).unwrap(), "a supply without the file");
+        assert_eq!(said_online(Ok("1\n".into())).unwrap(), Some(true));
+        assert_eq!(said_online(Ok("0\n".into())).unwrap(), Some(false));
+        assert_eq!(said_online(Err(Error::from(ErrorKind::WouldBlock))).unwrap(), None, "Qualcomm's USB-C connector early in a boot");
+        assert_eq!(said_online(Err(Error::from(ErrorKind::NotFound))).unwrap(), Some(false), "a supply without the file");
         assert!(said_online(Err(Error::from(ErrorKind::PermissionDenied))).is_err(), "anything else is an error");
+    }
+
+    #[test]
+    fn power_is_known_offline_only_when_no_source_is_still_starting() {
+        assert!(supplied(&[None, Some(false)]).is_err());
+        assert!(supplied(&[Some(false), None]).is_err());
+        assert!(supplied(&[None, Some(true)]).unwrap(), "one online source is enough despite another still starting");
+        assert!(supplied(&[Some(true), None]).unwrap());
+        assert!(!supplied(&[Some(false), Some(false)]).unwrap());
+        assert!(!supplied(&[]).unwrap(), "no external sources are described");
     }
 }

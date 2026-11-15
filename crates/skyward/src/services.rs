@@ -142,7 +142,9 @@ impl Given {
             None => Ok(0),
         };
         let sockets = program.sockets.iter().map(|s| Ok((s.clone(), id(&s.user)?, id(&s.group)?))).collect::<Result<Vec<_>>>()?;
-        Ok(Self { sockets, environment: program.environment.clone() })
+        let mut environment = program.environment.clone();
+        environment.extend(program.service.environment.iter().map(|(name, value)| (name.clone(), value.clone())));
+        Ok(Self { sockets, environment })
     }
 
     /// Make each socket, as init makes them afresh every time it starts

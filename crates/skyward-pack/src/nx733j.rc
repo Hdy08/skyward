@@ -1,0 +1,18 @@
+# NX733J board setup for the locally pinned TWRP base. The running slot
+# supplies kernel modules, firmware and HALs; Skyward starts its services
+# after adopting that system's OS and security patch levels.
+on init
+    setprop sys.usb.configfs 1
+    setprop sys.usb.config_disable 0
+
+on property:ro.boot.usbcontroller=*
+    setprop sys.usb.controller ${ro.boot.usbcontroller}
+    wait /sys/bus/platform/devices/${ro.boot.usb.dwc3_msm:-a600000.ssusb}/mode 1
+    write /sys/bus/platform/devices/${ro.boot.usb.dwc3_msm:-a600000.ssusb}/mode peripheral
+
+on fs
+    symlink /dev/block/platform/soc/${ro.boot.bootdevice} /dev/block/bootdevice
+    write /proc/sys/kernel/firmware_config/force_sysfs_fallback 1
+
+on property:skyward.modules.ready=1
+    write /sys/kernel/boot_adsp/ssr 1

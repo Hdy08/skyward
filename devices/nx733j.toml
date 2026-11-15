@@ -1,0 +1,91 @@
+[device]
+codename = "NX733J"
+brand = "nubia"
+model = "Nubia Z70 Ultra"
+ab = true
+soc = { hans = "骁龙®8至尊版移动平台", hant = "Snapdragon® 8 Elite 行動平台", en = "Snapdragon® 8 Elite Mobile Platform" }
+os_version_prop = "ro.build.display.id"
+
+[display]
+width = 1216
+height = 2688
+density = 480
+connector = "DSI-1"
+backlight = "panel0-backlight"
+dsi_display = "dsi_display0"
+brightness_max = 2047
+
+[touch]
+name = "gdix_input_agent"
+
+# The locally supplied HyperOS archive includes this NX733J TWRP. Both
+# recovery partitions read from the test device match the same image.
+[recovery]
+format = "twrp"
+sha256 = "12523342021fcf258c7bba092ca82b1d31073794fb0b5080f613a06393ea9b60"
+binder_header = "SYST"
+
+[modules]
+sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
+load = ["zte_tpd", "haptic"]
+optional = ["adsp_loader_dlkm", "q6_pdr_dlkm", "q6_notifier_dlkm", "snd_event_dlkm", "gpr_dlkm", "spf_core_dlkm"]
+
+[firmware]
+partition = "modem"
+context = ""
+
+[partitions]
+mounted = ["persist"]
+
+# The panel sends raw frames to the host. Its own processing program
+# creates gdix_input_agent, whose axes span 19455 by 43007.
+[[owners]]
+user = "system"
+group = "system"
+mode = 0o666
+paths = ["/dev/thp", "/dev/input_agent"]
+
+[[owners]]
+user = "system"
+group = "system"
+mode = 0o664
+paths = ["/sys/class/leds/vibrator/duration_aw", "/sys/class/leds/vibrator/activate_aw", "/sys/class/leds/vibrator/activate_mode", "/sys/class/leds/vibrator/index", "/sys/class/leds/vibrator/seq", "/sys/class/leds/vibrator/loop", "/sys/class/leds/vibrator/gain"]
+
+[[service]]
+path = "/vendor/bin/odm_tsc"
+libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw", "/odm/lib64", "/mnt/system/system/lib64"]
+user = "system"
+groups = ["system", "root"]
+capabilities = ["SYS_NICE"]
+
+[[service]]
+path = "/vendor/bin/hw/vendor.qti.hardware.vibrator.service"
+libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw", "/odm/lib64", "/mnt/system/system/lib64"]
+environment = { RICHTAP_DEVICE_PATH = "/dev/awinic_haptic;/dev/awinic_x_haptic", ENV_RICHTAP_CONFIG_PATH = "/odm/etc/aac_richtap.config;/odm/etc/aac_richtap_1.config" }
+user = "system"
+groups = ["system", "input"]
+ready_service = "android.hardware.vibrator.IVibrator/default"
+
+[haptics]
+backend = "aidl"
+# This HAL selects a weaker RAM waveform at 30 ms. The basic AIDL pulse
+# is 8 + 24 * strength ms, so cap this profile at 29 ms (waveform 2).
+strength = { lightest = 0.3, strongest = 0.875 }
+
+[wlan]
+prepare_on_boot = true
+modules = ["qca_cld3_peach_v2"]
+writes = [{ path = "/sys/kernel/cnss/fs_ready", value = "1" }]
+firmware = [
+    { name = "wlan/qca_cld/peach_v2/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/peach_v2/WCNSS_qcom_cfg.ini" },
+]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/system/lib64", "/vendor/lib64"]
+service = "android.hardware.wifi.supplicant.ISupplicant/default"
+# The supplied installed ROM uses HyperOS's connectivity probe.
+probe = "http://connect.rom.miui.com/generate_204"
+
+[backup]
+efs = ["modemst1", "modemst2", "fsg", "fsc", "persist", "ztecfg"]
+data_skipped = ["vendor/tzstorage", "vendor/qtee", "vendor/fingerprint", "vendor/fpc", "vendor/goodix"]

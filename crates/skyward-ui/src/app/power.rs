@@ -3,7 +3,41 @@
 
 use super::*;
 
+/// Let the initial cable state settle while USB enumerates. This only
+/// arms events; it does not hold the UI's startup.
+const POWER_SETTLE_MS: u64 = 2000;
+
 impl App {
+    /// Take a battery driver's cable reading. The first valid reading
+    /// establishes the state without an animation or wake. Startup
+    /// observations must stay known and unchanged for two seconds before
+    /// events are armed; missing readings retain the last known state.
+    /// After that, only a known change is an actual plug event.
+    /// Return the new state when there was such an event, for the log.
+    pub fn power_reading(&mut self, now: u64, plugged: Option<bool>) -> Option<bool> {
+        let Some(plugged) = plugged else {
+            if !self.power_ready {
+                self.power_since = None;
+            }
+            return None;
+        };
+        let before = self.powered.replace(plugged);
+        if !self.power_ready {
+            if before != Some(plugged) || self.power_since.is_none() {
+                self.power_since = Some(now);
+            } else if self.power_since.is_some_and(|since| now.saturating_sub(since) >= POWER_SETTLE_MS) {
+                self.power_ready = true;
+            }
+            return None;
+        }
+        let before = before?;
+        if before == plugged {
+            return None;
+        }
+        self.plugged(now, plugged);
+        Some(plugged)
+    }
+
     pub fn display_on(&self) -> bool {
         self.display_on
     }
@@ -234,6 +268,70 @@ mod tests {
     /// off.
     const DIMS: u64 = 113_000;
     const OFF: u64 = 120_000;
+
+    #[test]
+    fn first_power_readings_set_the_state_without_showing_charge_or_resetting_idle() {
+        for plugged in [false, true] {
+            let mut app = App::new(Screen::Home, W, H, PPD);
+            app.tick(0);
+            assert_eq!(app.power_reading(1000, None), None);
+            assert_eq!(app.power_reading(2000, Some(plugged)), None);
+            assert_eq!(app.power_reading(3000, Some(plugged)), None);
+            assert!(app.charging.is_none());
+            assert_eq!(app.active, Some(0));
+            assert!(app.woke_at.is_none());
+            assert_eq!(app.screen(), Screen::Home);
+        }
+    }
+
+    #[test]
+    fn late_first_power_readings_do_not_wake_a_panel_that_has_gone_dark() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.tick(0);
+        app.tick(OFF);
+        assert!(!app.display_on());
+        assert_eq!(app.power_reading(OFF + 1000, None), None);
+        assert_eq!(app.power_reading(OFF + 2000, Some(true)), None);
+        assert!(!app.display_on());
+        assert!(app.charging.is_none());
+    }
+
+    #[test]
+    fn missing_power_readings_keep_the_cable_state_and_real_insertions_still_animate() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        assert_eq!(app.power_reading(0, Some(true)), None);
+        assert_eq!(app.power_reading(1000, None), None);
+        assert_eq!(app.power_reading(2000, Some(true)), None);
+        assert_eq!(app.power_reading(2100, Some(true)), None);
+        assert!(!app.power_ready, "an unknown reading restarts initial settling");
+        assert_eq!(app.power_reading(2200 + POWER_SETTLE_MS, Some(true)), None);
+        assert!(app.charging.is_none());
+        assert_eq!(app.power_reading(5000, Some(false)), Some(false));
+        assert_eq!(app.power_reading(5200, None), None);
+        assert_eq!(app.power_reading(5500, Some(false)), None);
+        assert!(app.charging.is_none());
+        assert_eq!(app.power_reading(6000, Some(true)), Some(true));
+        assert!(app.charge_shown());
+        assert_eq!(app.charging.as_ref().unwrap().since, 6000);
+        assert_eq!(app.power_reading(6100, None), None);
+        assert_eq!(app.power_reading(6200, Some(true)), None);
+        assert_eq!(app.charging.as_ref().unwrap().since, 6000);
+    }
+
+    #[test]
+    fn startup_usb_enumeration_settles_without_becoming_a_charging_animation() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.tick(0);
+        for (now, plugged) in [(0, false), (100, false), (400, true), (1000, true), (2500, true)] {
+            assert_eq!(app.power_reading(now, Some(plugged)), None);
+            assert!(app.charging.is_none());
+        }
+        assert!(app.power_ready);
+        assert_eq!(app.active, Some(0), "synchronizing the boot state does not wake or stir the page");
+        assert_eq!(app.power_reading(3000, Some(false)), Some(false));
+        assert_eq!(app.power_reading(4000, Some(true)), Some(true));
+        assert!(app.charge_shown(), "a real reinsert after startup still shows the charging animation");
+    }
 
     #[test]
     fn left_alone_the_panel_dims_then_goes_off() {

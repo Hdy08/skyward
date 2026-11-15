@@ -1,13 +1,48 @@
 use crate::waveform::{made, share, ticks, RATE, TICKS_RATE};
 use anyhow::{anyhow, ensure, Context, Result};
 use evdev::raw_stream::RawDevice;
-use skyward_config::{ResonanceUnit, Strength};
+use skyward_config::{HapticsBackend, ResonanceUnit, Strength};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+mod aidl;
+
+pub struct Haptics {
+    backend: Backend,
+}
+
+enum Backend {
+    ForceFeedback(Motor),
+    Aidl(aidl::Vibrator),
+}
+
+impl Haptics {
+    pub fn open(cfg: &skyward_config::Haptics) -> Result<Self> {
+        let backend = match cfg.backend {
+            HapticsBackend::ForceFeedback => Backend::ForceFeedback(Motor::open(cfg)?),
+            HapticsBackend::Aidl => Backend::Aidl(aidl::Vibrator::open(cfg.strength)?),
+        };
+        Ok(Self { backend })
+    }
+
+    pub fn click(&mut self, position: f32) -> Result<Duration> {
+        match &mut self.backend {
+            Backend::ForceFeedback(motor) => motor.click(position),
+            Backend::Aidl(vibrator) => vibrator.click(position),
+        }
+    }
+
+    pub fn ticks(&mut self) -> Result<Duration> {
+        match &mut self.backend {
+            Backend::ForceFeedback(motor) => motor.ticks(),
+            Backend::Aidl(vibrator) => vibrator.ticks(),
+        }
+    }
+}
 
 // linux/input-event-codes.h
 const EV_FF: u16 = 0x15;
@@ -29,7 +64,7 @@ const TICKS_REST: Duration = Duration::from_millis(40);
 /// playing after its samples have run out, even when told to stop, until
 /// the click is taken away. So each click is loaded as it is played, at the
 /// strength the slider gives, and taken away once it has played out.
-pub struct Haptics {
+struct Motor {
     dev: File,
     click: Click,
     ticks: Click,
@@ -50,11 +85,11 @@ enum Click {
     Samples { data: Vec<i8>, rate: u32 },
 }
 
-impl Haptics {
+impl Motor {
     /// The force-feedback device and the configured click. Loading a click
     /// fills the driver's queue with what it plays, so the click is loaded
     /// only as it is played.
-    pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
+    fn open(cfg: &skyward_config::Haptics) -> Result<Self> {
         let (path, dev) = motor()?;
         let hz = resonance(&cfg.resonance, cfg.resonance_unit)?;
         let click = match cfg.click {
@@ -68,7 +103,7 @@ impl Haptics {
             }
         };
         let ticks = Click::Samples { data: ticks(hz), rate: TICKS_RATE };
-        Ok(Haptics { dev, click, ticks, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
+        Ok(Self { dev, click, ticks, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
     }
 
     /// One short click at the strength the slider's `position` gives, after
@@ -129,7 +164,7 @@ pub fn probe(cfg: &skyward_config::Haptics, position: f32, ticks: bool) -> Resul
     // Once it has played out, what played goes with the device as the
     // command ends.
     std::thread::sleep(length);
-    println!("played the {what} at {strength:.3} of the full strength, {} ms long", length.as_millis());
+    println!("played the {what} at configured strength {strength:.3}, {} ms long", length.as_millis());
     Ok(())
 }
 

@@ -117,6 +117,7 @@ pub struct RecoveryBase {
 pub enum RecoveryFormat {
     Stock,
     Orangefox,
+    Twrp,
 }
 
 /// The stock build a recovery is made on: the phone maker's full update
@@ -257,12 +258,16 @@ pub struct Wipe {
 /// The data partition, which the folders erasing takes in are in.
 const DATA: &str = "/data";
 
-/// The vibration motor, played through the kernel's force-feedback events:
+/// The vibration motor, played through force-feedback events or its HAL:
 /// its click, a waveform its driver keeps or one made from samples at the
 /// motor's resonant frequency, which the driver plays as they are given,
 /// and the ticks of the screen going off by the power key, made too.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Haptics {
+    /// Use the vendor's calibrated effects on motors without an evdev
+    /// force-feedback interface.
+    #[serde(default)]
+    pub backend: HapticsBackend,
     /// The driver's number for a click waveform it keeps, on phones whose
     /// driver plays the waveforms it keeps.
     #[serde(default)]
@@ -272,12 +277,21 @@ pub struct Haptics {
     #[serde(default = "default_click_cycles")]
     pub click_cycles: u8,
     /// The file the driver says the motor's resonance in.
+    #[serde(default)]
     pub resonance: String,
     /// How the driver measures resonance. Existing Xiaomi drivers report
     /// tenths of a hertz; OnePlus also exposes the period in microseconds.
     #[serde(default)]
     pub resonance_unit: ResonanceUnit,
     pub strength: Strength,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HapticsBackend {
+    #[default]
+    ForceFeedback,
+    Aidl,
 }
 
 fn default_click_cycles() -> u8 {
@@ -470,6 +484,10 @@ pub struct Service {
     /// Directories for LD_LIBRARY_PATH, searched in order.
     #[serde(default)]
     pub libraries: Vec<String>,
+    /// Environment supplied to a configured program, as init's setenv
+    /// lines do for vendor HAL configuration and device paths.
+    #[serde(default)]
+    pub environment: std::collections::BTreeMap<String, String>,
     /// The program runs once, to its end, as a service of init's marked
     /// oneshot does: it is not started again, the programs after it start
     /// once it has ended, and it has to end well.
@@ -695,6 +713,10 @@ impl DeviceConfig {
             for name in &s.capabilities {
                 ensure!(capability(name).is_some(), "[[service]] {}: {name} is not a capability init knows", s.path);
             }
+            for (name, value) in &s.environment {
+                ensure!(!name.is_empty() && !name.contains(['=', '\0']) && !value.contains('\0'),
+                    "[[service]] {}: {name:?} is not a valid environment entry", s.path);
+            }
         }
         for folder in &cfg.backup.data_skipped {
             let path = Path::new(folder);
@@ -704,7 +726,7 @@ impl DeviceConfig {
         if let Some(haptics) = &cfg.haptics {
             ensure!((1..=8).contains(&haptics.click_cycles), "[haptics] click_cycles must be between 1 and 8");
             let file = &haptics.resonance;
-            ensure!(file.starts_with('/'), "[haptics] resonance: {file} is not an absolute path");
+            ensure!(haptics.backend == HapticsBackend::Aidl || file.starts_with('/'), "[haptics] resonance: {file} is not an absolute path");
             let Strength { lightest, strongest } = haptics.strength;
             ensure!(
                 0.0 < lightest && lightest < strongest && strongest <= 1.0,
@@ -916,6 +938,33 @@ mod tests {
         assert!((ResonanceUnit::PeriodUs.hertz(7692).unwrap() - 130.0052).abs() < 0.001);
         for unit in [ResonanceUnit::TenthsHz, ResonanceUnit::Hz, ResonanceUnit::PeriodUs] {
             assert_eq!(unit.hertz(0), None);
+        }
+    }
+
+    #[test]
+    fn nx733j_uses_its_host_touch_processor_and_calibrated_vibrator_hal() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/nx733j.toml")).unwrap();
+        assert_eq!(cfg.device.codename, "NX733J");
+        assert_eq!(cfg.recovery.as_ref().unwrap().format, RecoveryFormat::Twrp);
+        assert_eq!(cfg.recovery.as_ref().unwrap().binder_header.as_deref(), Some("SYST"));
+        assert_eq!(cfg.touch.name.as_deref(), Some("gdix_input_agent"));
+        assert!(cfg.services.iter().any(|s| s.path == "/vendor/bin/odm_tsc" && s.capabilities == ["SYS_NICE"]));
+        let haptics = cfg.haptics.unwrap();
+        assert_eq!(haptics.backend, HapticsBackend::Aidl);
+        assert!(haptics.resonance.is_empty(), "the HAL owns resonance calibration");
+        let vibrator = cfg.services.iter().find(|s| s.ready_service.as_deref() == Some("android.hardware.vibrator.IVibrator/default")).unwrap();
+        assert_eq!(vibrator.environment["RICHTAP_DEVICE_PATH"], "/dev/awinic_haptic;/dev/awinic_x_haptic");
+        assert!(cfg.wlan.unwrap().prepare_on_boot);
+        let old = DeviceConfig::parse(include_str!("../../../devices/zizhan.toml")).unwrap();
+        assert_eq!(old.haptics.unwrap().backend, HapticsBackend::ForceFeedback);
+    }
+
+    #[test]
+    fn configured_service_environment_cannot_hold_invalid_process_entries() {
+        let make = |environment: &str| DeviceConfig::parse(&format!("[device]\ncodename='x'\n[[service]]\npath='/vendor/bin/a'\nenvironment={environment}\n"));
+        assert!(make("{ DEVICE_PATH='/dev/a;/dev/b' }").is_ok());
+        for invalid in ["{ ''='a' }", "{ 'A=B'='c' }", r#"{ A="\u0000" }"#] {
+            assert!(make(invalid).is_err(), "{invalid}");
         }
     }
 

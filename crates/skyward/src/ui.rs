@@ -273,14 +273,11 @@ fn fastboot_status() -> Result<(bool, UsbLink)> {
     Ok((running, usb_link()?))
 }
 
-/// Light the panel, as on a cable going in or out, when the battery as it
-/// `was` and as it `is` disagree on whether a charger or a computer powers
-/// the phone.
-fn plug(app: &mut App, was: &Option<skyward_info::Battery>, is: &Option<skyward_info::Battery>, now: u64) -> Result<()> {
-    let plugged = |b: &Option<skyward_info::Battery>| b.as_ref().is_some_and(|b| b.plugged);
-    if plugged(was) != plugged(is) {
-        skyward_sys::kmsg(if plugged(is) { "a charger or a computer powers the phone" } else { "the phone runs on its battery" })?;
-        app.plugged(now, plugged(is));
+/// Record a known change of external power. A missing battery reading is
+/// unknown, so neither it nor the first valid reading simulates a plug.
+fn plug(app: &mut App, battery: &Option<skyward_info::Battery>, now: u64) -> Result<()> {
+    if let Some(plugged) = app.power_reading(now, battery.as_ref().map(|b| b.plugged)) {
+        skyward_sys::kmsg(if plugged { "a charger or a computer powers the phone" } else { "the phone runs on its battery" })?;
     }
     Ok(())
 }
@@ -1293,7 +1290,13 @@ impl<'a> Pages<'a> {
         } else { None };
         let (w, h) = surface.as_ref().map_or((cfg.display.width, cfg.display.height), Surface::size);
         let control = Control::open()?;
-        let haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
+        let haptics = cfg.haptics.as_ref().and_then(|config| match Haptics::open(config) {
+            Ok(haptics) => Some(haptics),
+            Err(error) => {
+                let _ = skyward_sys::kmsg(&format!("haptics unavailable: {error:#}"));
+                None
+            }
+        });
         let first = match &request.work {
             Work::Fastboot => Screen::Fastboot,
             Work::PromptWipeData => Screen::CantStart,
@@ -1617,6 +1620,9 @@ impl<'a> Pages<'a> {
         self.scanned_at = Instant::now();
         self.app.state.update_server = cfg.update.is_some();
         self.drive_at = Instant::now();
+        // Readings collected while startup configured the port are not
+        // cable events. The first fresh sample establishes its baseline.
+        self.read_at = Instant::now();
         Ok(())
     }
 
@@ -1706,16 +1712,20 @@ impl<'a> Pages<'a> {
 
     /// One click of the motor, as strong as the settings say.
     fn click(&mut self) -> Result<()> {
-        if let Some(h) = &mut self.haptics {
-            h.click(self.app.state.vibration)?;
+        if let Some(h) = &mut self.haptics
+            && let Err(error) = h.click(self.app.state.vibration)
+        {
+            let _ = skyward_sys::kmsg(&format!("haptic click failed: {error:#}"));
         }
         Ok(())
     }
 
     /// The motor's ticks of the screen going off.
     fn ticks(&mut self) -> Result<()> {
-        if let Some(h) = &mut self.haptics {
-            h.ticks()?;
+        if let Some(h) = &mut self.haptics
+            && let Err(error) = h.ticks()
+        {
+            let _ = skyward_sys::kmsg(&format!("haptic ticks failed: {error:#}"));
         }
         Ok(())
     }
@@ -1778,33 +1788,43 @@ impl<'a> Pages<'a> {
         for reading in self.readings.taken() {
             match reading {
                 Reading::Battery(battery, at) => {
+                    if at < self.read_at {
+                        continue;
+                    }
                     if self.asked.is_some_and(|asked| at >= asked) {
                         self.asked = None;
                     }
                     untaken(&mut self.unread.battery, "the battery", battery.as_ref().err())?;
-                    if let Ok(battery) = battery
-                        && battery != self.info.battery
-                    {
-                        plug(&mut self.app, &self.info.battery, &battery, now)?;
-                        self.info.battery = battery;
-                        self.app.refresh();
+                    if let Ok(battery) = battery {
+                        plug(&mut self.app, &battery, now)?;
+                        if battery != self.info.battery {
+                            self.info.battery = battery;
+                            self.app.refresh();
+                        }
+                    } else {
+                        let _ = self.app.power_reading(now, None);
                     }
                 }
                 Reading::All(all, at) => {
+                    if at < self.read_at {
+                        continue;
+                    }
                     if self.asked.is_some_and(|asked| at >= asked) {
                         self.asked = None;
                     }
                     untaken(&mut self.unread.details, "the phone's details", all.as_ref().as_ref().err())?;
-                    if let Ok(mut all) = *all && at >= self.read_at {
+                    if let Ok(mut all) = *all {
+                        plug(&mut self.app, &all.battery, now)?;
                         if let Some(fold) = &self.cfg.fold {
                             all.panel = Some(self.surface.size());
                             all.screen = if self.unfolded { fold.display.diagonal } else { self.cfg.display.diagonal };
                         }
                         if all != self.info {
-                            plug(&mut self.app, &self.info.battery, &all.battery, now)?;
                             self.info = all;
                             self.app.refresh();
                         }
+                    } else {
+                        let _ = self.app.power_reading(now, None);
                     }
                 }
             }

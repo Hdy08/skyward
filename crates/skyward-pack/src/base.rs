@@ -16,6 +16,10 @@ pub fn verify(cfg: &DeviceConfig, bytes: &[u8]) -> Result<()> {
                 ensure!(cfg.device.codename == "dodge", "OrangeFox base compatibility is implemented only for dodge");
                 ensure!(bytes.len() == 104_857_600, "dodge's recovery partition is 104857600 bytes");
             }
+            RecoveryFormat::Twrp => {
+                ensure!(cfg.device.codename == "NX733J", "TWRP base compatibility is implemented only for NX733J");
+                ensure!(bytes.len() == 104_857_600, "NX733J's recovery partition is 104857600 bytes");
+            }
         }
     }
     Ok(())
@@ -78,6 +82,29 @@ pub fn prepare(cfg: &DeviceConfig, image: &BootImage, rd: &mut Ramdisk) -> Resul
             // common init.rc and Skyward's mtp.rc own those actions now.
             rd.replace("init.recovery.usb.rc", include_bytes!("dodge-usb.rc").to_vec())?;
         }
+        RecoveryFormat::Twrp => {
+            ensure!(custom, "the configured TWRP base has no custom recovery ramdisk");
+            ensure!(image.header.header_version() == 4 && image.kernel.is_empty(), "NX733J requires a v4 recovery image without a kernel");
+            let props = &rd.find(ramdisk::PROP_DEFAULT).context("the base has no prop.default")?.data;
+            ensure!(props.split(|b| *b == b'\n').any(|l| l == b"ro.product.system.device=NX733J"), "the base's product is not NX733J");
+            // Keep the verified donor's init, service directories and runtime.
+            // Its copied HALs must not start before the installed vendor and
+            // security patch levels are ready. Skyward discovers those HALs
+            // from the installed system instead. The donor's generic Wi-Fi,
+            // fan and duplicate recovery actions do not describe this port.
+            rd.entries.retain(|e| {
+                let name = e.name.as_str();
+                !(name == "twres" || name.starts_with("twres/")
+                    || ["init.recovery.wifi.rc", "init.recovery.hlthchrg.rc", "init.recovery.service.rc"].contains(&name)
+                    || (name.starts_with("vendor/etc/init/") || name.starts_with("odm/etc/init/")) && name.ends_with(".rc")
+                    || name.starts_with("system/etc/init/") && name.ends_with(".rc")
+                        && !["system/etc/init/hw/init.rc", "system/etc/init/servicemanager.rc", "system/etc/init/hwservicemanager.rc",
+                            "system/etc/init/vndservicemanager.rc"].contains(&name)
+                    || ramdisk::COMMANDS.contains(&name))
+            });
+            rd.replace("init.recovery.qcom.rc", include_bytes!("nx733j.rc").to_vec())?;
+            rd.replace("init.recovery.usb.rc", include_bytes!("dodge-usb.rc").to_vec())?;
+        }
     }
     Ok(())
 }
@@ -128,6 +155,49 @@ mod tests {
         let mut rd = Ramdisk { entries: Vec::new() };
         rd.add(ramdisk::PROP_DEFAULT, 0o644, b"ro.product.system.device=another\n".to_vec()).unwrap();
         assert!(prepare(&cfg, &image(), &mut rd).unwrap_err().to_string().contains("product is not zizhan"));
+    }
+
+    #[test]
+    fn the_nubia_twrp_keeps_its_runtime_and_replaces_its_startup_actions() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/nx733j.toml")).unwrap();
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add(ramdisk::PROP_DEFAULT, 0o644, b"ro.product.system.device=NX733J\n".to_vec()).unwrap();
+        let kept = ["system/bin/init", "system/bin/adbd", "system/lib64/libbinder.so", "sepolicy",
+            "system/etc/init/hw/init.rc", "system/etc/init/servicemanager.rc", "system/etc/init/hwservicemanager.rc",
+            "system/etc/init/vndservicemanager.rc", "data/vendor/touchscreen/fw/goodix_firmware.bin"];
+        for name in kept {
+            rd.add(name, 0o644, b"kept".to_vec()).unwrap();
+        }
+        let removed = ["twres/ui.xml", "vendor/etc/init/keymint.rc", "odm/etc/init/vibrator.rc",
+            "system/etc/init/keystore2.rc", "init.recovery.wifi.rc", "init.recovery.hlthchrg.rc",
+            "init.recovery.service.rc", "system/bin/resetprop"];
+        for name in removed {
+            rd.add(name, 0o644, b"old".to_vec()).unwrap();
+        }
+        for name in ["init.recovery.qcom.rc", "init.recovery.usb.rc"] {
+            rd.add(name, 0o750, b"old actions".to_vec()).unwrap();
+        }
+        prepare(&cfg, &image(), &mut rd).unwrap();
+        for name in kept {
+            assert_eq!(rd.find(name).unwrap().data, b"kept", "{name}");
+        }
+        for name in removed {
+            assert!(rd.find(name).is_none(), "{name}");
+        }
+        assert!(rd.find(ramdisk::PROP_DEFAULT).unwrap().data.ends_with(b"ro.skyward.binder.header=SYST\n"));
+        let board = String::from_utf8_lossy(&rd.find("init.recovery.qcom.rc").unwrap().data);
+        assert!(board.contains("skyward.modules.ready") && board.contains("sys.usb.config_disable 0"));
+        assert!(!board.contains("start odm.") && !board.contains("/sys/kernel/fan"));
+        assert!(!String::from_utf8_lossy(&rd.find("init.recovery.usb.rc").unwrap().data).contains("mount functionfs"));
+    }
+
+    #[test]
+    fn a_twrp_for_another_phone_is_refused() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/nx733j.toml")).unwrap();
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add(ramdisk::PROP_DEFAULT, 0o644, b"ro.product.system.device=another\n".to_vec()).unwrap();
+        rd.add("twres/ui.xml", 0o644, Vec::new()).unwrap();
+        assert!(prepare(&cfg, &image(), &mut rd).unwrap_err().to_string().contains("product is not NX733J"));
     }
 
     #[test]

@@ -1148,6 +1148,13 @@ pub struct App {
     /// off, under the backlight held then, and comes up as the panel lights.
     curtain: Fade,
     darkening: Option<f32>,
+    /// The last known cable state. A battery driver that is not ready
+    /// has not reported an unplug, and its first reading is no insertion.
+    powered: Option<bool>,
+    /// Startup observations settle before they become cable events: USB
+    /// setup and the PMIC may briefly report their initial offline state.
+    power_since: Option<u64>,
+    power_ready: bool,
     /// The charging screen, from when a cable goes in until it has gone,
     /// with the level and what the charger does drawn for it, and the
     /// screen it is drawn on while it comes or goes over the page.
@@ -1239,6 +1246,9 @@ impl App {
             bright: full_brightness(),
             curtain: Fade::shown(BRIGHTEN, DARKEN),
             darkening: None,
+            powered: None,
+            power_since: None,
+            power_ready: false,
             charging: None,
             charge_art: None,
             charge_canvas: None,
