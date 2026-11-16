@@ -282,7 +282,7 @@ successfully with no `data_key`; all listed volumes exist, and their combined
 size matches the manifest. `/data/unencrypted/ref` remains absent. The owner confirmed that deleting
 the test file, repeated folding and screen-off/power-key wake work normally.
 The UI process remained the same throughout those operations and the backup.
-Full Data restoration has not been performed on the reference phone.
+No full Data restoration was performed during that unencrypted-ROM check.
 
 The Recovery containing these fixes is 104,857,600 bytes, SHA-256
 `391dff455b12b4420e8f3e841b8644ece50772961046862888987bc09e456a74`,
@@ -382,6 +382,442 @@ It includes the preceding dual-system, Data backup, display and sideload
 fixes. No Android installation or system-slot change was performed during
 this startup fix.
 
+## Sideload transfer and application progress
+
+Full packages may have earlier build and security patch dates. Package
+identity, serial targeting and incremental-package checks are unchanged.
+The dates do not add a wipe request or modify payload headers; explicit
+package wipe requests retain their existing confirmation. Recovery already
+enables the stock update engine's support for earlier build timestamps.
+
+The writing percentage previously used the highest file offset reached by
+the sideload FUSE server. ZIP identification reads the central directory at
+the end of the file, so the writing page could show 100% before payload
+application. It now follows the engine's logged application percentage.
+The reference engine formats its status-pipe `set_progress` with `%.lf`,
+rounding to 0 or 1; its detailed log preserves the actual percentage. The
+existing writing, readback and finalization pages remain the same, and late
+messages from one output cannot move a later phase backwards.
+
+USB reads are sized for the missing header or complete payload, up to the
+negotiated maximum, rather than splitting a usual 64 KiB block into four
+synchronous 16 KiB requests. Protocol tests cover USB fragmentation,
+coalescing, zero-length packets, acknowledgements, legacy checksums and
+block-length errors. The same 128 MiB read-only script package establishes
+an observed baseline of 134,218,502 bytes in 12.775598 seconds. This is a
+transport measurement rather than a complete official OTA installation.
+
+Native Android regression tests passed for ADB (13), FUSE (9), update-engine
+progress (7), package policy (14), wipe-package policy (4), installation UI
+(16), stage text (1), and refusal text (1): 65 tests in total.
+The tests use `/tmp` for scratch files; they do not require mounting Data.
+Android Clippy with warnings denied and independent image checks passed.
+The recovery was written to the active `recovery_b` and read back; the owner
+confirmed normal display and touch. The identical read-only package then
+completed in 10.475555 seconds (12.22 MiB/s), versus 12.775598 seconds
+(10.02 MiB/s) before the change, approximately 22% higher throughput.
+The authorized official OS3.0.9.0 full package (6,467,751,457 bytes) was then
+installed through sideload in 858.36 seconds (14 minutes 18 seconds), with
+ADB exit code 0 and total transfer 1.00x. Package size divided by this full
+session is 7.19 MiB/s, including application, partition readback and
+finalization, rather than a separate USB throughput measurement. The writing
+log advances from 0 to 100 with intermediate values including 16, 19, 20,
+23 and 27, followed by readback of 34 partitions and successful postinstall.
+The owner confirmed the completion page and a normal boot into OS3.0.9.0
+with existing applications and files. The percentage follows the engine's
+discrete reports; it does not interpolate an artificial smooth percentage.
+
+This real install exposed a further retention issue: update_engine left
+the target `recovery_a` block device read-only, so writing Skyward back
+failed with EPERM. Image flashing now temporarily clears block-device
+read-only protection and restores its original state on both success and
+error. Eleven image tests, four retention tests and four recovery-upgrade
+tests passed on Android, for 84 relevant native tests across this change.
+Two of the image tests use temporary file-backed loop devices and exercise
+both protection states plus failed source reads and failed target opens.
+
+The final v15 image was independently verified and written to the actual
+read-only `recovery_a` using the corrected `image::flash`, then read back.
+Its original read-only flag was restored; the other recovery and both
+slots' boot, vendor_boot and dtbo hashes were unchanged by this repair.
+The full official reinstall above used v14; v15 adds the retention fix and
+was not used for a second full reinstall. After the Android boot, v15
+started from slot A with the expected executable hash, one UI startup and
+no panic. The owner confirmed startup, both displays, folding, touch,
+WLAN, Data access and computer file transfer again.
+
+The final image is 104,857,600 bytes, SHA-256
+`d5d099dcb3a8dfdbc9c711e747d45b5f2eeec350136afc0cb488de5d75a2b8ae`.
+The current source removes both recovery-level age restrictions; an actual
+downgrade to an older Android release has not been tested.
+
+## Metadata erase
+
+Factory reset previously erased Data, then failed while formatting metadata:
+`mke2fs` saw `/dev/block/by-name/metadata` in use even though the recovery's
+own `/metadata` mount had already gone away. Vendor key and fold services had
+kept private mount-namespace copies of the metadata filesystem.
+
+Before recreating any fstab partition, the recovery now finds the partition's
+device number, unmounts copies in inherited private namespaces, and removes
+the recovery's own mount points for that device. A process that still has an
+open file or working directory on the filesystem remains an error, so this
+does not force an active user off the partition. Two Android tests cover
+successful cleanup with and without a local mount, and retain the original
+EBUSY result when a private runtime is actively using the filesystem.
+All eight wipe UI regression tests and Android Clippy also passed.
+
+On the MIX Fold 2, the v16 recovery completed the original factory-reset
+flow: the log ended with `erasing ended: done`, metadata was mounted as a
+fresh ext4 filesystem and contained Skyward's settings file, and all vendor
+namespace copies were gone. The owner then confirmed that the cleared system
+entered Android's initial setup. Data and metadata were cleared by this test;
+the previous metadata image was saved before the test.
+
+The v16 image is 104,857,600 bytes, SHA-256
+`3a675bb6a6dc3f5f3541970d8d6469f3afb5108644a51473a8a83d05b35079b2`.
+
+## Official OS1 hardware services
+
+On official OS1.0.15.0.ULRCNXM (Android 14), WLAN opened no supplicant
+control socket, Data could not find KeyMint, and slot queries could not
+reach the boot HAL. These shared a discovery failure: OS1 carries
+`hwservicemanager` in `/system/bin`, while newer builds put it in
+system_ext. The service plan read only system_ext, vendor and odm, so it
+could not construct the HIDL-directory step and started none of the key
+or boot services. The supplicant also waited for that directory.
+
+Service discovery now includes system, with its system-as-root tree at
+`/mnt/system/system`. Credential-HAL filename fallback excludes the
+framework client `gatekeeperd`. The described-file extractor includes the
+same system partition and normalizes the system-as-root prefix. A new
+fixture covers a system-resident hardware service directory together with
+gatekeeperd and a vendor Gatekeeper HAL that lacks an init interface
+declaration. All 17 parser/naming unit tests and 11 multi-phone discovery
+tests passed on Android; Android Clippy with warnings denied and the
+independent image checks passed too.
+
+The v18 image was written to the active `recovery_a`, read back, and booted
+against OS1. KeyMint, Gatekeeper, the system-resident hwservicemanager and
+the boot HAL all registered. Slot control returned current/next A, both
+slots bootable and successful, and no pending snapshot update. WLAN was
+ready to scan in 121 ms after background preparation; the first scan
+returned three networks. Data mounted as f2fs and user 0 went from locked
+to unlocked. The owner confirmed WLAN Internet access, Data decryption,
+internal-storage browsing, the slot page, repeated folding and touch.
+No Android installation, Data clear or slot switch was performed for this
+fix; the other recovery and both slots' boot/vendor_boot/dtbo were unchanged.
+
+OS1 also has a different OTA query revision from its public OS name:
+`ro.mi.os.version.incremental` says `OS1.0.15.0.ULRCNXM`, while
+`ro.build.version.incremental` says `V816.0.15.0.ULRCNXM`. On 2026-11-16,
+otherwise identical official queries using the public name returned no ROM;
+using the installed build revision returned `OS1.0.16.0.ULRCNXM`.
+Xiaomi queries now read the actual incremental build property; displayed
+OS names and the Oplus provider retain their existing properties. The
+regression fixture covers OS1, OS3 and MIUI 14 request identities; all
+14 Xiaomi/Oplus protocol tests passed on Android.
+
+The integrated v19 was written to `recovery_a` and read back. Its live
+query named `V816.0.15.0.ULRCNXM` and returned the official
+`OS1.0.16.0.ULRCNXM` full package, 5,953,001,418 bytes. The owner confirmed
+that version on the update page and repeated Data, slot information,
+folding/display and touch checks successfully. No system update was
+downloaded or installed during this query validation.
+
+The final v19 image is 104,857,600 bytes, SHA-256
+`73ddc4b94d5dbd2a1d9efd7f9e89f45c95542c5293b9d4dcfee9f8fa29b7d758`.
+
+## Installing while an APEX holds a partition open
+
+Installing the official `V14.0.14.0.TLRCNXM` full package from OS1 stopped
+before the update engine ran: `unmount /mnt/system_ext: Device or resource
+busy`. No process directly mapped a file on that partition, but loop0
+still held `/mnt/system_ext/apex/com.android.vndk.v31.apex` as the backing
+file of the mounted VNDK bundle. The process-only pinning pass missed that
+kernel-held reference and classified system_ext as unused.
+
+The pinning pass now includes the files held by attached loop devices.
+Containers on the installed slot's mounted partitions are locked in
+memory whole and their source mount points join the existing busy set.
+The normal release path can then detach those mounts while their old
+files and devices remain usable; genuinely unused partitions still use
+strict unmounting and namespace-copy cleanup.
+
+Two Android-side tests passed using RAM-backed files and private mount
+namespaces. One reproduces EBUSY with only an APEX-like loop view, pins its
+container, detaches the source filesystem, overwrites the simulated old
+partition and reads the original payload through the loop. The other
+verifies that an unused filesystem still unmounts normally. The real boot
+partition hashes and init mount namespace were unchanged by these tests.
+Android Clippy with warnings denied and the independent image checks
+also passed.
+
+The owner then retried the same 6,008,392,048-byte official MIUI 14 package.
+The runtime and VNDK APEX containers were both pinned, system_ext left the
+mount tree, all 4,105 payload operations completed, and signature checking,
+filesystem verification and postinstall finished successfully. The engine
+reported `Update successfully applied`; Recovery reported
+`Installed { slot: B, wipe: false }`. Skyward was preserved in recovery_b,
+and both recovery partitions read back as v20. The owner confirmed the
+completed result page and normal folding/display and touch. The phone
+remained in the A-slot Recovery result page with B selected for the next
+system start; starting the installed MIUI 14 was not tested in this round.
+
+The postinstall log also recorded an automatic metadata remount warning:
+the filesystem-probing mount tried erofs and received EBUSY. An explicit
+read-only ext4 mount restored `/metadata` successfully, and the boot HAL
+reported no pending update. This was recorded separately from the fixed
+system_ext failure; metadata was not formatted.
+
+The v20 image is 104,857,600 bytes, SHA-256
+`563cf5c9446645df85a7fffc27c4a6ae66bfd7143b55f3ab88464b156d59b974`.
+
+## Factory reset immediately after installation
+
+After the MIUI 14 installation above, a factory reset in the same Recovery
+session failed before erasing anything: `Data failed: the phone's table
+has no /data`. Data was still mounted on dm-7, but the installer had taken
+the old slot's vendor and odm filesystems out of Recovery's mount tree.
+The reset planner read their fstab files again and found no entries.
+Changing the next boot slot did not restore these files. The device's
+userdata and metadata entries are shared partitions, without `slotselect`.
+
+Before an update or install script releases the installed system, the
+installer now keeps its complete parsed fstab in memory. Data opening,
+filesystem operations and wipe planning use this copy for the rest of
+that Recovery session. All filesystem alternatives, options, encryption
+flags and vendor/odm ordering are preserved. Repeated installation does
+not replace the booted system's policy with that of the next selected
+slot. A new Recovery process reads the system it starts with; ordinary
+startup reads do not freeze an incomplete table before vendor is mounted.
+The original confirmation and wipe behavior remain in place.
+
+All eight fstab tests passed on the phone, including three new regressions
+for removing both source files, an early read before the files exist, and
+repeated preservation followed by a new Recovery's read. These tests left
+the real boot partitions and init mount namespace unchanged. Android
+Clippy with warnings denied and independent image checks passed.
+
+Booting Recovery on the installed MIUI 14 also exposed a vendor-runtime
+dependency issue: Gatekeeper's HAL was loaded in the system namespace,
+which did not search vendor for `libkeymasterdeviceutils.so`. The private
+runtime's system namespace now searches vendor/odm after the installed
+framework directories. Framework libraries retain their search priority.
+Gatekeeper, KeyMint and boot control then started normally on a fresh v22
+boot, without modifying the generated runtime configuration by hand.
+The older firmware still refused the existing Data key with error -38;
+this was not treated as a missing partition or bypassed. The owner agreed
+to reinstall through sideload and erase the old Data.
+
+The same 6,008,392,048-byte MIUI 14 full package was installed from the
+B-slot v22 Recovery to A through ADB sideload. All 4,105 payload operations,
+signature checking, filesystem verification and postinstall succeeded.
+Both source fstab files were confirmed absent from Recovery's mount tree.
+The owner then performed the original factory-reset flow without rebooting:
+`erasing ended: done`. Boot ID and Recovery PID were identical before and
+after the reset. Data and shared storage were no longer mounted, metadata
+was newly formatted as ext4 and had no old metadata-encryption key, and
+all eight boot/recovery partition hashes were unchanged by the reset.
+No manual metadata remount or fstab-file restoration was used between the
+install and reset. The previously recorded automatic metadata remount
+warning still occurred; it did not prevent this reset. The owner then
+confirmed that the new MIUI 14 booted into Android setup on A.
+
+Both recovery partitions read back as v22. Its image is 104,857,600 bytes,
+SHA-256
+`14edb6b3061b5326f84bbe51ccf58a9052b578a7aaec8d2715f47fdf14fb0ecd`.
+
+## MIUI 14 identification and encrypted Data
+
+After the official MIUI 14 installation and setup, Recovery displayed only
+Android 13 and refused Data with `Android too old`. The installed system
+has no HyperOS display-version property. Its complete version is
+`ro.build.version.incremental=V14.0.14.0.TLRCNXM`, and its MIUI properties
+identify major version 14. Device information now falls back to that build
+revision for MIUI, using the installed system's properties rather than
+Recovery's inherited build. The systems page also names it `MIUI 14`.
+HyperOS keeps its preferred public version when both property sets exist.
+
+The key reader previously rejected any vold key directory containing a
+`stretching` file. Android 13's layout-1 metadata key on this phone has
+`stretching=nopassword`, which is a supported AOSP storage format rather
+than an unknown key layout. The reader now handles `nopassword` and `none`
+with their original application-ID binding rules. A directory without the
+file keeps the modern behavior. Hardware authentication and software GCM
+authentication remain in place; unsupported stretching such as `scrypt`
+and unknown layout versions still return explicit errors. No keys are
+rewritten and no Data format is needed for this fix.
+
+Android-native tests passed: 10 key-storage tests, one installed-version
+regression, and 37 systems tests, with two unrelated platform-dependent
+systems tests ignored. Coverage includes the Android 13 hardware-key
+binding, software keys with and without the legacy marker, rejection of
+the wrong secret or changed binding, MIUI 14 naming, and HyperOS priority.
+The tests left boot partitions, init mounts and metadata key files
+unchanged. Android Clippy with warnings denied and independent image
+checks passed.
+
+The owner confirmed the full MIUI version, successful credential-based
+Data decryption and visible internal storage on a fresh v23 boot. The
+Recovery log records user 0 changing from closed to open, with Data
+mounted as f2fs and shared storage exposed at `/sdcard`. A live update
+query used the installed MIUI revision and returned `V14.0.15.0.TLRCNXM`;
+no package was installed during this check. Both recovery partitions read
+back as v23; boot, vendor_boot and dtbo were unchanged in both slots.
+The phone remains in A-slot Skyward. This round did not clear Data.
+
+The v23 image is 104,857,600 bytes, SHA-256
+`49e81d39c0d9a89f2b57e69954515dd0bcabf04de11a4602a5c6239c6e8708cc`.
+
+## MIUI 13 downgrade compatibility and settings after a reset
+
+On official `V13.1.21.0.SLRCNXM` / Android 12, the VNDK 31 bundle is named
+`/mnt/system/system/apex/com.android.vndk.current.apex`. Its protobuf
+manifest names it `com.android.vndk.v31`. The previous lookup only tried
+versioned filenames. It missed this bundle, prepared no private vendor
+runtime, and qseecomd repeatedly exited before the key, credential and
+boot-control services could start. The fold client also had no runtime,
+leaving Recovery on the cover display. Waiting for the missing listener
+property added 20 seconds to startup. WLAN's supplicant shared the missing
+runtime dependency.
+
+Bundle lookup now retains the numbered-file search first, then recognizes
+the older `current` filename by its manifest name. It mounts the matching
+bundle at the normal versioned APEX path and uses the existing private
+runtime for vendor services, the fold client and the WLAN supplicant. A
+current bundle belonging to another VNDK version is not substituted.
+The bundle and the installed partitions stay read-only.
+
+Recovery settings live on metadata, so formatting that partition removes
+their file. The existing UI restores its in-memory settings after a wipe,
+but its two-second write debounce exceeded the result page's 1.5-second
+automatic restart. Settings restoration after metadata is made afresh is
+now due on the first safe write, before that restart. Ordinary slider
+changes keep their debounce; a failed write still waits for a change
+rather than retrying on every frame. This uses the existing wipe and
+result pages without another confirmation step.
+
+All 17 related Android-native tests passed: three VNDK lookup cases,
+nine settings cases, and five network-time cases. Coverage includes
+restoration before automatic restart, failed-write behavior, SNTP packet
+handling, the 2036 timestamp wrap and a local UDP exchange. The tests left
+the real boot partitions, init
+mount namespace, metadata keys and settings unchanged. Android Clippy
+with warnings denied and independent image checks passed.
+
+The first v24 boot on B started KeyMint, Gatekeeper, the hardware service
+directory, boot control and the fold sensor. It selected the unfolded
+inner panel automatically. The kernel-timestamp interval to the first
+Recovery frame fell from 24.33 seconds on the previous boot to 6.44 seconds;
+these are log timestamps, not optical boot-time measurements. The live
+slot query returned current/next B, both slots bootable and successful,
+and no pending update. Existing Recovery settings and metadata keys were
+unchanged across this boot.
+
+The owner confirmed faster startup, inner/cover display switching, touch,
+Data decryption, internal storage, WLAN Internet access, slot information
+and settings on v24. The update query then exposed a separate time issue:
+persist's RTC offset put Recovery on 2022-09-20, so the official HTTPS
+server's current certificate was not yet valid according to that clock.
+After obtaining a WLAN address, v25 asks network time in the background
+before completing the reachability check. It uses the network's DNS and
+SNTP replies matched to the requested endpoint and random request stamp.
+Unsynchronized, unrelated or unusable replies are refused. The running
+clock is corrected without writing the PMIC RTC or Android's persist
+partition, and HTTPS retains its certificate and date verification.
+
+On the integrated v25 boot, the first frame completed at 6.37 seconds.
+After WLAN connected, the network clock was set successfully and the
+official query returned `V13.1.25.0.SLRCNXM`, 5,842,347,190 bytes. The owner
+confirmed that version, settings retained after reboot, correct display
+and folding, successful Data decryption and visible internal storage.
+The settings JSON also matched its pre-reboot contents, and the log
+recorded user 0 unlocked. Both recovery partitions read back as v25;
+both slots' boot/vendor_boot/dtbo and the metadata key files were unchanged.
+The phone remains in B-slot Recovery. No Android install, slot switch or
+Data/metadata clear was performed for this fix. Settings restoration after
+a format was covered by the regression tests without another real wipe.
+
+The integrated v25 image is 104,857,600 bytes, SHA-256
+`fb1b1e2a346bc00c1d604d50c6852bca96de65a538e89b8a003b6a1b863afda7`.
+
+## MIUI 13 Data backup and memory extension
+
+On official MIUI 13 `V13.1.21.0.SLRCNXM` / Android 12, Data opened and
+user 0 unlocked, but the archive stopped at `/data/extm` with
+`Required key not available (os error 126)`. The installed ROM enabled
+MIUI memory extension, and that directory held a 3 GiB runtime file
+whose separate key was not available in Recovery.
+
+The v26 device configuration excludes only the root `extm` directory
+through the existing Data backup policy. The same policy leaves it
+untouched during restore. Ordinary application folders named `extm`,
+similarly prefixed paths, and other unreadable application data retain
+their existing behavior. The backup format, shared key reference and
+original UI workflow are unchanged.
+
+A regression failed with the preceding device configuration, then passed
+with this exclusion. It covers measurement, packing, restoration into an
+existing directory and into an empty directory, and similarly named app
+files. The four backup-worker tests and nine archive/store/manifest tests
+passed natively in Recovery RAM. The tests did not change real partitions,
+init's mounts, Recovery settings or metadata key files. Android Clippy
+with warnings denied and the independent image checks passed.
+
+The v26 candidate completed the backup, but a subsequent read-only audit
+failed at the PAX metadata of `app-ephemeral`. The tar dependency splits
+PAX records at newlines, which may occur inside a raw binary extended
+attribute. A synthetic archive reproduced that parsing failure without
+touching real Data. v27 keeps existing `SCHILY.xattr` records where the
+reader supports them, and encodes attributes with newline values or
+newline/equals in names as `SKYWARD.xattr-hex` records. Restoration decodes
+the original name and bytes. The test covers legacy text, NUL, non-UTF-8,
+newlines, all 256 byte values and the affected attribute names. The
+manifest remains format 1; the original product workflow is unchanged.
+
+The owner repeated a Data-only backup through the original UI on v27.
+The format-1 encrypted-Data manifest records 3,197,935,104 uncompressed
+archive bytes in three volumes, saved at
+`/sdcard/Skyward/backups/20220920-190644`. The same store reader and tar
+library used by restoration read all 10,464 entries, PAX records and
+file contents successfully; the complete digest matched the manifest.
+The archive includes ordinary application data and contains no `extm`
+or internal-storage entries. The owner confirmed completed backup,
+normal internal storage, folding and touch.
+
+Four backup-worker tests and ten archive/store/manifest tests passed
+natively on the final build, including both regressions that failed
+before their fixes. Clippy with warnings denied and independent image
+checks passed. Both recovery partitions read back as v27; both slots'
+boot/vendor_boot/dtbo, metadata key files and Recovery settings were
+unchanged. No Android install, slot switch or Data/metadata clear was
+performed. The earlier v26 candidate backup is preserved outside the
+normal backup list at
+`/sdcard/Skyward/diagnostics/backup-v26-pax-diagnostic-20220920-184021`.
+The backup folder dates follow the phone clock without WLAN time
+synchronization on these boots; the host validation date is 2026-11-16.
+The automated backup audit did not restore Data. The owner's subsequent
+MIUI 13 partition-restoration results are recorded below.
+
+The final v27 image is 104,857,600 bytes, SHA-256
+`9a38a2bde9a64998de2dfcfee052c2ddac6bdfd5805b29da121a5ab8c6937ec8`.
+
+## MIUI 13 owner-confirmed partition restoration
+
+On 2026-11-16 (Asia/Shanghai), following the v27 backup fix on official
+MIUI 13 `V13.1.21.0.SLRCNXM` / Android 12, the owner reported:
+“MIUI13 启动与Data分区恢复通过”. Boot-partition restoration and Data-partition
+restoration are therefore recorded as passed on this device and ROM,
+against the v27 image identified above.
+
+The source of these two results is the owner's real-device confirmation.
+The earlier automated backup audit remains a read-only archive check;
+this follow-up did not repeat restoration or collect partition readback,
+sample-file comparisons or a separate post-restore Android boot log.
+These results do not cover System/EFS restoration, kernel installation,
+other official ROM branches or the remaining checklist cases.
+
 ## Build and validation status
 
 Build on Windows with the local base, Android NDK and LZ4:
@@ -420,7 +856,15 @@ duration. Both boots started the recovery service once. Final partition and
 running-binary SHA-256 checks matched the built image, and the UI capacity hint
 was back at zero outside the large About page.
 
-Encrypted Data decryption, OTA download/install, boot backup/restore, kernel
-installation, Data format, and Data restoration have not been validated on MIX
-Fold 2. Results from the separate OnePlus 13 port do not validate these functions
+Official OS3.0.9.0 full-package installation through ADB sideload and
+subsequent Android boot have been validated as described above. Encrypted
+Data decryption is validated on official OS1.0.15.0.ULRCNXM,
+MIUI 14 V14.0.14.0.TLRCNXM and MIUI 13 V13.1.21.0.SLRCNXM.
+Encrypted Data backup on MIUI 13 is validated above; the owner subsequently
+confirmed boot-partition and Data-partition restoration on that ROM.
+Factory reset
+including Data and metadata clear is validated with v16. OTA download,
+System/EFS restoration, kernel installation and explicit filesystem
+conversion have not been validated on MIX Fold 2.
+Results from the separate OnePlus 13 port do not validate these functions
 on this device.

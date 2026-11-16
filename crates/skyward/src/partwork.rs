@@ -134,7 +134,6 @@ fn disable(package_size: u64, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
         let phone = Phone {
             device: prop("ro.product.device").context("ro.product.device is unset")?,
             serial: prop("ro.serialno").unwrap_or_default(),
-            installed: None,
         };
         package::read(bytes, &phone, &prop("ro.build.tags").unwrap_or_default())
     })();

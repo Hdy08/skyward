@@ -504,13 +504,15 @@ fn first(mount_point: &str) -> Result<Entry> {
 }
 
 /// Make the partition an entry names afresh as `filesystem`, with nothing
-/// mounted from it.
+/// mounted from it, including inherited copies in private vendor runtimes.
 pub fn remake(entry: &Entry, filesystem: &str) -> Result<()> {
-    let at = Path::new(&entry.mount_point);
-    if mount::is_mount_point(at)? {
-        mount::umount(at)?;
+    let device = PathBuf::from(fstab::device(entry)?);
+    let number = skyward_block::devnum(&device)?;
+    mount::unmount_namespace_copies(&[number])?;
+    for at in mount::points_of(number)?.into_iter().rev() {
+        mount::umount_over(&at)?;
     }
-    erase::make(Path::new(&fstab::device(entry)?), filesystem, &entry.extras, casefolds(entry))
+    erase::make(&device, filesystem, &entry.extras, casefolds(entry))
 }
 
 /// Whether the filesystem made for an entry looks names up without regard
@@ -1088,5 +1090,104 @@ mod tests {
         let cache = cache_with_logs("cache-f2fs");
         remake_cache(&cache.entry, "f2fs").unwrap();
         cache.holds_the_logs_alone("f2fs");
+    }
+
+    mod remaking {
+        use super::*;
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Child, ChildStdout, Command, Stdio};
+
+        struct Partition {
+            root: PathBuf,
+            at: PathBuf,
+            entry: Entry,
+            children: Vec<Child>,
+            _view: skyward_block::loopdev::Scoped,
+        }
+
+        impl Partition {
+            fn new() -> Self {
+                // The filesystem and all its mounts are in RAM, outside the
+                // Recovery's mount namespace and the phone's real partitions.
+                assert_eq!(unsafe { libc::unshare(libc::CLONE_FS | libc::CLONE_NEWNS) }, 0);
+                assert_eq!(unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_PRIVATE | libc::MS_REC, std::ptr::null()) }, 0);
+                let root = PathBuf::from(format!("/tmp/skyward-wipe-remake-{}-{}", std::process::id(), unsafe { libc::gettid() }));
+                fs::create_dir(&root).unwrap();
+                let backing = root.join("metadata.img");
+                fs::File::create(&backing).unwrap().set_len(16 << 20).unwrap();
+                let view = skyward_block::loopdev::scoped(&backing, 0, 16 << 20, false).unwrap();
+                erase::make(&view.path, "ext4", &[], false).unwrap();
+                let at = root.join("metadata");
+                fs::create_dir(&at).unwrap();
+                let alias = root.join("by-name-metadata");
+                std::os::unix::fs::symlink(&view.path, &alias).unwrap();
+                let entry = Entry {
+                    device: alias.to_string_lossy().into_owned(), mount_point: at.to_string_lossy().into_owned(),
+                    filesystem: "ext4".into(), options: Vec::new(), extras: Vec::new(),
+                };
+                mount::mount(&view.path, &at, "ext4", &[]).unwrap();
+                fs::write(at.join("old-marker"), b"old metadata").unwrap();
+                Self { root, at, entry, children: Vec::new(), _view: view }
+            }
+
+            fn child(&mut self, busy: bool) -> BufReader<ChildStdout> {
+                let at = self.at.display();
+                let script = format!("{}echo ready; read stop; test ! -e {at}/old-marker || exit 11; echo released",
+                    if busy { format!("cd {at} || exit 12; ") } else { String::new() });
+                let mut child = Command::new("/system/bin/unshare").args(["-m", "/system/bin/sh", "-c", &script])
+                    .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+                let mut reader = BufReader::new(child.stdout.take().unwrap());
+                self.children.push(child);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), "ready");
+                reader
+            }
+        }
+
+        impl Drop for Partition {
+            fn drop(&mut self) {
+                for child in &mut self.children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                let _ = mount::umount_detach(&self.at);
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        #[test]
+        fn metadata_is_remade_after_releasing_inherited_mounts_even_when_locally_unmounted() {
+            for mounted_here in [true, false] {
+                let mut partition = Partition::new();
+                let readers = [partition.child(false), partition.child(false)];
+                if !mounted_here {
+                    mount::umount(&partition.at).unwrap();
+                }
+                let namespace = fs::read_link("/proc/thread-self/ns/mnt").unwrap();
+                remake(&partition.entry, "ext4").unwrap();
+                assert_eq!(fs::read_link("/proc/thread-self/ns/mnt").unwrap(), namespace);
+                assert!(mount::points_of(skyward_block::devnum(&partition._view.path).unwrap()).unwrap().is_empty());
+                for (child, mut reader) in partition.children.iter_mut().zip(readers) {
+                    child.stdin.take().unwrap().write_all(b"done\n").unwrap();
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    assert_eq!(line.trim(), "released");
+                    assert!(child.wait().unwrap().success());
+                }
+                mount::mount(&partition._view.path, &partition.at, "ext4", &[]).unwrap();
+                assert!(!partition.at.join("old-marker").exists(), "a fresh metadata filesystem");
+            }
+        }
+
+        #[test]
+        fn a_private_runtime_still_using_metadata_prevents_formatting() {
+            let mut partition = Partition::new();
+            let _reader = partition.child(true);
+            let error = remake(&partition.entry, "ext4").unwrap_err();
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().raw_os_error(), Some(libc::EBUSY));
+            assert_eq!(fs::read(partition.at.join("old-marker")).unwrap(), b"old metadata");
+            assert!(mount::is_mount_point(&partition.at).unwrap(), "an actual user remains an error");
+        }
     }
 }

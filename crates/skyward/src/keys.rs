@@ -58,7 +58,13 @@ fn read(slot: skyward_vab::Slot, libraries: Option<&Path>) -> Result<Phone> {
     for name in PARTITIONS {
         let named = format!("{name}{}", slot.suffix());
         let partition = mounted.iter().find(|m| m.partition == named).with_context(|| format!("{named} is not mounted"))?;
-        partitions.push(Partition::mounted(name, &partition.mount_point));
+        // system-as-root images keep their /system tree inside the image;
+        // the other partitions' init folders are directly at their root.
+        let at = match name {
+            "system" => partition.mount_point.join("system"),
+            _ => partition.mount_point.clone(),
+        };
+        partitions.push(Partition::mounted(name, at));
     }
     Phone::read(partitions, properties, libraries)
 }

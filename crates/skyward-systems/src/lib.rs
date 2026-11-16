@@ -51,15 +51,20 @@ pub struct Other {
 }
 
 /// What the installed system calls itself, by its properties: HyperOS by
-/// the major version Xiaomi gives it, any other by its Android version;
+/// the major version Xiaomi gives it, MIUI by its own major version, and
+/// any other by its Android version;
 /// with the build it is, where it says.
 pub fn installed_name(props: &HashMap<String, String>, version_prop: &str) -> Named {
-    let name = match (props.get("ro.mi.os.version.code"), props.get("ro.build.version.release")) {
-        (Some(code), _) => format!("HyperOS {code}"),
-        (None, Some(release)) => format!("Android {release}"),
-        (None, None) => "Android".into(),
+    let miui = props.get("ro.miui.ui.version.code");
+    let name = match (props.get("ro.mi.os.version.code"), miui, props.get("ro.build.version.release")) {
+        (Some(code), _, _) => format!("HyperOS {code}"),
+        (None, Some(code), _) => format!("MIUI {code}"),
+        (None, None, Some(release)) => format!("Android {release}"),
+        (None, None, None) => "Android".into(),
     };
-    let version = props.get(version_prop).or_else(|| props.get("ro.build.display.id")).cloned();
+    let version = props.get(version_prop).filter(|v| !v.is_empty())
+        .or_else(|| miui.and_then(|_| props.get("ro.build.version.incremental")))
+        .or_else(|| props.get("ro.build.display.id")).cloned();
     Named { name, version }
 }
 
@@ -80,5 +85,15 @@ mod tests {
             installed_name(&custom, "ro.mi.os.version.incremental"),
             Named { name: "Android 16".into(), version: Some("lineage_ishtar-userdebug 16 BP2A".into()) }
         );
+    }
+
+    #[test]
+    fn miui_14_has_its_own_name_and_complete_build_revision() {
+        let miui = props(&[("ro.miui.ui.version.code", "14"), ("ro.miui.ui.version.name", "V140"), ("ro.build.version.release", "13"), ("ro.build.version.incremental", "V14.0.14.0.TLRCNXM"), ("ro.build.display.id", "TKQ1")]);
+        assert_eq!(installed_name(&miui, "ro.mi.os.version.incremental"), Named { name: "MIUI 14".into(), version: Some("V14.0.14.0.TLRCNXM".into()) });
+        let mut hyper = miui;
+        hyper.insert("ro.mi.os.version.code".into(), "1".into());
+        hyper.insert("ro.mi.os.version.incremental".into(), "OS1.0.15.0.ULRCNXM".into());
+        assert_eq!(installed_name(&hyper, "ro.mi.os.version.incremental"), Named { name: "HyperOS 1".into(), version: Some("OS1.0.15.0.ULRCNXM".into()) });
     }
 }

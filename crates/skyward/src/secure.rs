@@ -3,8 +3,10 @@
 //! service directory that knows the phone describes them.
 
 use anyhow::{ensure, Context, Result};
+use prost::Message;
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -287,7 +289,8 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
     if skyward_block::mount::is_mount_point(&at)? {
         return Ok(Some(at));
     }
-    let Some(file) = BUNDLE_DIRS.iter().map(|d| Path::new(d).join(format!("{name}.apex"))).find(|p| p.is_file()) else {
+    let dirs: Vec<_> = BUNDLE_DIRS.iter().map(Path::new).collect();
+    let Some(file) = bundle_source(name, &dirs)? else {
         return Ok(None);
     };
     let (offset, length) = image(&file)?;
@@ -295,6 +298,35 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
     fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
     skyward_block::mount::mount_ro(&device, &at)?;
     Ok(Some(at))
+}
+
+/// Older releases ship their current VNDK under a build-time filename.
+/// Its manifest still names the versioned bundle, which is what the
+/// vendor was built against and the mount point its libraries expect.
+fn bundle_source(name: &str, dirs: &[&Path]) -> Result<Option<PathBuf>> {
+    if let Some(file) = dirs.iter().map(|dir| dir.join(format!("{name}.apex"))).find(|p| p.is_file()) {
+        return Ok(Some(file));
+    }
+    if name.starts_with("com.android.vndk.v") {
+        for file in dirs.iter().map(|dir| dir.join("com.android.vndk.current.apex")).filter(|p| p.is_file()) {
+            let mut bundle = zip::ZipArchive::new(fs::File::open(&file)?)
+                .with_context(|| format!("read what is in {}", file.display()))?;
+            let mut manifest = Vec::new();
+            bundle.by_name("apex_manifest.pb")?.read_to_end(&mut manifest)?;
+            let manifest = BundleManifest::decode(manifest.as_slice())
+                .with_context(|| format!("read the bundle name in {}", file.display()))?;
+            if manifest.name == name {
+                return Ok(Some(file));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct BundleManifest {
+    #[prost(string, tag = "1")]
+    name: String,
 }
 
 /// Where the filesystem lies inside a bundle.
@@ -463,5 +495,47 @@ fn answering_again(was: Option<u32>) -> Result<()> {
             anyhow::bail!("the service directory did not come back");
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    fn current_bundle(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join("com.android.vndk.current.apex");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        zip.start_file("apex_manifest.pb", SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored)).unwrap();
+        zip.write_all(&BundleManifest { name: name.into() }.encode_to_vec()).unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn the_current_filename_opens_as_the_version_its_manifest_names() {
+        let home = tempfile::tempdir().unwrap();
+        let file = current_bundle(home.path(), "com.android.vndk.v31");
+        assert_eq!(bundle_source("com.android.vndk.v31", &[home.path()]).unwrap(), Some(file));
+    }
+
+    #[test]
+    fn the_current_bundle_does_not_stand_in_for_another_version_or_runtime() {
+        let home = tempfile::tempdir().unwrap();
+        current_bundle(home.path(), "com.android.vndk.v31");
+        for name in ["com.android.vndk.v30", "com.android.runtime"] {
+            assert_eq!(bundle_source(name, &[home.path()]).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn a_numbered_bundle_keeps_priority_over_the_current_filename() {
+        let older = tempfile::tempdir().unwrap();
+        let numbered = tempfile::tempdir().unwrap();
+        current_bundle(older.path(), "com.android.vndk.v31");
+        let file = numbered.path().join("com.android.vndk.v31.apex");
+        fs::write(&file, []).unwrap();
+        assert_eq!(bundle_source("com.android.vndk.v31", &[older.path(), numbered.path()]).unwrap(), Some(file));
     }
 }

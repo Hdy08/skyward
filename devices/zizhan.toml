@@ -117,7 +117,9 @@ server = "https://update.miui.com/updates/miotaV3.php"
 
 [backup]
 efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
-data_skipped = ["vendor/tzstorage", "vendor/qtee", "vendor/fingerprint", "vendor/fpc", "vendor/goodix"]
+# MIUI's memory-extension swap uses a separate key unavailable in recovery.
+# It is runtime storage, not app data; leave it alone on backup and restore.
+data_skipped = ["vendor/tzstorage", "vendor/qtee", "vendor/fingerprint", "vendor/fpc", "vendor/goodix", "extm"]
 
 [wipe]
 logs = ["/data/miuilog", "/data/vendor/diag", "/data/vendor/log", "/data/vendor/ramdump", "/data/vendor/ssrdump", "/data/vendor/tombstones", "/data/vendor/wlan_logs"]

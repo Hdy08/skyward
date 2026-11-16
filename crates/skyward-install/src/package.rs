@@ -127,15 +127,13 @@ fn text<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str) -> Result<String> {
     Ok(s)
 }
 
-/// What the phone is, and the system installed on it now when its
-/// partitions could be read.
+/// The phone's identity, used to match a package's device and serial.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Phone {
     /// ro.product.device
     pub device: String,
     /// ro.serialno
     pub serial: String,
-    pub installed: Option<Build>,
 }
 
 impl Phone {
@@ -145,24 +143,8 @@ impl Phone {
     pub fn from_system(props: &HashMap<String, String>, recovery_device: Option<&str>, serial: String) -> Result<Self> {
         let device = props.get("ro.product.device").map(String::as_str).filter(|s| !s.is_empty())
             .or(recovery_device.filter(|s| !s.is_empty())).context("ro.product.device is unset")?.to_owned();
-        let installed = match (props.get("ro.build.date.utc"), props.get("ro.build.version.security_patch")) {
-            (Some(time), Some(patch)) => Some(Build {
-                timestamp: time.parse().with_context(|| format!("ro.build.date.utc {time:?}"))?,
-                security_patch: patch.clone(),
-            }),
-            _ => None,
-        };
-        Ok(Self { device, serial, installed })
+        Ok(Self { device, serial })
     }
-}
-
-/// The installed system, from its build.prop files.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Build {
-    /// ro.build.date.utc
-    pub timestamp: i64,
-    /// ro.build.version.security_patch, as yyyy-mm-dd
-    pub security_patch: String,
 }
 
 /// Whether `update` may go on `phone`.
@@ -184,22 +166,8 @@ pub fn check(update: &Update, phone: &Phone) -> Result<(), Refusal> {
     if m.get("pre-build").is_some() || m.get("pre-build-incremental").is_some() {
         return Err(Refusal::Incremental);
     }
-    let Some(build) = &phone.installed else { return Ok(()) };
-    // A full package may install the version already there again; going
-    // back needs a package made for the build it leaves, an incremental
-    // one.
-    let timestamp = m.get("post-timestamp").and_then(|t| t.parse().ok()).unwrap_or(0);
-    if timestamp < build.timestamp {
-        return Err(Refusal::Older { package: timestamp, installed: build.timestamp });
-    }
-    // Patch levels are yyyy-mm-dd, so they order as text. Data that is
-    // erased before the older system starts is never read under it.
-    if let Some(patch) = m.get("post-security-patch-level") {
-        let allowed = m.get("spl-downgrade") == Some("yes") || m.get("ota-downgrade") == Some("yes") || update.wipes();
-        if patch < build.security_patch.as_str() && !allowed {
-            return Err(Refusal::OlderPatch { package: patch.to_string(), installed: build.security_patch.clone() });
-        }
-    }
+    // Full packages may install earlier build and security patch dates.
+    // Only the package's explicit wipe request affects Update::wipes().
     Ok(())
 }
 
@@ -234,11 +202,11 @@ METADATA_SIZE=1024
 ";
 
     fn phone() -> Phone {
-        Phone {
-            device: "ishtar".into(),
-            serial: "2674dc3e".into(),
-            installed: Some(Build { timestamp: 1_778_243_655, security_patch: "2026-04-01".into() }),
-        }
+        Phone::from_system(&HashMap::from([
+            ("ro.product.device".into(), "ishtar".into()),
+            ("ro.build.date.utc".into(), "1778243655".into()),
+            ("ro.build.version.security_patch".into(), "2026-04-01".into()),
+        ]), None, "2674dc3e".into()).unwrap()
     }
 
     fn update_with(metadata: &str, properties: &str) -> Update {
@@ -316,23 +284,44 @@ METADATA_SIZE=1024
     }
 
     #[test]
-    fn incremental_and_older_packages_are_refused() {
+    fn incremental_packages_are_refused() {
         let incremental = format!(
             "{METADATA_TEXT}pre-build=Xiaomi/ishtar/ishtar:16/X/OS3.0.305.0.WMACNXM:user/release-keys\npre-build-incremental=OS3.0.305.0.WMACNXM\n"
         );
         assert_eq!(check(&update_with(&incremental, PROPERTIES_TEXT), &phone()), Err(Refusal::Incremental));
-        let older = METADATA_TEXT.replace("1781000000", "1770000000");
-        assert_eq!(
-            check(&update_with(&older, PROPERTIES_TEXT), &phone()),
-            Err(Refusal::Older { package: 1_770_000_000, installed: 1_778_243_655 })
-        );
-        let patch = METADATA_TEXT.replace("2026-06-01", "2026-03-01");
-        assert_eq!(
-            check(&update_with(&patch, PROPERTIES_TEXT), &phone()),
-            Err(Refusal::OlderPatch { package: "2026-03-01".into(), installed: "2026-04-01".into() })
-        );
-        let allowed = format!("{}spl-downgrade=yes\n", METADATA_TEXT.replace("2026-06-01", "2026-03-01"));
-        assert_eq!(check(&update_with(&allowed, PROPERTIES_TEXT), &phone()), Ok(()));
+    }
+
+    #[test]
+    fn full_packages_may_have_earlier_or_missing_build_dates() {
+        for metadata in [
+            METADATA_TEXT.replace("1781000000", "1770000000"),
+            METADATA_TEXT.replace("post-timestamp=1781000000\n", ""),
+        ] {
+            assert_eq!(check(&update_with(&metadata, PROPERTIES_TEXT), &phone()), Ok(()));
+        }
+    }
+
+    #[test]
+    fn earlier_build_and_patch_dates_do_not_require_or_add_a_wipe() {
+        for metadata in [
+            METADATA_TEXT.replace("2026-06-01", "2026-03-01"),
+            METADATA_TEXT.replace("2026-06-01", "2022-09-01").replace("1781000000", "1663664709"),
+        ] {
+            let update = update_with(&metadata, PROPERTIES_TEXT);
+            assert_eq!(check(&update, &phone()), Ok(()));
+            assert!(!update.wipes());
+            assert_eq!(update.properties, PROPERTIES_TEXT, "the payload headers stay as supplied");
+        }
+    }
+
+    #[test]
+    fn installed_age_properties_are_not_needed_for_package_identity() {
+        let props = HashMap::from([
+            ("ro.product.device".into(), "ishtar".into()),
+            ("ro.build.date.utc".into(), "not a timestamp".into()),
+            ("ro.build.version.security_patch".into(), "".into()),
+        ]);
+        assert_eq!(Phone::from_system(&props, None, "2674dc3e".into()).unwrap(), phone());
     }
 
     #[test]
@@ -346,13 +335,13 @@ METADATA_SIZE=1024
         assert!(wipe.wipes());
         assert!(!update_with(METADATA_TEXT, &format!("{PROPERTIES_TEXT}POWERWASH=0\n")).wipes());
         let older_patch = format!("{}ota-wipe=yes\n", METADATA_TEXT.replace("2026-06-01", "2026-03-01"));
-        assert_eq!(check(&update_with(&older_patch, PROPERTIES_TEXT), &phone()), Ok(()), "the data it could not read is erased");
+        assert_eq!(check(&update_with(&older_patch, PROPERTIES_TEXT), &phone()), Ok(()));
     }
 
     #[test]
     fn without_an_installed_system_only_the_package_itself_is_checked() {
         let older = METADATA_TEXT.replace("1781000000", "1770000000");
-        let bare = Phone { installed: None, ..phone() };
+        let bare = Phone::from_system(&HashMap::new(), Some("ishtar"), "2674dc3e".into()).unwrap();
         assert_eq!(check(&update_with(&older, PROPERTIES_TEXT), &bare), Ok(()));
     }
 

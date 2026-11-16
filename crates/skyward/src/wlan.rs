@@ -534,6 +534,14 @@ impl Station {
         r.probed += 1;
         let n = r.probed;
         thread::spawn(move || {
+            match skyward_net::sntp::query(&dns).and_then(skyward_sys::clock::set_unix_ms) {
+                Ok(now) => {
+                    let _ = skyward_sys::kmsg(&format!("clock set to {now} ms from network time"));
+                }
+                Err(error) => {
+                    let _ = skyward_sys::kmsg(&format!("network time not set: {error:#}"));
+                }
+            }
             let reach = reach::probe(&page, &dns);
             back.tell(Inbox::Reach(n, reach));
         });

@@ -75,7 +75,7 @@ const DATA_SKIPPED: [&str; 22] = [
 ];
 
 /// What of the data partition backups leave out on this phone: what every
-/// phone's do, and what the phone's own secure world keeps in step.
+/// phone's do, and the phone's own key-bound files and runtime storage.
 pub fn data_skipped(phone: &[String]) -> Vec<String> {
     DATA_SKIPPED.iter().map(|s| s.to_string()).chain(phone.iter().cloned()).collect()
 }
@@ -639,6 +639,44 @@ mod tests {
         assert_eq!(fs::read(to.join("data/app/files/notes")).unwrap(), b"app data");
         for folder in ["gsi/dsu/second", "media/0", "skyward/systems"] {
             assert_eq!(fs::read(to.join(folder).join("kept")).unwrap(), to.as_os_str().as_encoded_bytes());
+        }
+    }
+
+    #[test]
+    fn zizhan_archives_leave_memory_extension_alone_and_keep_app_files() {
+        let phone = skyward_config::DeviceConfig::parse(include_str!("../../../devices/zizhan.toml")).unwrap();
+        let skipped = Skipped::new(&data_skipped(&phone.backup.data_skipped));
+        let at = tempfile::tempdir().unwrap();
+        let (from, to) = (at.path().join("from"), at.path().join("to"));
+        let files = [
+            ("data/app/files/notes", b"app data".as_slice()),
+            ("data/app/files/extm/notes", b"app extm".as_slice()),
+            ("extm-notes/notes", b"user notes".as_slice()),
+        ];
+        for root in [&from, &to] {
+            for (name, contents) in files {
+                let path = root.join(name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, if root == &from { contents } else { b"old" }).unwrap();
+            }
+            fs::create_dir(root.join("extm")).unwrap();
+            fs::write(root.join("extm/swap"), root.as_os_str().as_encoded_bytes()).unwrap();
+        }
+        let cancel = AtomicBool::new(false);
+        assert_eq!(archive::measure(&from, &skipped, &cancel).unwrap().0, files.iter().map(|(_, contents)| contents.len() as u64).sum::<u64>());
+        let mut packed = Vec::new();
+        archive::pack(&from, &skipped, &mut packed, &cancel, &mut |_| {}).unwrap();
+        archive::unpack(packed.as_slice(), &to, &skipped, &cancel, &mut |_| {}).unwrap();
+        for (name, contents) in files {
+            assert_eq!(fs::read(to.join(name)).unwrap(), contents);
+        }
+        assert_eq!(fs::read(to.join("extm/swap")).unwrap(), to.as_os_str().as_encoded_bytes());
+        let fresh = at.path().join("fresh");
+        fs::create_dir(&fresh).unwrap();
+        archive::unpack(packed.as_slice(), &fresh, &skipped, &cancel, &mut |_| {}).unwrap();
+        assert!(!fresh.join("extm").exists());
+        for (name, contents) in files {
+            assert_eq!(fs::read(fresh.join(name)).unwrap(), contents);
         }
     }
 }

@@ -7,7 +7,8 @@ pub use android::*;
 #[cfg(target_os = "android")]
 mod android {
     use anyhow::{Context, Result};
-    use std::fs::File;
+    use std::fs::{self, File};
+    use std::io::ErrorKind;
     use std::os::fd::AsRawFd;
     use std::path::{Path, PathBuf};
 
@@ -47,6 +48,27 @@ mod android {
         block_size: u32,
         info: Info,
         reserved: [u64; 8],
+    }
+
+    /// Files the kernel still holds for attached loop devices. A bundle
+    /// mounted through a loop keeps its containing filesystem busy even
+    /// when no process has the bundle itself open.
+    pub fn backing_files() -> Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir("/sys/block").context("read the block devices")? {
+            let entry = entry?;
+            if !entry.file_name().as_encoded_bytes().starts_with(b"loop") {
+                continue;
+            }
+            let path = entry.path().join("loop/backing_file");
+            match fs::read_to_string(&path) {
+                Ok(file) if !file.trim_end_matches('\n').is_empty() => files.push(PathBuf::from(file.trim_end_matches('\n'))),
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+            }
+        }
+        Ok(files)
     }
 
     /// Open `file` from `offset` for `length` bytes as a block device, and

@@ -46,6 +46,8 @@ pub enum Log {
     Overwriting,
     /// It started reading back the `index`th partition it wrote, from 0.
     Hashing { index: usize, partition: String },
+    /// The engine's combined payload/application progress, as a percent.
+    Progress(u8),
 }
 
 pub fn log(line: &str) -> Option<Log> {
@@ -56,6 +58,10 @@ pub fn log(line: &str) -> Option<Log> {
     if line.contains("Will overwrite existing partitions.") {
         return Some(Log::Overwriting);
     }
+    if let Some(rest) = after(line, ", overall progress ") {
+        let percent: u8 = rest.strip_suffix('%')?.parse().ok()?;
+        return (percent <= 100).then_some(Log::Progress(percent));
+    }
     let rest = after(line, "Hashing partition ")?;
     let (index, rest) = rest.split_once(" (")?;
     let (name, _) = rest.split_once(')')?;
@@ -64,6 +70,47 @@ pub fn log(line: &str) -> Option<Log> {
 
 fn after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     line.find(marker).map(|at| &line[at + marker.len()..])
+}
+
+/// The engine's writing, readback and finalization phases. ZIP directory
+/// reads and signature checks are not evidence that partitions were written.
+/// The stock sideload program rounds `set_progress` to whole 0/1 values;
+/// its detailed log retains the actual application percentage.
+#[cfg(any(target_os = "android", test))]
+#[derive(Default)]
+pub(crate) struct Progress {
+    written: u8,
+    partitions: usize,
+    verifying: Option<(usize, String)>,
+    finishing: bool,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl Progress {
+    pub fn status(&mut self, status: Status) {
+        if status == Status::Step(2) {
+            self.finishing = true;
+        }
+    }
+
+    pub fn log(&mut self, log: &Log) {
+        match log {
+            Log::Partition(_) => self.partitions += 1,
+            Log::Progress(percent) => self.written = self.written.max(*percent),
+            Log::Hashing { index, partition } => self.verifying = Some((*index, partition.clone())),
+            Log::Overwriting => {}
+        }
+    }
+
+    pub fn stage(&self) -> crate::Stage {
+        if self.finishing {
+            crate::Stage::Finishing
+        } else if let Some((index, partition)) = &self.verifying {
+            crate::Stage::Verifying { index: *index, count: self.partitions.max(index + 1), partition: partition.clone() }
+        } else {
+            crate::Stage::Writing { done: u64::from(self.written), total: 100 }
+        }
+    }
 }
 
 /// What an update_engine error code comes down to for whoever installs.
@@ -159,6 +206,47 @@ mod tests {
         );
         assert_eq!(log("[INFO:delta_performer.cc(267)] PartitionInfo old odm sha256: 00 size: 4"), None);
         assert_eq!(log("[INFO:delta_performer.cc(108)] Completed 10/400 operations (2%)"), None);
+    }
+
+    #[test]
+    fn application_progress_comes_from_the_engine_not_the_zip_offset() {
+        let line = "[INFO:delta_performer.cc(113)] Completed 12/400 operations (3%), 65536/7103041280 bytes downloaded (0%), overall progress 2%";
+        assert_eq!(log(line), Some(Log::Progress(2)));
+        for text in ["0", "50", "99", "100"] {
+            assert_eq!(log(&format!("Completed operations, overall progress {text}%")), Some(Log::Progress(text.parse().unwrap())));
+        }
+        for text in ["-1%", "101%", "256%", "NaN%", "50", "1.5%", "%"] {
+            assert_eq!(log(&format!("Completed operations, overall progress {text}")), None);
+        }
+        assert_eq!(Progress::default().stage(), crate::Stage::Writing { done: 0, total: 100 });
+    }
+
+    #[test]
+    fn writing_moves_only_with_application_progress_and_never_backwards() {
+        let mut progress = Progress::default();
+        progress.status(Status::Step(1));
+        progress.log(&Log::Partition("system".into()));
+        assert_eq!(progress.stage(), crate::Stage::Writing { done: 0, total: 100 });
+        for percent in [1, 25, 25, 50, 49, 99, 100] {
+            progress.log(&Log::Progress(percent));
+            let expected = if percent == 49 { 50 } else { percent };
+            assert_eq!(progress.stage(), crate::Stage::Writing { done: u64::from(expected), total: 100 });
+        }
+    }
+
+    #[test]
+    fn readback_and_finishing_keep_their_phase_when_outputs_interleave() {
+        let mut progress = Progress::default();
+        progress.log(&Log::Partition("system".into()));
+        progress.log(&Log::Partition("vendor".into()));
+        progress.log(&Log::Hashing { index: 0, partition: "system".into() });
+        progress.log(&Log::Progress(100));
+        progress.status(Status::Step(1));
+        assert_eq!(progress.stage(), crate::Stage::Verifying { index: 0, count: 2, partition: "system".into() });
+        progress.status(Status::Step(2));
+        progress.log(&Log::Hashing { index: 1, partition: "vendor".into() });
+        progress.status(Status::Step(1));
+        assert_eq!(progress.stage(), crate::Stage::Finishing);
     }
 
     #[test]

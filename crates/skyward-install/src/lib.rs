@@ -138,8 +138,8 @@ pub enum Reflash {
 /// How far the work is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
-    /// update_engine writes the new system: the bytes of its payload read
-    /// so far.
+    /// update_engine writes the new system: its application progress so
+    /// far, out of the reported total.
     Writing { done: u64, total: u64 },
     /// It reads back what it wrote, one partition after another.
     Verifying { index: usize, count: usize, partition: String },
@@ -212,11 +212,6 @@ pub enum Refusal {
     /// An incremental package, which needs snapshots that recovery cannot
     /// make on a Virtual A/B phone.
     Incremental,
-    /// Older than the installed system: both build times.
-    Older { package: i64, installed: i64 },
-    /// Its security patch is older than the installed one, which leaves
-    /// the data partition unreadable unless it is erased.
-    OlderPatch { package: String, installed: String },
     /// An image for partitions this phone does not have.
     NoPartition,
     /// Too little charge to install safely: the level, and whether a

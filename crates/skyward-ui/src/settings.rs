@@ -241,6 +241,9 @@ pub struct Keeper {
     /// The settings the pages showed when last looked at, and since when;
     /// with no time once writing them failed, until they change.
     standing: Option<(Settings, Option<u64>)>,
+    /// A freshly made metadata filesystem needs its settings back before
+    /// the result page's automatic restart, without the slider debounce.
+    restore: bool,
 }
 
 impl Keeper {
@@ -250,14 +253,20 @@ impl Keeper {
             Kept::Nothing => Some(None),
             Kept::Unreadable => None,
         };
-        Keeper { holds, standing: None }
+        Keeper { holds, standing: None, restore: false }
     }
 
     /// The settings to write at `now`, given those the pages `show`: none
     /// while they are what the file holds, or have stood unchanged for less
-    /// than [`WAIT_MS`], or what the file holds is not known.
+    /// than [`WAIT_MS`], or what the file holds is not known. A store made
+    /// afresh takes its settings immediately at the next safe write.
     pub fn due(&mut self, show: Settings, now: u64) -> Option<Settings> {
         let holds = self.holds.as_ref()?;
+        if self.restore {
+            self.restore = false;
+            self.standing = Some((show.clone(), None));
+            return Some(show);
+        }
         if holds.as_ref() == Some(&show) {
             self.standing = None;
             return None;
@@ -275,6 +284,7 @@ impl Keeper {
     pub fn written(&mut self, settings: Settings) {
         self.holds = Some(Some(settings));
         self.standing = None;
+        self.restore = false;
     }
 
     /// Writing the settings failed: they are written again once they change.
@@ -289,6 +299,7 @@ impl Keeper {
     pub fn remade(&mut self) {
         self.holds = Some(None);
         self.standing = None;
+        self.restore = true;
     }
 }
 
@@ -409,11 +420,35 @@ mod tests {
         keeper.due(dark.clone(), 0);
         assert_eq!(keeper.due(dark.clone(), 10_000), None);
         keeper.remade();
-        keeper.due(dark.clone(), 10_000);
-        assert_eq!(keeper.due(dark.clone(), 12_000), Some(dark.clone()));
+        assert_eq!(keeper.due(dark.clone(), 10_000), Some(dark.clone()));
         keeper.written(dark.clone());
         keeper.remade();
-        keeper.due(dark.clone(), 20_000);
-        assert_eq!(keeper.due(dark.clone(), 22_000), Some(dark), "erasing takes the file with it, so it is written again");
+        assert_eq!(keeper.due(dark.clone(), 20_000), Some(dark), "erasing takes the file with it, so it is written again immediately");
+    }
+
+    #[test]
+    fn a_remade_store_restores_before_the_result_pages_automatic_restart() {
+        let settings = Settings { dark: true, brightness: 0.4, vibration: 0.9, ..Settings::default() };
+        let mut keeper = Keeper::new(&Kept::Settings(settings.clone()));
+        keeper.remade();
+        let saved = keeper.due(settings.clone(), 10_000).expect("save on the first safe turn, before the 1.5 second restart");
+        keeper.written(saved.clone());
+        assert_eq!(keeper.due(settings.clone(), 11_500), None);
+        let back = Settings::read(&saved.text()).unwrap();
+        assert_eq!(back, settings);
+        assert_eq!(Keeper::new(&Kept::Settings(back)).due(settings, 0), None);
+    }
+
+    #[test]
+    fn a_failed_restore_waits_for_a_change_instead_of_retrying_every_frame() {
+        let settings = Settings::default();
+        let mut keeper = Keeper::new(&Kept::Settings(settings.clone()));
+        keeper.remade();
+        assert_eq!(keeper.due(settings.clone(), 0), Some(settings.clone()));
+        keeper.failed();
+        assert_eq!(keeper.due(settings, 60_000), None);
+        let changed = Settings { dark: true, ..Settings::default() };
+        assert_eq!(keeper.due(changed.clone(), 61_000), None);
+        assert_eq!(keeper.due(changed.clone(), 63_000), Some(changed));
     }
 }

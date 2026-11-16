@@ -25,6 +25,15 @@ const FN_KEY_BLOB: &str = "keymaster_key_blob";
 const FN_SECDISCARDABLE: &str = "secdiscardable";
 const FN_STRETCHING: &str = "stretching";
 
+/// Older vold directories record how a credential contributes to the
+/// wrapping. `nopassword` binds no credential; `none`, like a modern
+/// directory without this file, uses the supplied secret unchanged.
+#[derive(Clone, Copy)]
+enum Stretching {
+    None,
+    NoPassword,
+}
+
 /// SHA-512 of `data` behind a fixed prefix.
 pub fn hash_with_prefix(prefix: &[u8], data: &[u8]) -> Vec<u8> {
     let mut padded = prefix.to_vec();
@@ -60,6 +69,7 @@ pub struct StoredKey {
     /// The hash of the blob whose erasure makes the key unrecoverable.
     /// Directories written without one hash nothing.
     secdiscardable_hash: Vec<u8>,
+    stretching: Stretching,
 }
 
 impl StoredKey {
@@ -69,9 +79,15 @@ impl StoredKey {
         if version.trim() != VERSION {
             bail!("{} is written in layout {}, Skyward reads layout {VERSION}", dir.display(), version.trim());
         }
-        if dir.join(FN_STRETCHING).exists() {
-            bail!("{} was written by an Android too old for Skyward to read", dir.display());
-        }
+        let stretching = match fs::read_to_string(dir.join(FN_STRETCHING)) {
+            Ok(value) => match value.trim() {
+                "none" => Stretching::None,
+                "nopassword" => Stretching::NoPassword,
+                other => bail!("{} uses unsupported key stretching {other:?}", dir.display()),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Stretching::None,
+            Err(e) => return Err(e).with_context(|| format!("read {}", dir.join(FN_STRETCHING).display())),
+        };
         let secdiscardable_hash = match dir.join(FN_SECDISCARDABLE).exists() {
             true => hash_with_prefix(SECDISCARDABLE_PREFIX, &read(FN_SECDISCARDABLE)?),
             false => Vec::new(),
@@ -80,7 +96,7 @@ impl StoredKey {
             true => Some(read(FN_KEY_BLOB)?),
             false => None,
         };
-        Ok(StoredKey { encrypted: read(FN_ENCRYPTED_KEY)?, key_blob, secdiscardable_hash })
+        Ok(StoredKey { encrypted: read(FN_ENCRYPTED_KEY)?, key_blob, secdiscardable_hash, stretching })
     }
 
     /// What the wrapping is bound to: the directory's own hash and whatever
@@ -88,7 +104,9 @@ impl StoredKey {
     /// unwrapping fails rather than producing a key that looks usable.
     fn app_id(&self, secret: &[u8]) -> Vec<u8> {
         let mut id = self.secdiscardable_hash.clone();
-        id.extend_from_slice(secret);
+        if matches!(self.stretching, Stretching::None) {
+            id.extend_from_slice(secret);
+        }
         id
     }
 
@@ -174,6 +192,7 @@ mod tests {
             encrypted,
             key_blob: None,
             secdiscardable_hash: hash_with_prefix(SECDISCARDABLE_PREFIX, secdiscardable),
+            stretching: Stretching::None,
         }
     }
 
@@ -222,15 +241,59 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_in_an_older_layout_is_refused() {
+    fn unsupported_stretching_and_unknown_layouts_are_refused() {
         let dir = tempdir("older-layout");
         fs::write(dir.join(FN_VERSION), "1").unwrap();
         fs::write(dir.join(FN_ENCRYPTED_KEY), [0u8; 64]).unwrap();
         fs::write(dir.join(FN_STRETCHING), "scrypt 15 8 1").unwrap();
-        assert!(refusal(&dir).contains("too old"), "{}", refusal(&dir));
+        assert!(refusal(&dir).contains("unsupported key stretching"), "{}", refusal(&dir));
         fs::remove_file(dir.join(FN_STRETCHING)).unwrap();
         fs::write(dir.join(FN_VERSION), "2").unwrap();
         assert!(refusal(&dir).contains("layout 2"), "{}", refusal(&dir));
+    }
+
+    #[test]
+    fn an_android_13_passwordless_hardware_key_uses_its_secdiscardable_binding() {
+        struct Hardware;
+        impl Decryptor for Hardware {
+            fn gcm_decrypt(&self, blob: &[u8], app_id: &[u8], nonce: &[u8], body: &[u8]) -> Result<Vec<u8>> {
+                assert_eq!(blob, b"hardware key blob");
+                assert_eq!(hex::encode(app_id), "d29166a7b1dc78f68cdcb0e473a2d53421c932ee938167a2f41784e7f52adde202256f9eb3dcba42f08eef5be27bc87090e56c5b9099996f502939ab8961abcf");
+                assert_eq!(nonce, [3; NONCE_BYTES]);
+                assert_eq!(body, [7; TAG_BYTES + KEY_BYTES]);
+                Ok(vec![0xAB; KEY_BYTES])
+            }
+        }
+        let dir = tempdir("android13-nopassword");
+        fs::write(dir.join(FN_VERSION), VERSION).unwrap();
+        fs::write(dir.join(FN_STRETCHING), "nopassword").unwrap();
+        fs::write(dir.join(FN_SECDISCARDABLE), b"test").unwrap();
+        fs::write(dir.join(FN_KEY_BLOB), b"hardware key blob").unwrap();
+        fs::write(dir.join(FN_ENCRYPTED_KEY), [vec![3; NONCE_BYTES], vec![7; TAG_BYTES + KEY_BYTES]].concat()).unwrap();
+        let stored = StoredKey::load(&dir).unwrap();
+        assert_eq!(stored.unwrap(Unwrap::Hardware(&Hardware)).unwrap(), vec![0xAB; KEY_BYTES]);
+        assert_eq!(stored.app_id(b"not part of this binding"), stored.app_id(&[]));
+    }
+
+    #[test]
+    fn legacy_unstretched_software_keys_keep_the_secret_and_authentication() {
+        let dir = tempdir("android13-none");
+        let mut binding = hash_with_prefix(SECDISCARDABLE_PREFIX, b"test");
+        binding.extend_from_slice(b"the user's secret");
+        let encrypted = wrap(&binding, &[4; NONCE_BYTES], &[0xAD; 64]);
+        fs::write(dir.join(FN_VERSION), VERSION).unwrap();
+        fs::write(dir.join(FN_SECDISCARDABLE), b"test").unwrap();
+        fs::write(dir.join(FN_ENCRYPTED_KEY), encrypted).unwrap();
+        for legacy in [false, true] {
+            if legacy {
+                fs::write(dir.join(FN_STRETCHING), "none").unwrap();
+            }
+            let stored = StoredKey::load(&dir).unwrap();
+            assert_eq!(stored.unwrap(Unwrap::<NoService>::Secret(b"the user's secret")).unwrap(), vec![0xAD; 64]);
+            assert!(stored.unwrap(Unwrap::<NoService>::Secret(b"wrong secret")).is_err());
+        }
+        fs::write(dir.join(FN_SECDISCARDABLE), b"another binding").unwrap();
+        assert!(StoredKey::load(&dir).unwrap().unwrap(Unwrap::<NoService>::Secret(b"the user's secret")).is_err());
     }
 
     #[test]

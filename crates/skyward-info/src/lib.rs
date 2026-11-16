@@ -163,7 +163,7 @@ pub fn collect_with(cfg: &DeviceConfig, battery: Option<Battery>) -> Result<Devi
         ram_kib: mem_total(&read("/proc/meminfo")?)?,
         panel: (d.width > 0 && d.height > 0).then_some((d.width, d.height)),
         screen: d.diagonal,
-        os_version: system.get(&cfg.device.os_version_prop),
+        os_version: system.os_version(&cfg.device.os_version_prop),
         android: system.get("ro.build.version.release"),
         locale: system.get("ro.product.locale"),
         security_patch: system.get("ro.build.version.security_patch").map(|s| s.parse()).transpose()?,
@@ -213,6 +213,19 @@ impl SystemProps {
             SystemProps::Running => prop(name),
             SystemProps::Installed(props) => props.get(name).cloned(),
         }
+    }
+
+    /// MIUI predates the HyperOS display property. Read its complete build
+    /// revision from the same installed-system properties as the Android
+    /// version, rather than falling back to Recovery's own build.
+    fn os_version(&self, preferred: &str) -> Option<String> {
+        self.get(preferred).filter(|v| !v.is_empty()).or_else(|| {
+            if preferred == "ro.mi.os.version.incremental" && self.get("ro.miui.ui.version.name").is_some() {
+                self.get("ro.build.version.incremental").filter(|v| !v.is_empty())
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -446,6 +459,18 @@ fn supplied(sources: &[Option<bool>]) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn miui_uses_its_installed_build_while_hyperos_keeps_its_display_revision() {
+        let system = |pairs: &[(&str, &str)]| SystemProps::Installed(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+        let miui = system(&[("ro.miui.ui.version.name", "V140"), ("ro.build.version.incremental", "V14.0.14.0.TLRCNXM")]);
+        assert_eq!(miui.os_version("ro.mi.os.version.incremental").as_deref(), Some("V14.0.14.0.TLRCNXM"));
+        let hyper = system(&[("ro.mi.os.version.incremental", "OS1.0.15.0.ULRCNXM"), ("ro.build.version.incremental", "V816.0.15.0.ULRCNXM"), ("ro.miui.ui.version.name", "V816")]);
+        assert_eq!(hyper.os_version("ro.mi.os.version.incremental").as_deref(), Some("OS1.0.15.0.ULRCNXM"));
+        let other = system(&[("ro.build.version.incremental", "some-android-build")]);
+        assert_eq!(other.os_version("ro.mi.os.version.incremental"), None);
+        assert_eq!(miui.os_version("ro.build.display.id"), None, "another device's configured version property keeps its meaning");
+    }
 
     #[test]
     fn cpulist_ranges_and_singles() {

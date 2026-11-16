@@ -17,10 +17,22 @@ use tar::{Archive, Builder, EntryType, Header};
 
 /// How the archive's extended headers name what a tar header leaves out.
 const XATTR: &str = "SCHILY.xattr.";
+/// The tar reader separates PAX records at newlines. Encode attributes
+/// whose names or binary values cannot be represented by that reader.
+const XATTR_HEX: &str = "SKYWARD.xattr-hex.";
 const PROJECT: &str = "SKYWARD.project";
 const INHERITS: &str = "SKYWARD.project-inherit";
 const KEY_ROOT: &str = "SKYWARD.key-root";
 const MTIME: &str = "mtime";
+
+#[cfg(any(target_os = "android", test))]
+fn xattr_record(name: &str, value: Vec<u8>) -> (String, Vec<u8>) {
+    if name.contains(['\n', '=']) || value.contains(&b'\n') {
+        (format!("{XATTR_HEX}{}", hex::encode(name)), hex::encode(value).into_bytes())
+    } else {
+        (format!("{XATTR}{name}"), value)
+    }
+}
 
 /// Paths in a folder left out of its archive and left alone when an
 /// archive is unpacked into it, each from the folder, a `*` in it standing
@@ -415,7 +427,10 @@ fn records(entry: &mut tar::Entry<impl Read>) -> Result<Records> {
         let ext = ext?;
         let key = ext.key()?;
         let value = ext.value_bytes();
-        if let Some(name) = key.strip_prefix(XATTR) {
+        if let Some(name) = key.strip_prefix(XATTR_HEX) {
+            let name = String::from_utf8(hex::decode(name).context("decode the attribute name")?).context("read the attribute name")?;
+            r.xattrs.push((name, hex::decode(value).context("decode the attribute's contents")?));
+        } else if let Some(name) = key.strip_prefix(XATTR) {
             r.xattrs.push((name.to_string(), value.to_vec()));
         } else if key == PROJECT {
             r.project = Some(std::str::from_utf8(value)?.parse()?);
@@ -530,7 +545,7 @@ fn beyond(path: &Path, meta: &fs::Metadata) -> Result<Vec<(String, Vec<u8>)>> {
             return Err(io::Error::last_os_error()).with_context(|| format!("read its attribute {name:?}"));
         }
         value.truncate(len as usize);
-        out.push((format!("{XATTR}{}", String::from_utf8_lossy(raw)), value));
+        out.push(xattr_record(&String::from_utf8_lossy(raw), value));
     }
     if meta.is_file() || meta.is_dir() {
         let fsx = fs_attributes(path)?;
@@ -747,6 +762,35 @@ mod tests {
         let e = pack(&at.join("from"), &skipped(), io::sink(), &partway, &mut |n| partway.store(n > 0, Ordering::Relaxed)).unwrap_err();
         assert!(e.is::<Cancelled>(), "stopped in the middle of a file: {e:#}");
         fs::remove_dir_all(&at).unwrap();
+    }
+
+    #[test]
+    fn binary_extended_attributes_survive_the_archive() {
+        let attributes = [
+            ("user.skyward.text", b"legacy text".to_vec()),
+            ("user.skyward.nul", b"kept\0with\xffbytes".to_vec()),
+            ("user.skyward.lines", b"first\nsecond\n".to_vec()),
+            ("user.skyward.binary", (0u8..=255).collect::<Vec<_>>()),
+            ("user.skyward=name", b"equals in name".to_vec()),
+            ("user.skyward\nname", b"newline in name".to_vec()),
+        ];
+        let metadata: Vec<_> = attributes.iter().map(|(name, value)| xattr_record(name, value.clone())).collect();
+        let mut builder = Builder::new(Vec::new());
+        builder.append_pax_extensions(metadata.iter().map(|(name, value)| (name.as_str(), value.as_slice()))).unwrap();
+        let mut header = Header::new_gnu();
+        header.set_mode(0o600);
+        header.set_size(12);
+        builder.append_data(&mut header, "app-data", b"app contents".as_slice()).unwrap();
+        let packed = builder.into_inner().unwrap();
+        let mut archive = Archive::new(packed.as_slice());
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        let restored = records(&mut entry).unwrap();
+        assert_eq!(restored.xattrs, attributes.iter().map(|(name, value)| (name.to_string(), value.clone())).collect::<Vec<_>>());
+        let mut contents = Vec::new();
+        entry.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"app contents");
+        assert!(entries.next().is_none());
     }
 
     #[test]

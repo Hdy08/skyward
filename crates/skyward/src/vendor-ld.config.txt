@@ -10,6 +10,6 @@ namespace.default.links = system
 namespace.default.link.system.allow_all_shared_libs = true
 
 namespace.system.isolated = false
-namespace.system.search.paths = /mnt/system/system/${LIB}:/mnt/system_ext/${LIB}
+namespace.system.search.paths = /mnt/system/system/${LIB}:/mnt/system_ext/${LIB}:/vendor/${LIB}:/vendor/${LIB}/hw:/odm/${LIB}
 namespace.system.links = default
 namespace.system.link.default.shared_libs = libc.so:libdl.so:libm.so:libdl_android.so

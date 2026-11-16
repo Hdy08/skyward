@@ -184,7 +184,9 @@ pub fn steps(phone: &Phone) -> Result<Vec<Step>> {
         Kind::Hidl => Ready::HardwareService(name),
     };
     let alone = |_: &Described| false;
-    let program = behind(phone, "the credential service", &credentials, |file| file.contains("gatekeeper"))?;
+    // gatekeeperd is the framework client, not the credential HAL. Older
+    // systems carry it beside hwservicemanager on the system partition.
+    let program = behind(phone, "the credential service", &credentials, |file| file.contains("gatekeeper") && file != "gatekeeperd")?;
     let registers = besides(phone, program, &credentials, alone);
     start(&mut out, started(phone, program, ready(credentials, credentials_kind), registers));
 

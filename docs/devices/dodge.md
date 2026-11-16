@@ -104,11 +104,12 @@ IV，按安装更新器的 RSA-OAEP 协议交换密钥。设备 ID 使用更新�
 `post-build-incremental`。本机官方包提供的显示版本为
 `PJZ110_16.0.10.501(CN01)`，内部构建号为 `V.3205195-ced00f-d0523d`。
 显示版本直接来自待安装包，离线打开本地文件也适用，不依赖在线查询结果；
-设备、时间戳、安全补丁、签名和是否清除 Data 的检查继续使用原有元数据。
+设备匹配、签名和是否清除 Data 的检查继续使用原有元数据。
 
 OnePlus 的官方包使用 `pre-device=OP5D0DL1`，而本地 Recovery 使用 `dodge`。
 安装器从已安装系统读取准确的 `ro.product.device`；没有安装系统时才使用
-Recovery 的产品名。其他设备、增量包、系统时间戳和安全补丁降级检查继续执行。
+Recovery 的产品名。其他设备和增量包仍会被拒绝；当前源码允许完整包的
+构建日期与安全补丁日期早于已安装系统。
 旧基底携带的证书缺少本机当前的 `online_OTA` 公共证书，因此 `[recovery]
 ota_certificates` 指向 `/mnt/my_engineering/etc/security/otacerts.zip`。启动时先
 解析并校验该 ZIP 中的公共证书，再原子复制到 RAM 中的

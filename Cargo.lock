@@ -2429,6 +2429,7 @@ dependencies = [
  "libc",
  "procfs",
  "serde",
+ "tempfile",
  "zerocopy",
 ]
 

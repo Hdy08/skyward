@@ -3,9 +3,19 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Where the phone's own partitions keep the table.
 pub const FILES: [&str; 2] = ["/vendor/etc/fstab.qcom", "/odm/etc/fstab.qcom"];
+
+/// The booted system's table must outlive its partitions: after an update
+/// takes /vendor and /odm away, wiping or closing Data still needs it.
+static TABLE: Table = Table { kept: OnceLock::new() };
+
+#[derive(Default)]
+struct Table {
+    kept: OnceLock<Vec<Entry>>,
+}
 
 /// One filesystem the phone knows about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,10 +61,10 @@ pub fn entries(text: &str) -> Vec<Entry> {
     out
 }
 
-/// Every entry of the phone's own table, read from wherever the table is.
-fn table() -> Result<Vec<Entry>> {
+/// Every entry read from the given table files, in the phone's order.
+fn read_files(files: &[&str]) -> Result<Vec<Entry>> {
     let mut out = Vec::new();
-    for file in FILES {
+    for file in files {
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -63,6 +73,39 @@ fn table() -> Result<Vec<Entry>> {
         out.extend(entries(&text));
     }
     Ok(out)
+}
+
+impl Table {
+    fn read(&self, files: &[&str]) -> Result<Vec<Entry>> {
+        if let Some(kept) = self.kept.get() {
+            return Ok(kept.clone());
+        }
+        let read = read_files(files);
+        // A reader may have started before the installer kept the table
+        // and finished after its partitions came off.
+        self.kept.get().cloned().map(Ok).unwrap_or(read)
+    }
+
+    fn keep(&self, files: &[&str]) -> Result<()> {
+        if self.kept.get().is_none() {
+            let _ = self.kept.set(read_files(files)?);
+        }
+        Ok(())
+    }
+}
+
+/// Keep the booted system's complete table before installation takes its
+/// partitions away. Further reads use this copy until Recovery exits,
+/// including after a later package changes what starts next. Reading a
+/// table during startup does not keep it before all partitions are ready.
+pub fn keep() -> Result<()> {
+    TABLE.keep(&FILES)
+}
+
+/// Every entry of the phone's own table, kept before its partitions leave
+/// the tree or read from those partitions while they are still there.
+fn table() -> Result<Vec<Entry>> {
+    TABLE.read(&FILES)
 }
 
 /// What the phone's own table says about `mount_point`.
@@ -177,5 +220,50 @@ mod tests {
     fn comments_and_short_lines_are_passed_over() {
         assert!(entries("# nothing\n\n/dev/x /y f2fs rw\n").is_empty());
         assert_eq!(entries(TABLE).len(), 3);
+    }
+
+    #[test]
+    fn the_complete_table_survives_the_installed_partitions_being_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let vendor = root.path().join("vendor.fstab");
+        let odm = root.path().join("odm.fstab");
+        std::fs::write(&vendor, TABLE).unwrap();
+        std::fs::write(&odm, "/dev/block/by-name/cache /cache ext4 nosuid,nodev wait,check,formattable\n").unwrap();
+        let files = [vendor.to_str().unwrap(), odm.to_str().unwrap()];
+        let table = Table::default();
+        let before = table.read(&files).unwrap();
+        table.keep(&files).unwrap();
+        std::fs::remove_file(&vendor).unwrap();
+        std::fs::remove_file(&odm).unwrap();
+        assert_eq!(table.read(&files).unwrap(), before, "Data, metadata, cache and all filesystem alternatives remain available");
+        assert!(read_files(&files).unwrap().is_empty(), "the original files really are gone");
+        assert_eq!(before.len(), 4);
+    }
+
+    #[test]
+    fn an_early_read_does_not_keep_a_table_before_its_partitions_are_mounted() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("fstab");
+        let files = [file.to_str().unwrap()];
+        let table = Table::default();
+        assert!(table.read(&files).unwrap().is_empty());
+        std::fs::write(&file, TABLE).unwrap();
+        table.keep(&files).unwrap();
+        assert_eq!(table.read(&files).unwrap(), entries(TABLE));
+    }
+
+    #[test]
+    fn another_install_keeps_the_booted_table_and_a_new_recovery_reads_the_new_one() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("fstab");
+        let files = [file.to_str().unwrap()];
+        std::fs::write(&file, TABLE).unwrap();
+        let table = Table::default();
+        table.keep(&files).unwrap();
+        let replacement = "/dev/block/by-name/userdata /data ext4 noatime wait,formattable\n";
+        std::fs::write(&file, replacement).unwrap();
+        table.keep(&files).unwrap();
+        assert_eq!(table.read(&files).unwrap(), entries(TABLE), "choosing another next slot does not change this boot's Data policy");
+        assert_eq!(Table::default().read(&files).unwrap(), entries(replacement), "a new Recovery reads its own installed system");
     }
 }

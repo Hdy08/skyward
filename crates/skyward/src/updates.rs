@@ -101,6 +101,7 @@ impl Worker {
                 Task::Check { server, probe, installed } => {
                     let a = http::agent(servers.clone());
                     *using.lock().expect("the agent is not held by a thread that panicked") = Some(a.clone());
+                    let _ = skyward_sys::kmsg(&format!("OTA query: {} at {} (Android {})", installed.device, installed.version, installed.android));
                     let mut answer = release::ask(&a, &server, &installed).map_err(|e| unanswered(&e, &server, &probe, &servers));
                     if let Ok(Some(r)) = &mut answer && r.length.is_none() {
                         match release::length(&a, &r.urls[0]) {

@@ -13,7 +13,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 fn described(codename: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/described").join(codename)
+    std::env::var_os("SKYWARD_PROGRAMS_TEST_DESCRIBED")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/described"))
+        .join(codename)
 }
 
 /// Where a recovery has each partition mounted: the phone's own where the
@@ -21,6 +24,7 @@ fn described(codename: &str) -> PathBuf {
 fn mounted(partition: &str) -> String {
     match partition {
         "vendor" | "odm" => format!("/{partition}"),
+        "system" => "/mnt/system/system".into(),
         other => format!("/mnt/{other}"),
     }
 }
@@ -305,6 +309,50 @@ fn ishtar_s_programs_look_in_its_bundle_before_the_installed_system_s_folders() 
         ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw", bundle, "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
     );
     assert_eq!(*libraries("/mnt/system_ext/bin/hwservicemanager"), ["/mnt/system/system/lib64/bootstrap", "/mnt/system/system/lib64", "/mnt/system_ext/lib64", bundle]);
+}
+
+#[test]
+fn a_system_partition_hardware_directory_keeps_key_credential_and_boot_services_in_the_plan() {
+    let tree = tempfile::tempdir().unwrap();
+    let system = tree.path().join("system");
+    std::fs::create_dir_all(system.join("etc/init")).unwrap();
+    std::fs::create_dir_all(system.join("bin")).unwrap();
+    std::fs::write(system.join("etc/init/hwservicemanager.rc"),
+        "service hwservicemanager /system/bin/hwservicemanager\n    user system\n    group system readproc\n    disabled\n").unwrap();
+    std::fs::write(system.join("bin/hwservicemanager"), b"").unwrap();
+    std::fs::write(system.join("etc/init/gatekeeperd.rc"),
+        "service gatekeeperd /system/bin/gatekeeperd\n    class late_start\n    user system\n    group system\n").unwrap();
+    std::fs::write(system.join("bin/gatekeeperd"), b"").unwrap();
+    let partitions = PARTITIONS.iter().map(|name| Partition {
+        name: name.to_string(), mounted: mounted(name).into(),
+        at: match *name {
+            "system" | "system_ext" => tree.path().join(name),
+            _ => described("ishtar").join(name),
+        },
+    }).collect();
+    let properties = [("ro.boot.hardware", "qcom"), ("ro.boot.product.vendor.sku", "kalama"), ("ro.boot.product.hardware.sku", "ishtar")]
+        .map(|(name, value)| (name.to_string(), value.to_string())).into_iter().collect();
+    let mut phone = Phone::read(partitions, properties, None).unwrap();
+    // OS1 describes this HAL in the combined vendor manifest and does not
+    // declare its interface in init: the filename fallback must exclude
+    // the framework's gatekeeperd even when the framework is read too.
+    for program in phone.programs.iter_mut().filter(|p| p.path.starts_with("/vendor/") && p.path.contains("gatekeeper")) {
+        program.interfaces.clear();
+    }
+    for service in phone.services.iter_mut().filter(|s| s.described.package == "android.hardware.gatekeeper") {
+        service.file = "/vendor/etc/vintf/manifest.xml".into();
+    }
+    let steps = secure::steps(&phone).unwrap();
+    let started = secure::programs(&steps);
+    let directory = started.iter().find(|p| p.service.path.ends_with("hwservicemanager")).unwrap();
+    assert_eq!(directory.service.path, "/mnt/system/system/bin/hwservicemanager");
+    assert_eq!(directory.service.ready_property.as_deref(), Some("hwservicemanager.ready"));
+    assert_eq!(directory.service.user.as_deref(), Some("system"));
+    assert_eq!(directory.service.groups, strings(&["system", "readproc"]));
+    assert_eq!(directory.service.libraries, strings(&ON_SYSTEM));
+    assert!(started.iter().any(|p| p.service.ready_service.as_deref() == Some(KEYS)));
+    assert!(started.iter().any(|p| p.service.path.contains("gatekeeper")));
+    assert!(started.iter().any(|p| p.service.path.contains("android.hardware.boot")));
 }
 
 /// A phone whose weaver's secure element is behind a service of its own,

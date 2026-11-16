@@ -7,6 +7,7 @@ use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use anyhow::{bail, ensure, Context, Result};
 use base64::Engine;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 pub mod oplus;
 
@@ -31,7 +32,9 @@ pub struct Installed {
     /// ro.product.mod_device: the phone, and after it the region its system
     /// is for, such as `_global`; the Chinese system has none.
     pub device: String,
-    /// The system's version, such as OS3.0.308.0.WMACNXM.
+    /// The firmware revision the updater sends. On Xiaomi this is
+    /// ro.build.version.incremental, which can differ from the name shown
+    /// in Settings (OS1.0.15.0 is built as V816.0.15.0).
     pub version: String,
     /// ro.build.version.release.
     pub android: String,
@@ -42,6 +45,20 @@ pub struct Installed {
 }
 
 impl Installed {
+    /// Read Xiaomi's query identity from the installed system. Its public
+    /// OS name remains for display; the server recognizes the build's own
+    /// incremental revision, including the V816 revisions of early HyperOS.
+    pub fn xiaomi(props: &HashMap<String, String>, unlocked: bool) -> Result<Self> {
+        let prop = |name: &str| props.get(name).cloned().with_context(|| format!("the installed system says no {name}"));
+        Ok(Self {
+            device: prop("ro.product.mod_device")?,
+            version: prop("ro.build.version.incremental")?,
+            android: prop("ro.build.version.release")?,
+            unlocked,
+            oplus: None,
+        })
+    }
+
     /// The region the server knows the system's by: what follows the
     /// phone's name in its device name, the European one under its own.
     fn region(&self) -> String {
@@ -216,6 +233,30 @@ mod tests {
 
     fn thirteen_ultra() -> Installed {
         Installed { device: "ishtar".into(), version: "OS3.0.306.0.WMACNXM".into(), android: "16".into(), unlocked: true, oplus: None }
+    }
+
+    #[test]
+    fn a_hyperos_display_name_does_not_replace_its_build_revision_in_the_question() {
+        for (display, incremental, android) in [
+            ("OS1.0.15.0.ULRCNXM", "V816.0.15.0.ULRCNXM", "14"),
+            ("OS3.0.9.0.VLRCNXM", "OS3.0.9.0.VLRCNXM", "15"),
+            ("V14.0.14.0.TLRCNXM", "V14.0.14.0.TLRCNXM", "13"),
+        ] {
+            let props = [
+                ("ro.product.mod_device", "zizhan"),
+                ("ro.mi.os.version.incremental", display),
+                ("ro.build.version.incremental", incremental),
+                ("ro.build.version.release", android),
+            ].map(|(name, value)| (name.to_string(), value.to_string())).into_iter().collect();
+            let installed = Installed::xiaomi(&props, true).unwrap();
+            let q: serde_json::Value = serde_json::from_str(&installed.question()).unwrap();
+            assert_eq!(q["ov"], incremental);
+            assert_eq!(q["v"], format!("MIUI-{incremental}"));
+            assert_eq!(q["c"], android);
+            assert_eq!(q["d"], "zizhan");
+            assert_eq!(props["ro.mi.os.version.incremental"], display, "the displayed OS name stays as installed");
+            assert!(installed.oplus.is_none());
+        }
     }
 
     #[test]

@@ -204,13 +204,14 @@ pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progr
     ensure!(!devices.is_empty(), "no partition to write");
     let mut outs = Vec::with_capacity(devices.len());
     for path in devices {
+        let access = WriteAccess::open(path).with_context(|| format!("allow writing {}", path.display()))?;
         let mut f = OpenOptions::new().read(true).write(true).open(path).with_context(|| format!("open {}", path.display()))?;
         let size = f.seek(SeekFrom::End(0)).with_context(|| format!("find the size of {}", path.display()))?;
         f.seek(SeekFrom::Start(0)).with_context(|| format!("rewind {}", path.display()))?;
-        outs.push((path, f, size));
+        outs.push((path, f, size, access));
     }
     let size = outs[0].2;
-    ensure!(outs.iter().all(|(_, _, s)| *s == size), "the partition differs in size between slots");
+    ensure!(outs.iter().all(|(_, _, s, _)| *s == size), "the partition differs in size between slots");
     ensure!(len <= size, "the image is {len} bytes, more than the {size} its partition holds");
 
     let mut footer = [0u8; FOOTER_LEN as usize];
@@ -233,7 +234,7 @@ pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progr
         let n = (end - at).min(CHUNK as u64) as usize;
         source.read_exact(&mut buf[..n]).context("read the image")?;
         written.update(&buf[..n]);
-        for (path, f, _) in &mut outs {
+        for (path, f, _, _) in &mut outs {
             f.write_all(&buf[..n]).with_context(|| format!("write {}", path.display()))?;
             done += n as u64;
             progress(done, total);
@@ -241,11 +242,11 @@ pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progr
         at += n as u64;
     }
     let written = written.finalize();
-    for (path, f, _) in &mut outs {
+    for (path, f, _, _) in &mut outs {
         f.sync_all().with_context(|| format!("flush {}", path.display()))?;
         drop_cache(f).with_context(|| format!("drop the cached pages of {}", path.display()))?;
     }
-    for (path, f, _) in &mut outs {
+    for (path, f, _, _) in &mut outs {
         f.seek(SeekFrom::Start(0)).with_context(|| format!("rewind {}", path.display()))?;
         let mut back = Sha256::new();
         let mut left = end;
@@ -259,10 +260,78 @@ pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progr
         }
         ensure!(back.finalize() == written, "{} reads back different from what was written", path.display());
     }
+    for (path, _, _, access) in &mut outs {
+        access.restore().with_context(|| format!("restore the write protection of {}", path.display()))?;
+    }
     Ok(())
 }
 
 pub(crate) use skyward_block::drop_cache;
+
+/// update_engine can leave a partition read-only after writing it. Keep
+/// its original protection while this flash temporarily needs write access,
+/// including when opening, writing or reading back another partition fails.
+struct WriteAccess {
+    #[cfg(target_os = "android")]
+    restore: Option<std::fs::File>,
+}
+
+impl WriteAccess {
+    fn open(path: &Path) -> Result<Self> {
+        #[cfg(target_os = "android")]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            let file = std::fs::File::open(path)?;
+            let restore = if file.metadata()?.file_type().is_block_device() && block_readonly(&file)? {
+                set_block_readonly(&file, false)?;
+                Some(file)
+            } else {
+                None
+            };
+            Ok(Self { restore })
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = path;
+            Ok(Self {})
+        }
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        #[cfg(target_os = "android")]
+        if let Some(file) = &self.restore {
+            set_block_readonly(file, true)?;
+            self.restore = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WriteAccess {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(target_os = "android")]
+fn block_readonly(file: &std::fs::File) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut value: libc::c_int = 0;
+    if unsafe { libc::ioctl(file.as_raw_fd(), 0x125e as libc::Ioctl, &mut value) } != 0 {
+        return Err(io::Error::last_os_error()).context("BLKROGET");
+    }
+    Ok(value != 0)
+}
+
+#[cfg(target_os = "android")]
+fn set_block_readonly(file: &std::fs::File, readonly: bool) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let value: libc::c_int = readonly.into();
+    if unsafe { libc::ioctl(file.as_raw_fd(), 0x125d as libc::Ioctl, &value) } != 0 {
+        return Err(io::Error::last_os_error()).context("BLKROSET");
+    }
+    Ok(())
+}
 
 /// Images made up for the tests here and in the modules that look into
 /// partitions.
@@ -484,5 +553,37 @@ mod tests {
         let err = flash_all(&[1u8; 4097], &slots).unwrap_err();
         assert!(err.to_string().contains("4097"), "{err}");
         assert!(std::fs::read(&slots[0]).unwrap().iter().all(|&b| b == 0xaa));
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn a_block_partitions_original_write_protection_is_restored_after_flashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing = partition(dir.path(), "backing", 16384);
+        let device = skyward_block::loopdev::scoped(&backing, 0, 16384, false).unwrap();
+        let file = std::fs::File::open(&device.path).unwrap();
+        for readonly in [false, true] {
+            set_block_readonly(&file, readonly).unwrap();
+            flash_all(&[0x51; 8192], std::slice::from_ref(&device.path)).unwrap();
+            assert_eq!(block_readonly(&file).unwrap(), readonly);
+            assert_eq!(&std::fs::read(&backing).unwrap()[..8192], &[0x51; 8192]);
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn a_failed_flash_restores_every_partitions_write_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing = partition(dir.path(), "backing", 16384);
+        let device = skyward_block::loopdev::scoped(&backing, 0, 16384, false).unwrap();
+        let file = std::fs::File::open(&device.path).unwrap();
+        set_block_readonly(&file, true).unwrap();
+        let missing = dir.path().join("absent");
+        assert!(flash_all(&[1; 8192], &[device.path.clone(), missing]).is_err());
+        assert!(block_readonly(&file).unwrap(), "opening the next partition failed");
+        let result = flash(&mut Cursor::new([1; 4096]), 8192, std::slice::from_ref(&device.path), &mut |_, _| {});
+        assert!(result.is_err(), "the source ends before its declared length");
+        assert!(block_readonly(&file).unwrap(), "reading the image failed");
+        assert!(std::fs::read(&backing).unwrap().iter().all(|&b| b == 0xaa));
     }
 }

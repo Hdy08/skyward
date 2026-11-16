@@ -60,35 +60,40 @@ pub fn take(package: &str, partitions: &[String], out: &Path) -> Result<()> {
         ensure!(!to.exists(), "{} is there already; take it away to write it afresh", to.display());
         let image = payload.open_image(name, &ImageOptions::default()).with_context(|| format!("open the {name} partition of {package}"))?;
         let filesystem = Filesystem::open(Arc::new(Partition(image))).with_context(|| format!("read the filesystem of the {name} partition"))?;
+        // system-as-root images keep the /system tree one level inside
+        // the image. Store its described files relative to /system, as
+        // runtime discovery reads them, rather than the image root.
+        let prefix = if name == "system" && filesystem.lookup_path("system/etc/init").is_ok() { "system/" } else { "" };
         let mut written = 0;
         for path in TAKEN {
-            written += take_path(&filesystem, path, &to).with_context(|| format!("take /{path} out of the {name} partition"))?;
+            written += take_path(&filesystem, prefix, path, &to).with_context(|| format!("take /{path} out of the {name} partition"))?;
         }
         ensure!(written > 0, "the {name} partition of {package} holds none of {TAKEN:?}");
         println!("wrote {written} files of the {name} partition under {}", to.display());
-        read.push((name.as_str(), filesystem, to));
+        read.push((name.as_str(), filesystem, to, prefix));
     }
     let mut named = Named::default();
-    for (_, _, to) in &read {
+    for (_, _, to, _) in &read {
         named.in_scripts(&to.join(SCRIPTS))?;
     }
-    let on = |path: &str| -> Option<(&(&str, Filesystem, std::path::PathBuf), String)> {
-        let (top, within) = skyward_programs::phone::partition_of(read.iter().map(|(name, _, _)| *name), path)?;
-        Some((read.iter().find(|(name, _, _)| *name == top)?, within.to_string()))
+    type ReadPartition<'a> = (&'a str, Filesystem, std::path::PathBuf, &'a str);
+    let on = |path: &str| -> Option<(&ReadPartition<'_>, String)> {
+        let (top, within) = skyward_programs::phone::partition_of(read.iter().map(|(name, _, _, _)| *name), path)?;
+        Some((read.iter().find(|(name, _, _, _)| *name == top)?, within.to_string()))
     };
     for path in &named.put {
-        let Some(((name, filesystem, to), within)) = on(path) else { continue };
+        let Some(((name, filesystem, to, prefix), within)) = on(path) else { continue };
         if to.join(&within).exists() {
             continue;
         }
-        if take_path(filesystem, &within, to).with_context(|| format!("take {path} out of the {name} partition"))? > 0 {
+        if take_path(filesystem, prefix, &within, to).with_context(|| format!("take {path} out of the {name} partition"))? > 0 {
             println!("wrote {path}, which the phone puts in the place of another file");
         }
     }
     let mut carried = 0;
     for path in &named.programs {
-        let Some(((name, filesystem, to), within)) = on(path) else { continue };
-        match filesystem.lookup_path(&within) {
+        let Some(((name, filesystem, to, prefix), within)) = on(path) else { continue };
+        match filesystem.lookup_path(&format!("{prefix}{within}")) {
             Ok(_) => {}
             // A path through a link that leads off the partition is not
             // one the partition carries either.
@@ -111,8 +116,8 @@ const SCRIPTS: &str = "etc/init";
 /// Take the file or the folder at `path` of `filesystem` and write it at
 /// that path under `to`; gives how many files that was, none where the
 /// filesystem has no such path.
-fn take_path(filesystem: &Filesystem, path: &str, to: &Path) -> Result<usize> {
-    let inode = match filesystem.lookup_path(path) {
+fn take_path(filesystem: &Filesystem, prefix: &str, path: &str, to: &Path) -> Result<usize> {
+    let inode = match filesystem.lookup_path(&format!("{prefix}{path}")) {
         Ok(inode) => inode,
         Err(fs_erofs::Error::NotFound) => return Ok(0),
         Err(e) => return Err(e).context("look for it"),

@@ -439,11 +439,12 @@ fn command(s: &Service, who: &Credentials, given: &Given, handed: &[(String, Own
 }
 
 /// Lock in memory every file the running programs have mapped or open on
-/// the `mounted` partitions, so they keep working once those partitions
-/// are written over, and give the mount points the files are on. The
-/// locked mappings stay for the rest of the recovery's life.
+/// the `mounted` partitions, including files held by loop devices such as
+/// the VNDK APEX, so they keep working once those partitions are written
+/// over, and give the mount points the files are on. The locked mappings
+/// stay for the rest of the recovery's life.
 pub fn pin(services: &[Service], mounted: &[Mounted]) -> Result<Vec<PathBuf>> {
-    let mut files = BTreeSet::new();
+    let mut files: BTreeSet<_> = skyward_block::loopdev::backing_files()?.into_iter().collect();
     // A program run once has ended, and one between restarts has nothing in
     // memory to keep either.
     for s in services.iter().filter(|s| !s.oneshot) {
@@ -552,5 +553,79 @@ fn wait_for(pid: u32) -> Result<()> {
         if e.kind() != io::ErrorKind::Interrupted {
             return Err(e).context("wait on the pidfd");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skyward_block::{loopdev, mount};
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    struct Partition {
+        mounted: Mounted,
+        _home: tempfile::TempDir,
+        _view: loopdev::Scoped,
+    }
+
+    impl Partition {
+        fn new() -> Self {
+            // These mounts and files live in RAM in a private namespace;
+            // the phone's partitions and Recovery namespace stay untouched.
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_FS | libc::CLONE_NEWNS) }, 0);
+            assert_eq!(unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_PRIVATE | libc::MS_REC, std::ptr::null()) }, 0);
+            let home = tempfile::tempdir_in("/tmp").unwrap();
+            let image = home.path().join("system_ext.img");
+            fs::File::create(&image).unwrap().set_len(16 << 20).unwrap();
+            assert!(Command::new("/system/bin/mke2fs").args(["-t", "ext4", "-F", "-q"]).arg(&image).status().unwrap().success());
+            let view = loopdev::scoped(&image, 0, 16 << 20, false).unwrap();
+            let at = home.path().join("system_ext");
+            fs::create_dir(&at).unwrap();
+            mount::mount(&view.path, &at, "ext4", &[]).unwrap();
+            let apex = at.join("apex");
+            fs::create_dir(&apex).unwrap();
+            // An APEX-like container whose loop exposes only its payload.
+            fs::write(apex.join("vndk.apex"), [vec![0x41; 4096], vec![0x6d; 256 << 10], vec![0x5a; 4096]].concat()).unwrap();
+            mount::umount(&at).unwrap();
+            mount::mount_ro(&view.path, &at).unwrap();
+            Self { mounted: Mounted { partition: "system_ext_a".into(), device: view.path.clone(), mount_point: at, filesystem: "ext4".into() }, _home: home, _view: view }
+        }
+    }
+
+    impl Drop for Partition {
+        fn drop(&mut self) {
+            let _ = mount::umount_detach(&self.mounted.mount_point);
+        }
+    }
+
+    #[test]
+    fn a_loop_held_apex_is_kept_before_its_containing_partition_leaves_the_tree() {
+        let partition = Partition::new();
+        let file = partition.mounted.mount_point.join("apex/vndk.apex");
+        let apex = loopdev::scoped(&file, 4096, 256 << 10, true).unwrap();
+        let error = mount::umount_over(&partition.mounted.mount_point).unwrap_err();
+        assert_eq!(error.downcast_ref::<io::Error>().unwrap().raw_os_error(), Some(libc::EBUSY), "the loop alone keeps the containing filesystem busy");
+        let busy = pin(&[], std::slice::from_ref(&partition.mounted)).unwrap();
+        assert_eq!(busy.as_slice(), std::slice::from_ref(&partition.mounted.mount_point), "no service directly opened or mapped the container");
+        mount::umount_detach_over(&partition.mounted.mount_point).unwrap();
+        assert!(!file.exists());
+        // Even after an installer overwrites the old partition, the loop
+        // must serve its original payload from the locked container pages.
+        let mut disk = fs::File::options().write(true).open(&partition.mounted.device).unwrap();
+        disk.write_all(&vec![0; 16 << 20]).unwrap();
+        disk.sync_all().unwrap();
+        let mut opened = fs::File::open(&apex.path).unwrap();
+        opened.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, vec![0x6d; 256 << 10]);
+    }
+
+    #[test]
+    fn a_partition_with_no_loop_container_or_service_file_is_still_unmounted_normally() {
+        let partition = Partition::new();
+        assert!(pin(&[], std::slice::from_ref(&partition.mounted)).unwrap().is_empty());
+        mount::umount_over(&partition.mounted.mount_point).unwrap();
+        assert!(mount::visible(&partition.mounted.mount_point).unwrap().is_none());
     }
 }

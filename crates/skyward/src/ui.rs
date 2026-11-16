@@ -1039,19 +1039,19 @@ fn installed(cfg: &DeviceConfig, info: &skyward_info::DeviceInfo) -> Result<Inst
     let props = skyward_info::installed_props(slot)?;
     let prop = |name: &str| props.get(name).cloned().with_context(|| format!("the installed system says no {name}"));
     let update = cfg.update.as_ref().context("no update server is configured")?;
-    let oplus = if update.provider == skyward_config::UpdateProvider::Oplus {
-        let path = update.features.as_deref().context("the Oplus update provider needs its installed app features")?;
-        let features = fs::read_to_string(path).with_context(|| format!("read {path}"))?;
-        Some(release::oplus::Installed::from_system(props.clone(), &features, &update.server)?)
-    } else {
-        None
-    };
+    let unlocked = skyward_block::boot_param("androidboot.flash.locked")?.as_deref() == Some("0");
+    if update.provider != skyward_config::UpdateProvider::Oplus {
+        return Installed::xiaomi(&props, unlocked);
+    }
+    let path = update.features.as_deref().context("the Oplus update provider needs its installed app features")?;
+    let features = fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+    let oplus = release::oplus::Installed::from_system(props.clone(), &features, &update.server)?;
     Ok(Installed {
-        device: prop(if oplus.is_some() { "ro.product.name" } else { "ro.product.mod_device" })?,
+        device: prop("ro.product.name")?,
         version: prop(&cfg.device.os_version_prop)?,
         android: prop("ro.build.version.release")?,
-        unlocked: skyward_block::boot_param("androidboot.flash.locked")?.as_deref() == Some("0"),
-        oplus,
+        unlocked,
+        oplus: Some(oplus),
     })
 }
 

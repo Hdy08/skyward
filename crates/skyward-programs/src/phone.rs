@@ -12,10 +12,9 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 /// The partitions that carry the programs a recovery starts and say how,
-/// in the order init reads them: the one the installed system keeps its
-/// directory for hardware services of the older kind on, and the phone's
-/// own.
-pub const PARTITIONS: [&str; 3] = ["system_ext", "vendor", "odm"];
+/// in the order init reads them: the installed system and its extension
+/// (either may carry hwservicemanager), followed by the phone's own.
+pub const PARTITIONS: [&str; 4] = ["system", "system_ext", "vendor", "odm"];
 
 /// The script of the phone's hardware, which the system's own first script
 /// has init read; the scripts of the phone's partitions hang off it.
@@ -430,7 +429,7 @@ mod tests {
         assert_eq!(on("/vendor/odm/bin/init.mi.factory_id.sh"), Some(("odm", "bin/init.mi.factory_id.sh")), "the vendor partition links to it");
         assert_eq!(on("/system/vendor/odm/etc"), Some(("odm", "etc")));
         assert_eq!(on("/vendor"), Some(("vendor", "")));
-        assert_eq!(on("/system/bin/sh"), None, "the installed system's own partition is not read");
+        assert_eq!(on("/system/bin/hwservicemanager"), Some(("system", "bin/hwservicemanager")), "older systems carry the hardware service directory here");
         assert_eq!(on("/vendor_dlkm/lib/modules"), None, "a longer name is another partition");
         assert_eq!(on("vendor/bin/sh"), None, "a path from nowhere is on none");
     }

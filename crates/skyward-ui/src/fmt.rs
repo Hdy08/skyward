@@ -992,8 +992,8 @@ fn give(l: Lang, source: Source) -> &'static str {
 }
 
 /// Why a package from `source` was not installed, for a phone with this
-/// codename, its dates in the zone at `zone` in [`TIME_ZONES`].
-pub fn refusal(l: Lang, r: &Refusal, codename: &str, source: Source, zone: usize) -> String {
+/// codename.
+pub fn refusal(l: Lang, r: &Refusal, codename: &str, source: Source, _zone: usize) -> String {
     let give = give(l, source);
     match r {
         Refusal::Unknown => tr!(
@@ -1038,21 +1038,6 @@ pub fn refusal(l: Lang, r: &Refusal, codename: &str, source: Source, zone: usize
             "无法安装增量更新包，请{give}完整更新包。",
             "無法安裝增量更新檔，請{give}完整更新檔。",
             "An incremental OTA package can't be installed. {give} a full OTA package."
-        ),
-        Refusal::Older { package, installed } => {
-            let (package, installed) = (date(l, *package, zone), date(l, *installed, zone));
-            tr!(
-                l,
-                "该更新包的构建日期为 {package}，早于当前系统的 {installed}。",
-                "這個更新檔的建置日期為 {package}，早於目前系統的 {installed}。",
-                "This package was built on {package}, before the current system, built on {installed}."
-            )
-        }
-        Refusal::OlderPatch { package, installed } => tr!(
-            l,
-            "该更新包的安全补丁为 {package}，早于当前系统的 {installed}。",
-            "這個更新檔的安全性修補程式為 {package}，早於目前系統的 {installed}。",
-            "This package's security patch is {package}, older than the current system's {installed}."
         ),
         Refusal::NoPartition => l.pick(["本机没有可刷入该镜像的分区。", "本機沒有可刷入這個映像檔的分割區。", "This phone has no partition this image can be flashed to."]).into(),
         Refusal::Battery { level, charging } => {
@@ -1754,14 +1739,6 @@ mod tests {
     fn reasons_read_as_sentences() {
         let pc = Source::Computer;
         assert_eq!(refusal(HANS, &Refusal::OtherDevice("nezha".into()), "ishtar", pc, 0), "该更新包适用于 nezha，本机为 ishtar。");
-        assert_eq!(
-            refusal(HANS, &Refusal::Older { package: 1_770_000_000, installed: 1_778_243_655 }, "ishtar", pc, 0),
-            "该更新包的构建日期为 2026年2月2日，早于当前系统的 2026年5月8日。"
-        );
-        assert_eq!(
-            refusal(Lang::En, &Refusal::Older { package: 1_770_000_000, installed: 1_778_243_655 }, "ishtar", pc, 0),
-            "This package was built on February 2, 2026, before the current system, built on May 8, 2026."
-        );
         assert_eq!(refusal(HANS, &Refusal::Battery { level: 12, charging: true }, "ishtar", pc, 0), "电量仅剩 12%，请充电至 15% 以上后重试。");
         assert_eq!(
             refusal(HANS, &Refusal::Pending(SnapshotState::Snapshotted), "ishtar", pc, 0),

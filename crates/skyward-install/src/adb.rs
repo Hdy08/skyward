@@ -32,8 +32,9 @@ pub const HEADER_LEN: usize = 24;
 pub const DONE: &[u8; 8] = b"DONEDONE";
 pub const FAILED: &[u8; 8] = b"FAILFAIL";
 
-/// The most taken from the USB endpoint in one read.
-const READ_CHUNK: usize = 16 * 1024;
+/// Receive a whole adb payload in one USB request. Synchronous 16 KiB
+/// reads split every usual sideload block across four USB submissions.
+const READ_CHUNK: usize = MAX_PAYLOAD as usize;
 
 /// The block sizes the package can be served in, and the most blocks: a
 /// read never spans more than two blocks, and every block's hash is kept.
@@ -339,7 +340,10 @@ impl<L: Link> Connection<L> {
     /// nothing at all.
     fn fill(&mut self, n: usize) -> Result<(), Error> {
         while self.inbox.len() < n {
-            let got = match self.link.read(&mut self.chunk) {
+            // Ask for only the missing header/payload, so a short control
+            // packet does not allocate a maximum-sized kernel USB buffer.
+            let remaining = (n - self.inbox.len()).min(self.chunk.len());
+            let got = match self.link.read(&mut self.chunk[..remaining]) {
                 Ok(got) => got,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(Error::Interrupted),
                 Err(e) => return Err(Error::Io(e)),
@@ -541,6 +545,94 @@ impl<L: Link> Connection<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    #[derive(Default)]
+    struct UsbTransfers {
+        incoming: VecDeque<Vec<u8>>,
+        written: Vec<u8>,
+        reads: usize,
+    }
+
+    impl Link for UsbTransfers {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let next = self.incoming.front_mut().ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+            let count = next.len().min(out.len());
+            out[..count].copy_from_slice(&next[..count]);
+            next.drain(..count);
+            if next.is_empty() {
+                self.incoming.pop_front();
+            }
+            self.reads += 1;
+            Ok(count)
+        }
+
+        fn write(&mut self, data: &[u8]) -> io::Result<()> {
+            self.written.extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    fn wire(packet: &Packet, version: u32) -> Vec<u8> {
+        [packet.header(version).as_slice(), &packet.payload].concat()
+    }
+
+    #[test]
+    fn a_usual_sideload_block_needs_one_payload_usb_read() {
+        let packet = Packet::new(WRTE, 7, LOCAL_ID, vec![0xa5; 65536]);
+        let link = UsbTransfers { incoming: [packet.header(VERSION).to_vec(), packet.payload.clone()].into(), ..Default::default() };
+        let mut connection = Connection::new(link, Vec::new());
+        assert_eq!(connection.receive().unwrap(), packet);
+        assert_eq!(connection.into_link().reads, 2, "one header and one complete payload transfer");
+    }
+
+    #[test]
+    fn usb_reads_may_split_packets_join_them_or_contain_a_zero_length_packet() {
+        let packets = [Packet::new(OKAY, 7, LOCAL_ID, []), Packet::new(WRTE, 7, LOCAL_ID, vec![3; 65536])];
+        let bytes: Vec<_> = packets.iter().flat_map(|p| wire(p, VERSION)).collect();
+        for width in [7, 16384, bytes.len()] {
+            let mut incoming: VecDeque<_> = bytes.chunks(width).map(<[u8]>::to_vec).collect();
+            incoming.push_front(Vec::new());
+            let mut connection = Connection::new(UsbTransfers { incoming, ..Default::default() }, Vec::new());
+            for packet in &packets {
+                assert_eq!(connection.receive().unwrap(), *packet);
+            }
+        }
+    }
+
+    #[test]
+    fn fetching_a_block_preserves_the_request_and_acknowledgement_protocol() {
+        let data = vec![0x5a; 65536];
+        let incoming = [Packet::new(OKAY, 7, LOCAL_ID, []), Packet::new(WRTE, 7, LOCAL_ID, data.clone())]
+            .iter().map(|p| wire(p, VERSION)).collect();
+        let mut connection = Connection::new(UsbTransfers { incoming, ..Default::default() }, Vec::new());
+        connection.take(7).unwrap();
+        let mut received = vec![0; data.len()];
+        connection.fetch(42, &mut received).unwrap();
+        assert_eq!(received, data);
+        let expected: Vec<_> = [
+            Packet::new(OKAY, LOCAL_ID, 7, []),
+            Packet::new(WRTE, LOCAL_ID, 7, b"00000042"),
+            Packet::new(OKAY, LOCAL_ID, 7, []),
+        ].iter().flat_map(|p| wire(p, VERSION)).collect();
+        assert_eq!(connection.into_link().written, expected);
+    }
+
+    #[test]
+    fn large_receives_still_check_legacy_checksums_and_block_lengths() {
+        let packet = Packet::new(WRTE, 7, LOCAL_ID, vec![1; 65536]);
+        let mut bytes = wire(&packet, VERSION_MIN);
+        let mut connection = Connection::new(UsbTransfers { incoming: [bytes.clone()].into(), ..Default::default() }, Vec::new());
+        connection.version = VERSION_MIN;
+        assert_eq!(connection.receive().unwrap(), packet);
+        bytes[HEADER_LEN] ^= 0xff;
+        let mut connection = Connection::new(UsbTransfers { incoming: [bytes].into(), ..Default::default() }, Vec::new());
+        connection.version = VERSION_MIN;
+        assert!(matches!(connection.receive(), Err(Error::Protocol(_))));
+        let mut connection = Connection::new(UsbTransfers { incoming: [wire(&packet, VERSION)].into(), ..Default::default() }, Vec::new());
+        connection.take(7).unwrap();
+        assert!(matches!(connection.fetch(0, &mut [0; 4096]), Err(Error::Protocol(_))));
+    }
 
     #[test]
     fn headers_carry_the_inverted_command_and_a_checksum_only_on_the_first_version() {
