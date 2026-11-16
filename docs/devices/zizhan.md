@@ -818,6 +818,20 @@ sample-file comparisons or a separate post-restore Android boot log.
 These results do not cover System/EFS restoration, kernel installation,
 other official ROM branches or the remaining checklist cases.
 
+## MIUI 13 owner-confirmed clearing and credential types
+
+On 2026-11-16 (Asia/Shanghai), the owner further reported:
+“MIUI13 清除功能、各密码种类通过”. Recovery clearing functions and Data
+decryption across the supported credential types are recorded as passed
+on the current v27 / official `V13.1.21.0.SLRCNXM` / Android 12 baseline.
+The evidence source is the owner's real-device confirmation; no device
+clearing or credential testing was repeated while recording this result.
+
+The report signs off these feature groups. It does not supply per-option
+clearing logs, an install-then-reset sequence, post-clear settings timing
+or incorrect-credential cases. Those checklist details and other official
+ROM branches retain their separate status.
+
 ## Build and validation status
 
 Build on Windows with the local base, Android NDK and LZ4:
@@ -862,6 +876,8 @@ Data decryption is validated on official OS1.0.15.0.ULRCNXM,
 MIUI 14 V14.0.14.0.TLRCNXM and MIUI 13 V13.1.21.0.SLRCNXM.
 Encrypted Data backup on MIUI 13 is validated above; the owner subsequently
 confirmed boot-partition and Data-partition restoration on that ROM.
+The owner also confirmed MIUI 13 clearing functions and Data decryption
+across credential types on v27.
 Factory reset
 including Data and metadata clear is validated with v16. OTA download,
 System/EFS restoration, kernel installation and explicit filesystem
