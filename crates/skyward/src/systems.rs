@@ -54,20 +54,14 @@ fn read(version_prop: &str) -> Result<Overview> {
     let current = skyward_vab::current_slot()?.context("not an A/B phone")?;
     let props = skyward_info::installed_props(current)?;
     let state = install::state()?;
-    let changed = match state.system {
-        Some(_) => install::changed(&state, next_slot()?)?,
-        None => false,
-    };
+    let changed = if state.system.is_some() || state.android.is_some() { install::changed(&state, next_slot()?)? } else { false };
     let held = install::held(&state, current)?;
     Ok(install::overview(&state, skyward_systems::installed_name(&props, version_prop), changed, held))
 }
 
 /// The system whose boot set is in the boot partitions.
 fn starting(state: &State) -> Who {
-    match state.occupied {
-        Some(_) => Who::Other,
-        None => Who::Installed,
-    }
+    if state.occupied.is_some() || state.android.as_ref().is_some_and(|s| s.starts) { Who::Other } else { Who::Installed }
 }
 
 /// Finish a switch cut off before, where there was one, and say which
@@ -83,7 +77,8 @@ fn resume() -> Result<Option<Who>> {
 /// system that starts already is left as it is.
 fn switch(to: Who) -> Result<()> {
     install::resume()?;
-    if starting(&install::state()?) == to {
+    let state = install::state()?;
+    if state.android.is_none() && starting(&state) == to {
         return Ok(());
     }
     install::switch_to(next_slot()?, to)

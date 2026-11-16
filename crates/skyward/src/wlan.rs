@@ -213,7 +213,7 @@ impl Station {
         if self.cfg.prepare_on_boot {
             let began = Instant::now();
             let _ = skyward_sys::kmsg("WLAN: preparing the driver in the background");
-            match prepare_driver(&self.cfg, &self.modules).and_then(|()| iface::set_up(&self.cfg.interface, false)) {
+            match prepare_interface(&self.cfg, &self.modules, false) {
                 Ok(()) => {
                     let _ = skyward_sys::kmsg(&format!("WLAN: driver prepared in {} ms, interface down", began.elapsed().as_millis()));
                 }
@@ -317,7 +317,7 @@ impl Station {
     }
 
     fn start(&self) -> Result<Running> {
-        bring_up(&self.cfg, &self.modules)?;
+        prepare_interface(&self.cfg, &self.modules, true)?;
         let mut child = start_supplicant(&self.cfg, self.libraries.as_deref())?;
         let socket = Path::new(HOME).join("sockets").join(&self.cfg.interface);
         let connected = (|| -> Result<(Control, Control)> {
@@ -644,16 +644,10 @@ impl Station {
     }
 }
 
-/// Load the driver where its interface is not there yet, and bring the
-/// interface up.
-fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
-    prepare_driver(cfg, modules)?;
-    iface::set_up(&cfg.interface, true)
-}
-
-/// Prepare only the driver and its firmware. No interface is enabled and
-/// no supplicant is started until WLAN is requested by the user.
-fn prepare_driver(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
+/// Prepare the driver and its firmware, then set the interface's requested
+/// state. Background preparation leaves it down and starts no supplicant.
+fn prepare_interface(cfg: &Config, modules: &[PathBuf], up: bool) -> Result<()> {
+    let until = Instant::now() + INTERFACE_WAIT;
     let net = Path::new("/sys/class/net").join(&cfg.interface);
     if !net.exists() {
         for file in &cfg.firmware {
@@ -665,13 +659,29 @@ fn prepare_driver(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
         for w in &cfg.writes {
             fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
         }
-        let until = Instant::now() + INTERFACE_WAIT;
         while !net.exists() {
             ensure!(Instant::now() < until, "the driver made no {} in {} seconds", cfg.interface, INTERFACE_WAIT.as_secs());
             thread::sleep(Duration::from_millis(100));
         }
     }
-    Ok(())
+    // QCA6490 can expose the sysfs directory before the interface accepts
+    // ioctls while calibration hands over to the normal driver. ENODEV is
+    // transient there; wait within the same startup deadline, while all
+    // other errors still reach the WLAN page immediately.
+    wait_for_interface(until, || iface::set_up(&cfg.interface, up))
+}
+
+fn wait_for_interface(until: Instant, mut set: impl FnMut() -> Result<()>) -> Result<()> {
+    loop {
+        let result = set();
+        let missing = result.as_ref().err().is_some_and(|error| {
+            error.chain().any(|cause| cause.downcast_ref::<std::io::Error>().is_some_and(|e| e.raw_os_error() == Some(libc::ENODEV)))
+        });
+        if !missing || Instant::now() >= until {
+            return result;
+        }
+        thread::sleep(Duration::from_millis(100).min(until.saturating_duration_since(Instant::now())));
+    }
 }
 
 /// Put a file the driver asks for where the firmware loader looks.
@@ -759,4 +769,56 @@ fn end(child: &mut Child, control: Option<&Control>) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_calibrating_interface_can_disappear_before_accepting_ioctls() {
+        let mut calls = 0;
+        wait_for_interface(Instant::now() + Duration::from_secs(2), || {
+            calls += 1;
+            if calls < 3 {
+                Err(std::io::Error::from_raw_os_error(libc::ENODEV)).context("read how wlan0 stands")
+            } else {
+                Ok(())
+            }
+        }).unwrap();
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn an_interface_ready_at_once_needs_no_retry() {
+        let mut calls = 0;
+        wait_for_interface(Instant::now() + INTERFACE_WAIT, || {
+            calls += 1;
+            Ok(())
+        }).unwrap();
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn an_interface_error_other_than_enodev_is_reported_at_once() {
+        let mut calls = 0;
+        let error = wait_for_interface(Instant::now() + INTERFACE_WAIT, || {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::EPERM)).context("bring wlan0 up")
+        }).unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn an_interface_still_absent_at_the_deadline_keeps_its_original_error() {
+        let mut calls = 0;
+        let error = wait_for_interface(Instant::now(), || {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::ENODEV)).context("read how wlan0 stands")
+        }).unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().raw_os_error(), Some(libc::ENODEV));
+        assert_eq!(error.to_string(), "read how wlan0 stands");
+    }
 }

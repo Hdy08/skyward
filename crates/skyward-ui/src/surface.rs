@@ -796,24 +796,33 @@ pub mod kms {
                 .expect("the preferred mode itself has the preferred size");
             let (w, h) = (mode.size().0 as u32, mode.size().1 as u32);
 
-            // The CRTC already driving the panel, or the first one an
-            // encoder of this connector can drive.
+            // The CRTC already driving the panel, or a free one its encoder
+            // can drive. After the recovery service restarts, encoders can
+            // lose their routes; both panels must not pick the same first
+            // CRTC and disconnect one another during preparation.
+            let mut occupied = Vec::new();
+            for &other in res.connectors().iter().filter(|&&c| c != conn.handle()) {
+                let id = Props::read(&card, other)?.value("CRTC_ID")?;
+                if id != 0 {
+                    occupied.push(id);
+                }
+            }
             let current = match conn.current_encoder() {
                 Some(e) => card.get_encoder(e).context("read encoder")?.crtc(),
                 None => None,
             };
             let crtc = match current {
-                Some(c) => c,
-                None => {
+                Some(c) if !occupied.contains(&u64::from(u32::from(c))) => c,
+                _ => {
                     let mut found = None;
                     for &e in conn.encoders() {
                         let enc = card.get_encoder(e).context("read encoder")?;
-                        if let Some(&c) = res.filter_crtcs(enc.possible_crtcs()).first() {
+                        if let Some(c) = res.filter_crtcs(enc.possible_crtcs()).into_iter().find(|c| !occupied.contains(&u64::from(u32::from(*c)))) {
                             found = Some(c);
                             break;
                         }
                     }
-                    found.ok_or_else(|| anyhow!("no CRTC can drive the panel"))?
+                    found.ok_or_else(|| anyhow!("no free CRTC can drive the panel"))?
                 }
             };
 

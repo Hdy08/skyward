@@ -7,6 +7,7 @@ use super::*;
 /// takes so far.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SystemChoice {
+    pub android: bool,
     pub name: String,
     pub version: String,
     /// The sizes there is room for, the least first.
@@ -320,6 +321,23 @@ mod tests {
         app.install(Event::Finished(Outcome::SystemInstalled { name: "Ubuntu Touch".into() }), 1000);
         assert_eq!(tap_at(&mut app, &f, &i, Action::Open(Screen::Systems), 2000), vec![Effect::ReadSystems]);
         assert_eq!(app.screen(), Screen::Systems);
+    }
+
+    #[test]
+    fn android_userdata_is_chosen_before_the_install_begins() {
+        let (f, i) = (fonts(), info());
+        let mut app = sideloading(&f, &i);
+        app.install(Event::AndroidSystem { name: "HyperOS".into(), version: "OS3.0.9.0.VLRCNXM".into(), sizes: vec![8_000_000_000, 32_000_000_000] }, 0);
+        let Install::SystemChoosing(choice) = &app.state.install else { panic!("confirmation before writing") };
+        assert!(choice.android);
+        tap_at(&mut app, &f, &i, Action::SystemSize(1), 1000);
+        let track = app.frame(&f, &i).hits.iter().find(|h| h.action == Action::Confirm(Confirm::InstallSystem)).unwrap().rect;
+        let y = track.centre().1 - app.top().1;
+        app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
+        app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::InstallSystem { size: 32_000_000_000 }]);
+        app.install(Event::Progress(Stage::AndroidWriting { done: 1, total: 2 }), 2000);
+        assert!(matches!(app.state.install, Install::Systeming { stage: Some(Stage::AndroidWriting { .. }), .. }));
     }
 
     #[test]

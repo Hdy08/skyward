@@ -29,6 +29,8 @@ pub enum Package {
     Script,
     /// A system to install beside the installed one.
     System(skyward_systems::package::Contents),
+    /// Android framework images with a separate userdata image.
+    Android(skyward_systems::android::Manifest),
     Unknown,
 }
 
@@ -95,6 +97,9 @@ pub fn identify<R: Read + Seek>(mut file: R) -> Result<Package> {
     }
     if skyward_systems::package::is_system(&zip) {
         return skyward_systems::package::read(&mut zip).map(Package::System);
+    }
+    if zip.index_for_name(skyward_systems::android::MANIFEST).is_some() {
+        return skyward_systems::android::read(&mut zip).map(Package::Android);
     }
     if zip.index_for_name(UPDATE_BINARY).is_some() {
         return Ok(Package::Script);
@@ -380,5 +385,15 @@ METADATA_SIZE=1024
         let other = zip_with(&[("readme.txt", b"hello", CompressionMethod::Stored)]);
         assert_eq!(identify(Cursor::new(other)).unwrap(), Package::Unknown);
         assert_eq!(identify(Cursor::new(b"just some text".to_vec())).unwrap(), Package::Unknown);
+    }
+
+    #[test]
+    fn a_prepared_android_package_is_separate_from_an_ota_or_script() {
+        let manifest = format!("id = \"hyperos\"\nname = \"HyperOS\"\nversion = \"3\"\ndevice = \"zizhan\"\n[images.system]\nsize = 4096\nsha256 = \"{}\"\n", "ab".repeat(32));
+        let bytes = zip_with(&[("android.toml", manifest.as_bytes(), CompressionMethod::Stored), ("system.img", &[0; 4096], CompressionMethod::Stored), (UPDATE_BINARY, b"must not execute", CompressionMethod::Stored)]);
+        let Package::Android(android) = identify(Cursor::new(bytes)).unwrap() else { panic!("a separate Android installation") };
+        assert_eq!(android.version, "3");
+        let compressed = zip_with(&[("android.toml", manifest.as_bytes(), CompressionMethod::Stored), ("system.img", &[0; 4096], CompressionMethod::Deflated)]);
+        assert!(identify(Cursor::new(compressed)).is_err());
     }
 }

@@ -997,7 +997,7 @@ fn update_stage(l: Lang, stage: Option<&Stage>) -> (String, Option<f32>) {
         }
         Some(Stage::Finishing) => (l.pick(["第 3 步，共 3 步：完成安装", "第 3 步，共 3 步：完成安裝", "Step 3 of 3: finishing"]).into(), None),
         Some(Stage::Reflashing { done, total }) => (l.pick(REFLASHING).into(), Some(*done as f32 / *total as f32)),
-        Some(Stage::Flashing { .. } | Stage::Script { .. } | Stage::Signature { .. } | Stage::Allocating { .. } | Stage::Root { .. } | Stage::Storing) | None => {
+        Some(Stage::Flashing { .. } | Stage::Script { .. } | Stage::Signature { .. } | Stage::Allocating { .. } | Stage::Root { .. } | Stage::Storing | Stage::AndroidWriting { .. } | Stage::AndroidFinishing) | None => {
             (l.pick(GETTING_READY).into(), None)
         }
     }
@@ -1007,6 +1007,8 @@ fn update_stage(l: Lang, stage: Option<&Stage>) -> (String, Option<f32>) {
 /// of its step done when known.
 fn system_stage(l: Lang, stage: Option<&Stage>) -> (String, Option<f32>) {
     match stage {
+        Some(Stage::AndroidWriting { done, total }) => (l.pick(["正在写入 Android 系统镜像", "正在寫入 Android 系統映像檔", "Writing the Android system images"]).into(), Some(share(*done, *total))),
+        Some(Stage::AndroidFinishing) => (l.pick(["正在完成第二套 Android 的安装", "正在完成第二套 Android 的安裝", "Completing the second Android installation"]).into(), None),
         Some(Stage::Allocating { done, total }) => {
             let s = share(*done, *total);
             let p = percent(s);
@@ -1348,11 +1350,15 @@ pub fn installing(cx: &Ctx) -> Frame {
             let list = widgets::list(&mut c, t, f, y, &rows);
             let picks: Vec<Action> = (0..choice.sizes.len()).map(Action::SystemSize).collect();
             out.extend(hits(&list.rows, &picks));
-            let note = l.pick([
+            let note = if choice.android { l.pick([
+                "所选容量用于第二套 Android 的独立应用和数据，系统镜像另占空间。它复用当前系统的内核和硬件驱动。删除第二系统后释放这些空间。",
+                "所選容量用於第二套 Android 的獨立應用和資料，系統映像檔另佔空間。它共用目前系統的核心和硬體驅動。刪除第二系統後釋放這些空間。",
+                "The chosen size holds the second Android's separate apps and data. System images take additional space. It uses the current system's kernel and hardware drivers. Removing the second system releases this space.",
+            ]) } else { l.pick([
                 "所选空间将从 data 分区中划出，供第二系统存放文件，安装后无法更改；删除第二系统后归还。主系统的分区不会被写入。",
                 "所選空間將從 data 分割區中劃出，供第二系統存放檔案，安裝後無法變更；刪除第二系統後歸還。主系統的分割區不會被寫入。",
                 "The room chosen is set aside in the data partition for the second system's files, can't be changed once it's installed, and comes back when the second system is removed. Nothing of the main system's partitions is written.",
-            ]);
+            ]) };
             let y = widgets::footnote(&mut c, t, f, list.bottom, note);
             let (label, danger) = confirm_label(Confirm::InstallSystem, cx.state);
             let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
@@ -3691,7 +3697,7 @@ pub fn systems(cx: &Ctx) -> Frame {
                     Some(name) => tr!(l, "正在切换到 {name}", "正在切換到 {name}", "Switching to {name}"),
                     None => l.pick(["正在切换系统", "正在切換系統", "Switching systems"]).to_string(),
                 };
-                (heading, l.pick(["正在写入启动镜像", "正在寫入啟動映像檔", "Writing its boot images"]))
+                (heading, l.pick(["正在切换启动配置", "正在切換啟動設定", "Changing the boot selection"]))
             }
             SystemsWork::Removing => (
                 l.pick(["正在删除第二系统", "正在刪除第二系統", "Removing the second system"]).to_string(),
@@ -3754,9 +3760,9 @@ pub fn systems(cx: &Ctx) -> Frame {
         }
     }
     let what = l.pick([
-        "点按卡片选择系统。切换系统只改写下次启动槽位的 boot 和 init_boot 分区，主系统的其他分区保持不变。第二系统的文件保存在 data 分区中。",
-        "點按卡片選擇系統。切換系統只改寫下次啟動槽位的 boot 和 init_boot 分割區，主系統的其他分割區保持不變。第二系統的檔案儲存在 data 分割區中。",
-        "Tap a card to pick a system. Switching rewrites only the boot and init_boot partitions of the slot that starts next, and leaves the main system's other partitions as they are. The second system's files are kept in the data partition.",
+        "点按卡片选择下次启动的系统，再滑动确认。第二系统的文件保存在 data 分区中。",
+        "點按卡片選擇下次啟動的系統，再滑動確認。第二系統的檔案儲存在 data 分割區中。",
+        "Tap a card to choose which system starts next, then slide to confirm. The second system's files are kept in the data partition.",
     ]);
     y = widgets::footnote(&mut c, t, f, y, what);
     match systems.held {
@@ -3771,9 +3777,9 @@ pub fn systems(cx: &Ctx) -> Frame {
         }
         Held::Unrecorded => {
             let note = l.pick([
-                "启动分区里是第二系统的启动镜像，Skyward 保存的记录已经不存在，无法写回主系统的启动镜像。请重新刷入主系统的 boot 和 init_boot 镜像。",
-                "啟動分割區裡是第二系統的啟動映像檔，Skyward 儲存的記錄已經不存在，無法寫回主系統的啟動映像檔。請重新刷入主系統的 boot 和 init_boot 映像檔。",
-                "The boot partitions hold a second system's boot images, and what Skyward kept of them is gone, so it can't put the main system's back. Flash the main system's boot and init_boot images again.",
+                "启动分区里是第二系统的启动镜像，Skyward 保存的记录已经不存在，无法写回主系统的启动镜像。请重新刷入主系统所需的启动镜像。",
+                "啟動分割區裡是第二系統的啟動映像檔，Skyward 儲存的記錄已經不存在，無法寫回主系統的啟動映像檔。請重新刷入主系統所需的啟動映像檔。",
+                "The boot partitions hold a second system's boot images, and Skyward's saved record is gone. Flash the boot images needed by the main system again.",
             ]);
             y = widgets::footnote(&mut c, t, f, y, note);
         }

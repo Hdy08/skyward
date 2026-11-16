@@ -393,9 +393,13 @@ pub fn mounted_partitions(slot: Slot) -> Result<Vec<Mounted>> {
 /// them: unmount them and remove their device-mapper devices. A partition
 /// whose mount point is in `busy` still has files in use; it only leaves
 /// the tree, and those files and its device stay until let go. /metadata
-/// stays mounted for the update.
+/// stays mounted for the update. Unused copies inherited by private vendor
+/// runtimes must come off before their device-mapper devices can be removed.
 pub fn release_partitions(slot: Slot, busy: &[PathBuf]) -> Result<()> {
-    for m in mounted_partitions(slot)?.into_iter().rev() {
+    let mounted = mounted_partitions(slot)?;
+    let unused = mounted.iter().filter(|m| !busy.contains(&m.mount_point)).map(|m| devnum(&m.device)).collect::<Result<Vec<_>>>()?;
+    mount::unmount_namespace_copies(&unused)?;
+    for m in mounted.into_iter().rev() {
         if busy.contains(&m.mount_point) {
             mount::umount_detach_over(&m.mount_point)?;
         } else {

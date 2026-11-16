@@ -88,8 +88,10 @@ fn open(service: &KeyMint) -> Result<Opened> {
     }
 }
 
-/// Reach the filesystem through the mapping its encryption needs, or
-/// directly where the phone declares no whole-filesystem encryption.
+/// Reach the filesystem through the mapping its encryption needs, or an
+/// identity mapping where the phone declares no whole-filesystem encryption.
+/// Android's image service needs this intermediate device to share the raw
+/// partition with images while Data is mounted.
 fn map(service: &KeyMint) -> Result<(Vec<Entry>, PathBuf)> {
     let entries = skyward_block::fstab::read(MOUNT)?;
     let entry = entries.first().with_context(|| format!("the phone's own table says nothing about {MOUNT}"))?;
@@ -101,7 +103,10 @@ fn map(service: &KeyMint) -> Result<(Vec<Entry>, PathBuf)> {
             "{} has no readable filesystem and the phone declares no metadata encryption",
             device.display()
         );
-        return Ok((entries, device));
+        let sectors = skyward_block::size_bytes(&device)? / 512;
+        let target = dm::Target::Linear { sectors, device: skyward_block::devnum(&device)?, offset: 0 };
+        let mapped = dm::create(MAPPED, &[target], false)?;
+        return Ok((entries, mapped));
     }
     let encryption = Encryption::of(entry)?;
     let key = storage_key(service, entry, &encryption)?;
@@ -170,6 +175,14 @@ pub struct Opening {
     pub closed: Vec<Closed>,
 }
 
+/// Whether Data declares file encryption or keeps the records of its
+/// file keys. An unencrypted installation has no shared-key reference.
+pub fn files_encrypted() -> Result<bool> {
+    Ok(skyward_block::fstab::read(MOUNT)?.iter().any(|entry| entry.extra("fileencryption").is_some())
+        || Path::new(FILE_MODE).exists()
+        || Path::new(USER_KEYS).exists())
+}
+
 /// Open the data partition as far as it opens with nothing a user knows:
 /// mount it where it is not mounted, let in the keys of the files that
 /// belong to no one user and of each user's files readable before they
@@ -180,10 +193,7 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
         true => None,
         false => Some(open(service)?),
     };
-    let encrypted_files = skyward_block::fstab::read(MOUNT)?.iter().any(|entry| entry.extra("fileencryption").is_some())
-        || Path::new(FILE_MODE).exists()
-        || Path::new(USER_KEYS).exists();
-    if !encrypted_files {
+    if !files_encrypted()? {
         let owner = Path::new(SHARED_STORAGE).join(OWNER.to_string());
         anyhow::ensure!(crate::fscrypt::unlocked(&owner)?, "the owner's shared storage is encrypted, but the phone describes no file encryption");
         show_owner_storage()?;

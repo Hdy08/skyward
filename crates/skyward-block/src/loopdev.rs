@@ -19,6 +19,8 @@ mod android {
     /// The device only ever reads. It stays pointed at the file until the
     /// recovery ends, which is as long as anything mounted from it lasts.
     const READ_ONLY: u32 = 1;
+    const AUTO_CLEAR: u32 = 4;
+    const DIRECT_IO: u32 = 16;
 
     /// Every field is a plain number or a run of bytes, so the request is
     /// made by zeroing it and filling in what matters.
@@ -72,6 +74,59 @@ mod android {
             return Err(std::io::Error::last_os_error()).with_context(|| format!("point {} at {}", path.display(), file.display()));
         }
         Ok(path)
+    }
+
+    /// A writable, direct-I/O view of a raw partition. An unencrypted
+    /// filesystem can hold that partition exclusively, preventing dm-linear
+    /// from claiming it directly. The loop keeps raw offsets unchanged.
+    /// Retain this handle until the dm table has opened it; autoclear then
+    /// detaches it after the last mapped user closes it.
+    pub struct Writable {
+        pub path: PathBuf,
+        _device: File,
+    }
+
+    /// A bounded file view kept until its mount has been released. Closing
+    /// the last user automatically detaches it, including on failed work.
+    pub struct Scoped {
+        pub path: PathBuf,
+        _device: File,
+    }
+
+    pub fn scoped(file: &Path, offset: u64, length: u64, readonly: bool) -> Result<Scoped> {
+        let backing = File::options().read(true).write(!readonly).open(file)?;
+        let control = File::open(CONTROL)?;
+        let number = unsafe { libc::ioctl(control.as_raw_fd(), GET_FREE as libc::Ioctl) };
+        if number < 0 {
+            return Err(std::io::Error::last_os_error()).context("ask for a temporary loop device");
+        }
+        let path = free_device(number as u32)?;
+        let device = File::options().read(true).write(true).open(&path)?;
+        let mut config: Config = unsafe { std::mem::zeroed() };
+        config.fd = backing.as_raw_fd() as u32;
+        config.info.offset = offset;
+        config.info.size_limit = length;
+        config.info.flags = AUTO_CLEAR | if readonly { READ_ONLY } else { 0 };
+        if unsafe { libc::ioctl(device.as_raw_fd(), CONFIGURE as libc::Ioctl, &mut config) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("make a bounded temporary loop view");
+        }
+        Ok(Scoped { path, _device: device })
+    }
+
+    pub fn writable(file: &Path) -> Result<Writable> {
+        let backing = File::options().read(true).write(true).open(file).with_context(|| format!("open {}", file.display()))?;
+        let control = File::open(CONTROL).with_context(|| format!("open {CONTROL}"))?;
+        let number = unsafe { libc::ioctl(control.as_raw_fd(), GET_FREE as libc::Ioctl) };
+        if number < 0 { return Err(std::io::Error::last_os_error()).context("ask for a writable loop device"); }
+        let path = free_device(number as u32)?;
+        let device = File::options().read(true).write(true).open(&path)?;
+        let mut config: Config = unsafe { std::mem::zeroed() };
+        config.fd = backing.as_raw_fd() as u32;
+        config.info.flags = AUTO_CLEAR | DIRECT_IO;
+        if unsafe { libc::ioctl(device.as_raw_fd(), CONFIGURE as libc::Ioctl, &mut config) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("make a writable raw-partition loop view");
+        }
+        Ok(Writable { path, _device: device })
     }
 
     /// Where the kernel put the loop device it just handed out: Android

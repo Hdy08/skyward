@@ -85,12 +85,13 @@ fn statvfs(path: &Path) -> io::Result<libc::statvfs> {
 mod sys {
     use super::{Visible, FILESYSTEMS};
     use anyhow::{bail, Context, Result};
-    use procfs::process::{all_processes, MMapPath, MountInfo, MountOptFields, Process};
-    use procfs::{ProcError, ProcResult};
+    use procfs::process::{all_processes, MMapPath, MountInfo, MountInfos, MountOptFields};
+    use procfs::{FromRead, ProcError, ProcResult};
     use std::collections::{BTreeSet, HashMap, HashSet};
     use std::ffi::CString;
     use std::fs;
     use std::io::ErrorKind;
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
@@ -169,7 +170,66 @@ mod sys {
     }
 
     fn mounts() -> Result<Vec<MountInfo>> {
-        Ok(Process::myself()?.mountinfo()?.0)
+        // A cleanup thread may have entered another mount namespace while
+        // the process leader and the UI stay in the recovery's namespace.
+        Ok(MountInfos::from_file("/proc/thread-self/mountinfo")?.0)
+    }
+
+    /// Unmount copies of `devices` in other processes' mount namespaces.
+    /// Private vendor runtimes inherit the installed partitions even when
+    /// they use no file on them. Unmounting only the recovery's copy does
+    /// not release those devices. Child mounts, such as firmware, stay.
+    /// A filesystem still held open remains an error, as with `umount_over`.
+    pub fn unmount_namespace_copies(devices: &[(u32, u32)]) -> Result<usize> {
+        if devices.is_empty() {
+            return Ok(0);
+        }
+        let current = fs::metadata("/proc/thread-self/ns/mnt")?;
+        let mut seen = HashSet::from([(current.dev(), current.ino())]);
+        let mut count = 0;
+        for process in all_processes().context("list mount namespaces")? {
+            let Some(process) = present(process)? else { continue };
+            let path = Path::new("/proc").join(process.pid().to_string()).join("ns/mnt");
+            let namespace = match fs::File::open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH) => continue,
+                Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
+            };
+            let identity = namespace.metadata()?;
+            if !seen.insert((identity.dev(), identity.ino())) {
+                continue;
+            }
+            let Some(mounted) = present(process.mountinfo())? else { continue };
+            if !mounted.0.iter().any(|m| devices.iter().any(|&(major, minor)| m.majmin == format!("{major}:{minor}"))) {
+                continue;
+            }
+            let devices = devices.to_vec();
+            // Mount namespace entry requires a private fs_struct. Isolate
+            // it in a short-lived thread so neither the UI nor its workers
+            // change namespace, root or working directory.
+            count += std::thread::Builder::new().name("unmount-copies".into()).spawn(move || -> Result<usize> {
+                if unsafe { libc::unshare(libc::CLONE_FS) } != 0 {
+                    return Err(os_error()).context("separate the cleanup thread's filesystem context");
+                }
+                if unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNS) } != 0 {
+                    return Err(os_error()).context("enter the partition's other mount namespace");
+                }
+                let mut removed = 0;
+                for m in mounts()?.into_iter().rev() {
+                    if !devices.iter().any(|&(major, minor)| m.majmin == format!("{major}:{minor}")) {
+                        continue;
+                    }
+                    // Never propagate this cleanup into the recovery's or
+                    // a sibling's namespace, even if the copy was shared.
+                    remount(&m.mount_point, libc::MS_PRIVATE | libc::MS_REC, "private")?;
+                    umount_over(&m.mount_point)?;
+                    removed += 1;
+                }
+                Ok(removed)
+            }).context("start the mount namespace cleanup")?.join()
+                .map_err(|_| anyhow::anyhow!("the mount namespace cleanup panicked"))??;
+        }
+        Ok(count)
     }
 
     pub fn is_mount_point(path: &Path) -> Result<bool> {
@@ -465,6 +525,10 @@ mod sys {
         bail!("this host does not unmount {}", target.display())
     }
 
+    pub fn unmount_namespace_copies(_devices: &[(u32, u32)]) -> Result<usize> {
+        bail!("this host does not unmount other mount namespaces")
+    }
+
     pub fn is_mount_point(path: &Path) -> Result<bool> {
         bail!("this host has no mount table to look up {}", path.display())
     }
@@ -496,7 +560,7 @@ mod sys {
 
 pub use sys::{
     bind, holders, holding, is_mount_point, mount, mount_ids, mount_ro, mount_ro_over, points_of, remount_writable, umount,
-    umount_detach, umount_detach_over, umount_over, visible,
+    umount_detach, umount_detach_over, umount_over, unmount_namespace_copies, visible,
 };
 
 #[cfg(test)]
@@ -523,5 +587,127 @@ mod tests {
         assert!(room.total >= room.free && room.free >= room.available, "{room:?}");
         assert_eq!(space(Path::new("/no/such/folder")).unwrap_err().kind(), io::ErrorKind::NotFound);
         assert_eq!(space(Path::new("/tmp/a\0b")).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(target_os = "android")]
+    mod namespaces {
+        use super::*;
+        use crate::{devnum, dm, loopdev};
+        use std::fs::{self, File};
+        use std::io::{BufRead, BufReader, Write};
+        use std::path::PathBuf;
+        use std::process::{Child, Command, Stdio};
+
+        struct Fixture {
+            home: PathBuf,
+            point: PathBuf,
+            name: String,
+            children: Vec<Child>,
+            _loop: loopdev::Scoped,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                // Every test mount stays outside the recovery's namespace.
+                assert_eq!(unsafe { libc::unshare(libc::CLONE_FS | libc::CLONE_NEWNS) }, 0);
+                assert_eq!(unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_PRIVATE | libc::MS_REC, std::ptr::null()) }, 0);
+                let home = PathBuf::from(format!("/tmp/skyward-mount-copies-{}-{}", std::process::id(), unsafe { libc::gettid() }));
+                fs::create_dir(&home).unwrap();
+                let image = home.join("disk.img");
+                File::create(&image).unwrap().set_len(24 << 20).unwrap();
+                assert!(Command::new("/system/bin/mke2fs").args(["-t", "ext4", "-F", "-q"]).arg(&image).status().unwrap().success());
+                let view = loopdev::scoped(&image, 0, 24 << 20, false).unwrap();
+                let name = format!("skyward-mount-copies-{}", unsafe { libc::gettid() });
+                let node = dm::create(&name, &[dm::Target::Linear { sectors: (24 << 20) / 512, device: devnum(&view.path).unwrap(), offset: 0 }], false).unwrap();
+                let point = home.join("mounted");
+                fs::create_dir(&point).unwrap();
+                let fixture = Self { home, point, name, children: Vec::new(), _loop: view };
+                mount(&node, &fixture.point, "ext4", &[]).unwrap();
+                fs::write(fixture.point.join("disk-marker"), b"disk").unwrap();
+                let nested = fixture.point.join("kept");
+                fs::create_dir(&nested).unwrap();
+                mount(Path::new("none"), &nested, "tmpfs", &[]).unwrap();
+                fs::write(nested.join("ram-marker"), b"ram").unwrap();
+                fixture
+            }
+
+            fn child(&mut self, busy: bool) -> BufReader<std::process::ChildStdout> {
+                let point = self.point.display();
+                let script = format!(
+                    "{}echo ready; read stop; \
+                     test ! -e {point}/disk-marker || exit 11; \
+                     test \"$(cat {point}/kept/ram-marker)\" = ram || exit 12; echo cleaned",
+                    if busy { format!("cd {point} || exit 13; ") } else { String::new() }
+                );
+                let mut child = Command::new("/system/bin/unshare").args(["-m", "/system/bin/sh", "-c", &script])
+                    .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+                let mut reader = BufReader::new(child.stdout.take().unwrap());
+                self.children.push(child);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), "ready");
+                reader
+            }
+
+            fn removed(&mut self) {
+                umount_over(&self.point).unwrap();
+                assert_eq!(fs::read(self.point.join("kept/ram-marker")).unwrap(), b"ram");
+                dm::remove(&self.name).unwrap();
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                for child in &mut self.children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                let _ = umount_detach(&self.point.join("kept"));
+                let _ = umount_detach(&self.point);
+                if dm::status(&self.name).ok().flatten().is_some() {
+                    let _ = dm::remove(&self.name);
+                }
+                let _ = fs::remove_dir_all(&self.home);
+            }
+        }
+
+        #[test]
+        #[ignore = "requires root Recovery, loop/device-mapper and mount namespaces"]
+        fn inherited_partition_copies_are_released_without_changing_the_caller() {
+            let mut fixture = Fixture::new();
+            let first = fixture.child(false);
+            let second = fixture.child(false);
+            let device = dm::status(&fixture.name).unwrap().unwrap();
+            assert_eq!(dm::remove(&fixture.name).unwrap_err().downcast_ref::<io::Error>().unwrap().raw_os_error(), Some(libc::EBUSY));
+            let namespace = fs::read_link("/proc/thread-self/ns/mnt").unwrap();
+            assert_eq!(unmount_namespace_copies(&[device]).unwrap(), 2);
+            assert_eq!(fs::read_link("/proc/thread-self/ns/mnt").unwrap(), namespace);
+            assert_eq!(visible(&fixture.point).unwrap().unwrap().device, device, "the caller's partition must remain mounted");
+            assert_eq!(fs::read(fixture.point.join("disk-marker")).unwrap(), b"disk");
+            assert_eq!(unmount_namespace_copies(&[device]).unwrap(), 0, "a second cleanup is harmless");
+            for (child, mut reader) in fixture.children.iter_mut().zip([first, second]) {
+                child.stdin.take().unwrap().write_all(b"done\n").unwrap();
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), "cleaned", "unrelated nested RAM mounts survive in the private runtimes");
+                assert!(child.wait().unwrap().success());
+            }
+            fixture.removed();
+        }
+
+        #[test]
+        #[ignore = "requires root Recovery, loop/device-mapper and mount namespaces"]
+        fn a_private_runtime_that_still_uses_the_partition_is_not_forced_off() {
+            let mut fixture = Fixture::new();
+            let _reader = fixture.child(true);
+            let device = dm::status(&fixture.name).unwrap().unwrap();
+            let error = unmount_namespace_copies(&[device]).unwrap_err();
+            assert_eq!(error.downcast_ref::<io::Error>().unwrap().raw_os_error(), Some(libc::EBUSY));
+            assert_eq!(visible(&fixture.point).unwrap().unwrap().device, device);
+            assert!(dm::status(&fixture.name).unwrap().is_some());
+            fixture.children[0].kill().unwrap();
+            fixture.children[0].wait().unwrap();
+            fixture.removed();
+        }
     }
 }

@@ -367,6 +367,33 @@ impl<'a> Handle<'a> {
     pub fn transact(&self, code: u32, data: &impl Payload) -> Result<Reply<'a>> {
         self.binder.transact(self.handle, code, data)
     }
+
+    /// Retain this strong reference with shared ownership of its driver.
+    /// Lazy services must stay referenced between successive transactions.
+    pub fn into_owned(mut self, binder: Arc<Binder>) -> Result<OwnedHandle> {
+        ensure!(std::ptr::eq(self.binder, Arc::as_ptr(&binder)), "an owned handle needs the driver it came from");
+        self.held = false;
+        Ok(OwnedHandle { binder, handle: self.handle })
+    }
+}
+
+pub struct OwnedHandle {
+    binder: Arc<Binder>,
+    handle: u32,
+}
+
+impl OwnedHandle {
+    pub fn binder(&self) -> &Binder { &self.binder }
+
+    pub fn transact(&self, code: u32, data: &impl Payload) -> Result<Reply<'_>> {
+        self.binder.transact(self.handle, code, data)
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        let _ = self.binder.tell(BC_RELEASE, &self.handle.to_ne_bytes());
+    }
 }
 
 impl Drop for Handle<'_> {

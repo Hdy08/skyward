@@ -266,6 +266,10 @@ impl App {
         // starts darkening, and only that row: a finger that moves on
         // before then never waits for it.
         if let (Some(press), None) = (self.row_press.filter(|p| now >= p.rise), &self.row_art) {
+            // A row tapped near a viewport edge may extend beyond the
+            // drawn band. Its pressed image crops the whole row, so draw
+            // that extent before taking either copy.
+            self.draw_rows(f, info, press.rect.y.floor(), (press.rect.y + press.rect.h).ceil());
             let page = &self.frame.as_ref().expect("rendered above").canvas;
             let (x, y, w, h) = row_part(press.rect, page);
             let pressed = t.pressed();
@@ -745,6 +749,37 @@ mod tests {
         let page = &app.frame.as_ref().unwrap().canvas;
         assert!(whole.h > H + H / 4, "a page well over a screen long, drawn in {bands} more bands");
         assert!(page.whole() && page.data == whole.data, "the page drawn a band at a time is the page drawn whole");
+    }
+
+    #[test]
+    fn a_foldable_home_page_keeps_its_bands_consistent_as_wlan_starts() {
+        let f = fonts();
+        let i = DeviceInfo { model: "Xiaomi MIX Fold 2".into(), codename: "zizhan".into(), slot: Some(Slot::B), ..info() };
+        for (w, h) in [(1080, 2520), (1916, 2160)] {
+            for early in [true, false] {
+                let mut app = App::new(Screen::Home, 1080, 2520, 2.75);
+                app.state.dual_boot = true;
+                if early {
+                    app.set_wlan(Wlan::default());
+                }
+                app.compose(&mut Canvas::new(1080, 2520), &f, &i, "12:00", 0);
+                app.resize(w, h, 2.75, 1);
+                let mut out = Canvas::new(w, h);
+                app.compose(&mut out, &f, &i, "12:00", 1);
+                // Both startup and a capability arriving after the first
+                // frame must keep the rows and the touch layout together.
+                app.set_wlan(Wlan::default());
+                app.compose(&mut out, &f, &i, "12:00", 2);
+                while app.draw_ahead(&f, &i) {}
+                let t = app.theme();
+                let fresh = pages::render(Screen::Home, &Ctx { t: &t, f: &f, info: &i, state: &app.state, term: None, band: None });
+                let cached = app.frame.as_ref().unwrap();
+                assert!(cached.canvas.whole(), "{w}x{h}, WLAN available early: {early}");
+                assert!(cached.canvas.data == fresh.canvas.data, "the cached home page matches a full drawing");
+                assert_eq!(cached.hits, fresh.hits, "menu touch targets follow the same layout");
+                assert!(cached.hits.iter().any(|hit| hit.action == Action::Open(Screen::Wlan)));
+            }
+        }
     }
 
     #[test]

@@ -68,6 +68,9 @@ pub struct Parcel {
     /// Where among the values each object sits, which the driver is told
     /// so that it can turn an object into what the other side holds it by.
     objects: Vec<u64>,
+    /// Duplicated descriptors stay open until the transaction completes.
+    #[cfg(unix)]
+    files: Vec<std::os::fd::OwnedFd>,
 }
 
 impl Payload for Parcel {
@@ -110,6 +113,23 @@ impl Parcel {
 
     pub fn bool(&mut self, v: bool) {
         self.i32(v as i32);
+    }
+
+    /// A non-null android.os.ParcelFileDescriptor. Its parcelable marker
+    /// and absent communication socket precede the binder fd object.
+    #[cfg(unix)]
+    pub fn file(&mut self, file: std::os::fd::BorrowedFd<'_>) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let file = file.try_clone_to_owned().context("duplicate a parcel file descriptor")?;
+        self.i32(1);
+        self.i32(0);
+        self.objects.push(self.data.len() as u64);
+        self.data.extend_from_slice(&u32::from_be_bytes([b'f', b'd', b'*', 0x85]).to_le_bytes());
+        self.data.extend_from_slice(&0u32.to_le_bytes());
+        self.data.extend_from_slice(&(file.as_raw_fd() as u64).to_le_bytes());
+        self.data.extend_from_slice(&1u64.to_le_bytes());
+        self.files.push(file);
+        Ok(())
     }
 
     /// A byte array: its length, its bytes, then padding to the next four.
@@ -321,13 +341,28 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn a_parcel_file_descriptor_is_duplicated_and_registered_with_the_driver() {
+        use std::os::fd::AsFd;
+        let mut p = Parcel::default();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        p.file(file.as_fd()).unwrap();
+        drop(file);
+        assert_eq!(p.addresses(), [8]);
+        assert_eq!(&p.bytes()[..8], &[1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&p.bytes()[8..12], b"\x85*df");
+        assert_eq!(p.bytes().len(), 32, "fd objects have no Binder interface-stability word");
+        assert!(p.files[0].try_clone().is_ok(), "the parcel owns the duplicate");
+    }
+
     #[test]
     fn a_call_opens_with_the_header_and_the_interface_name() {
         let p = Parcel::call("a.b.IC");
         let mut r = Reader::new(p.bytes());
         assert_eq!(r.i32().unwrap(), i32::MIN, "strict mode gathers");
         assert_eq!(r.i32().unwrap(), -1, "no work source");
-        assert_eq!(r.i32().unwrap(), 0x5245_434f, "the recovery's mark, RECO");
+        assert_eq!(r.i32().unwrap(), header(), "the running recovery's configured libbinder mark");
         assert_eq!(r.string().unwrap(), "a.b.IC");
         assert_eq!(r.here(), p.bytes().len(), "the header is all of it");
     }

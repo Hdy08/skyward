@@ -65,7 +65,7 @@ pub fn resume(places: &Places) -> Result<bool> {
 fn other_init_boot(places: &Places, state: &State) -> Result<Vec<u8>> {
     let store = state.store.as_ref().context("no store holds the boot sets")?;
     let system = state.system.as_ref().context("no other system is installed")?;
-    let stored = store::init_boot(store, places.store, &system.set)?;
+    let stored = store::ramdisk_image(store, places.store, &system.set)?;
     let program = fs::read(places.program).with_context(|| format!("read {}", places.program.display()))?;
     boot::with_program(&stored, system.own_ramdisk, &program, &system.start())
 }
@@ -132,7 +132,8 @@ pub fn held(state: &State, by_name: &Path, starts: Slot) -> Result<Held> {
         return Ok(Held::Recorded);
     }
     let Some(occupied) = &state.occupied else {
-        let init_boot = store::partition(by_name, store::INIT_BOOT, starts);
+        let Some(layout) = boot::Layout::detect(by_name)? else { return Ok(Held::Recorded) };
+        let init_boot = store::partition(by_name, layout.ramdisk_partition(), starts);
         return Ok(match fs::read(&init_boot) {
             Ok(image) if boot::starts_from_data(&image) => Held::Unrecorded,
             Ok(_) => Held::Recorded,
@@ -240,6 +241,55 @@ mod tests {
         // The next save goes to the other entry, the last one kept whole.
         switch(&b.places(), Slot::A, Who::Other).unwrap();
         assert_eq!(State::load(&b.state).unwrap().saved.unwrap().entry, 1);
+    }
+
+    fn installed_boot_only() -> Bench {
+        let b = installed();
+        let mut state = State::load(&b.state).unwrap();
+        let store = crate::state::Store { area: area("/data/skyward/systems/store", crate::state::Store::size_for(32768, 0)), boot: 32768, init_boot: 0 };
+        std::fs::write(&b.store, vec![0; store.area.size as usize]).unwrap();
+        let (image, _) = boot::in_boot(&crate::boot::tests::kernel_image(3), None, b"old program", &start()).unwrap();
+        state.system.as_mut().unwrap().set = put(&store, &b.store, OTHER, &mut image.as_slice(), image.len() as u64, &[]).unwrap();
+        state.store = Some(store);
+        state.save(&b.state).unwrap();
+        for slot in ["a", "b"] {
+            std::fs::remove_file(b.dir.join(format!("init_boot_{slot}"))).unwrap();
+            let mut main = crate::boot::tests::kernel_image(3);
+            main.resize(32768, 0);
+            std::fs::write(b.dir.join(format!("boot_{slot}")), main).unwrap();
+        }
+        b
+    }
+
+    #[test]
+    fn a_boot_only_phone_switches_and_restores_the_original_image_whole() {
+        let b = installed_boot_only();
+        let main = b.read("boot_a");
+        assert_eq!(held(&State::default(), &b.dir, Slot::A).unwrap(), Held::Recorded);
+        switch(&b.places(), Slot::A, Who::Other).unwrap();
+        assert_eq!(b.program_in("boot_a"), b"new program");
+        assert_eq!(BootImage::parse(&b.read("boot_a")).unwrap().kernel, b"the Linux kernel");
+        assert_eq!(b.read("boot_b"), main);
+        assert_eq!(held(&State::load(&b.state).unwrap(), &b.dir, Slot::A).unwrap(), Held::Recorded);
+        assert_eq!(held(&State::default(), &b.dir, Slot::A).unwrap(), Held::Unrecorded, "a lost state is detected from boot too");
+        switch(&b.places(), Slot::B, Who::Installed).unwrap();
+        assert_eq!(b.read("boot_a"), main, "including the original ramdisk and partition padding");
+        assert!(!b.dir.join("init_boot_a").exists());
+    }
+
+    #[test]
+    fn a_boot_only_switch_interrupted_after_saving_keeps_the_original_save() {
+        let b = installed_boot_only();
+        let original = b.read("boot_a");
+        let mut s = State::load(&b.state).unwrap();
+        s.saved = Some(store::save(s.store.as_ref().unwrap(), &b.store, 0, &b.dir, Slot::A).unwrap());
+        s.switching = Some(Switching { to: Who::Other, slot: "_a".into(), saved: true });
+        s.save(&b.state).unwrap();
+        std::fs::write(b.dir.join("boot_a"), vec![0xcc; 32768]).unwrap();
+        assert!(resume(&b.places()).unwrap());
+        assert_eq!(b.program_in("boot_a"), b"new program");
+        switch(&b.places(), Slot::B, Who::Installed).unwrap();
+        assert_eq!(b.read("boot_a"), original);
     }
 
     #[test]

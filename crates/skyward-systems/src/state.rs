@@ -3,7 +3,7 @@
 //! the areas in can take away without it.
 
 use crate::boot::Start;
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use skyward_block::area::Area;
 use std::fs::{self, File, OpenOptions};
@@ -22,6 +22,10 @@ pub struct State {
     /// system's took its place.
     pub saved: Option<Saved>,
     pub system: Option<System>,
+    /// A second Android managed by the installed image service instead
+    /// of the Linux boot store. Older state files have none.
+    #[serde(default)]
+    pub android: Option<crate::android::Installed>,
     /// The slot whose boot partitions hold the other system's boot set;
     /// none while they hold the installed system's.
     pub occupied: Option<String>,
@@ -119,6 +123,7 @@ impl Who {
         match (name, &state.system) {
             ("installed", _) => Some(Who::Installed),
             (id, Some(system)) if system.id == id => Some(Who::Other),
+            (id, _) if state.android.as_ref().is_some_and(|s| s.manifest.id == id) => Some(Who::Other),
             _ => None,
         }
     }
@@ -128,7 +133,11 @@ impl State {
     /// The state kept at `path`; none kept is none installed.
     pub fn load(path: &Path) -> Result<State> {
         match fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("read {}", path.display())),
+            Ok(text) => {
+                let state: State = toml::from_str(&text).with_context(|| format!("read {}", path.display()))?;
+                state.check()?;
+                Ok(state)
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(State::default()),
             Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
         }
@@ -137,6 +146,7 @@ impl State {
     /// Keep the state at `path` whole or not at all: written beside it,
     /// synced, put in its place, and the folder synced.
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.check()?;
         let dir = path.parent().context("the state is kept in a folder")?;
         fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
         let text = toml::to_string(self).context("write the systems' state")?;
@@ -146,6 +156,14 @@ impl State {
         f.sync_all().with_context(|| format!("sync {}", tmp.display()))?;
         fs::rename(&tmp, path).with_context(|| format!("put {} in place of {}", tmp.display(), path.display()))?;
         File::open(dir).and_then(|d| d.sync_all()).with_context(|| format!("sync {}", dir.display()))
+    }
+
+    fn check(&self) -> Result<()> {
+        if let Some(android) = &self.android {
+            android.manifest.check()?;
+            ensure!(self.system.is_none() && self.occupied.is_none() && self.switching.is_none(), "Android image state conflicts with Linux boot state");
+        }
+        Ok(())
     }
 
     /// Which system's boot set the boot partitions of `slot` hold.
@@ -186,6 +204,7 @@ pub(crate) mod tests {
                 dtbo: "ff".into(),
             }),
             occupied: Some("_a".into()),
+            android: None,
             written: Some(Written { boot: "cc".into(), init_boot: "11".into() }),
             switching: Some(Switching { to: Who::Installed, slot: "_a".into(), saved: false }),
         };
@@ -202,5 +221,21 @@ pub(crate) mod tests {
         assert_eq!(Who::named("installed", &state), Some(Who::Installed));
         assert_eq!(Who::named("test", &state), Some(Who::Other));
         assert_eq!(Who::named("other", &state), None);
+    }
+
+    #[test]
+    fn an_interrupted_android_install_survives_restart_without_becoming_a_linux_switch() {
+        use crate::android::{Image, Installed, Manifest};
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("systems.toml");
+        let manifest = Manifest { id: "hyperos".into(), name: "HyperOS".into(), version: "3".into(), device: "zizhan".into(), images: BTreeMap::from([("system".into(), Image { size: 4096, sha256: "ab".repeat(32) })]) };
+        let mut state = State { android: Some(Installed { manifest, userdata: 32_000_000_000, enabled: false, starts: false, complete: false, boot: "a".into(), vendor_boot: "b".into(), dtbo: "c".into() }), ..Default::default() };
+        state.save(&path).unwrap();
+        assert_eq!(State::load(&path).unwrap(), state);
+        assert_eq!(Who::named("hyperos", &state), Some(Who::Other));
+        state.occupied = Some("_a".into());
+        assert!(state.save(&path).is_err());
+        assert!(!State::load(&path).unwrap().android.unwrap().complete);
     }
 }

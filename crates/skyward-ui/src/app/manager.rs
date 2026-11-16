@@ -630,6 +630,32 @@ mod tests {
     }
 
     #[test]
+    fn delete_confirmation_renders_on_both_foldable_panels() {
+        let (f, i) = (fonts(), info());
+        for (w, h) in [(1080, 2520), (1916, 2160)] {
+            for name in ["test", "Skyward-Android-zizhan-OS3.0.9.0.zip", "测试目录及文件备份"] {
+                let mut app = App::new(Screen::FileInfo, w, h, 2.75);
+                app.state.files.path = "/sdcard/Download".into();
+                app.state.file = Some(entry(name, folder(3)));
+                let row = app.frame(&f, &i).hits.iter().find(|hit| hit.action == Action::AskDelete).unwrap().rect;
+                // The row's centre is on screen while its lower half is
+                // below the currently drawn band, as a real scrolling tap.
+                app.top_mut().1 = (row.y + row.h / 2.0 - h as f32 + 32.0).max(0.0).min(app.max_scroll());
+                app.refresh();
+                let mut screen = Canvas::new(w, h);
+                app.compose(&mut screen, &f, &i, "12:00", 0);
+                let (_, y) = spot(&mut app, &f, &i, Action::AskDelete);
+                assert!(y >= 0.0 && y < h as f32, "the tap lies on the panel");
+                tap(&mut app, &f, &i, Action::AskDelete);
+                app.compose(&mut screen, &f, &i, "12:00", 1);
+                while app.draw_ahead(&f, &i) {}
+                app.compose(&mut screen, &f, &i, "12:00", 2);
+                assert!(app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Confirm(Confirm::DeleteEntry)));
+            }
+        }
+    }
+
+    #[test]
     fn work_that_ends_on_its_page_takes_the_title_of_how_it_ended() {
         let (f, i) = (fonts(), info());
         let mut app = in_sdcard(&f, &i);

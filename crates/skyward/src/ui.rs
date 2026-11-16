@@ -1374,14 +1374,21 @@ impl<'a> Pages<'a> {
             }
         };
         app.state.phone_logs = cfg.wipe.logs.len();
+        // A foldable may cache its first page before begin starts the
+        // workers. Include their entries now: adding the WLAN row later
+        // would leave cached bands with the home page's old height.
+        if cfg.wlan.is_some() {
+            app.set_wlan(Wlan::default());
+        }
+        app.state.update_server = cfg.update.is_some();
         // Skyward lives in a recovery partition of each slot where the phone
         // has them, and the install page then offers to keep it there. Such a
-        // phone holds a second system where it also has boot and init_boot
-        // partitions in both slots, which a switch writes.
+        // phone holds a second system with either separate init_boot
+        // partitions or generic ramdisks in the two boot partitions.
         let by_name = Path::new(skyward_block::BY_NAME);
         let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
         app.state.recovery_partitions = both("recovery")?;
-        app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
+        app.state.dual_boot = app.state.recovery_partitions && skyward_systems::boot::Layout::detect(by_name)?.is_some();
         // The second system's work; the systems are read at once, for the home
         // page to name the one that starts, once a switch cut off before is
         // finished.
@@ -1609,7 +1616,6 @@ impl<'a> Pages<'a> {
         // The WLAN starts off. Without the bundle of the vendor interface's
         // libraries the supplicant does not start, and the WLAN page says why.
         if let Some(w) = &cfg.wlan {
-            self.app.state.wlan = Some(Wlan::default());
             let modules = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
             let libraries = secure::libraries().unwrap_or_else(|e| {
                 let _ = skyward_sys::kmsg(&format!("the vendor interface's libraries are not open: {e:#}"));
@@ -1618,7 +1624,6 @@ impl<'a> Pages<'a> {
             self.wlan = Some(wlan::Worker::start(w.clone(), modules, libraries, self.servers.clone())?);
         }
         self.scanned_at = Instant::now();
-        self.app.state.update_server = cfg.update.is_some();
         self.drive_at = Instant::now();
         // Readings collected while startup configured the port are not
         // cable events. The first fresh sample establishes its baseline.

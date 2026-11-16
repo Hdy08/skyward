@@ -68,6 +68,16 @@ enum Cmd {
     /// Print the suffix of the slot the phone runs from and, where the
     /// phone's boot control runs, what it holds of each slot.
     Slot,
+    /// Inspect the dual-system layout and state without selecting a system.
+    #[cfg(target_os = "android")]
+    Systems {
+        /// Query the installed Android image service as well.
+        #[arg(long)]
+        android: bool,
+        /// Remove only a recorded, incomplete Android installation.
+        #[arg(long)]
+        remove_incomplete: bool,
+    },
     /// List modules in dependency load order from a source directory.
     Modules {
         #[arg(long, default_value = "/vendor/lib/modules")]
@@ -246,6 +256,21 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Info { config } => info(&config),
         Cmd::Slot => slot(),
+        #[cfg(target_os = "android")]
+        Cmd::Systems { android, remove_incomplete } => {
+            if remove_incomplete {
+                let state = skyward_systems::install::state()?;
+                anyhow::ensure!(state.android.as_ref().is_some_and(|s| !s.complete && !s.enabled), "there is no incomplete, disabled Android install to remove");
+                skyward_systems::install::remove()?;
+            }
+            println!("boot layout = {:?}", skyward_systems::boot::Layout::detect(Path::new(skyward_block::BY_NAME))?);
+            println!("state = {:#?}", skyward_systems::install::state()?);
+            if android {
+                let client = skyward_systems::android::Client::open()?;
+                println!("Android installed = {}, enabled = {}, busy = {}, slot = {:?}", client.installed()?, client.enabled()?, client.busy()?, client.active()?);
+            }
+            Ok(())
+        }
         Cmd::Modules { source } => modules(&source),
         Cmd::Load { config, names } => {
             let cfg = DeviceConfig::load(&config)?;
@@ -817,6 +842,11 @@ fn recovery() -> Result<()> {
         std::fs::set_permissions(skyward_sys::RUN, std::fs::Permissions::from_mode(0o755))
             .with_context(|| format!("open {} to the recovery's other users", skyward_sys::RUN))?;
         skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = skyward_sys::kmsg(&format!("recovery panic: {info}"));
+            previous(info);
+        }));
         // A recovery that ended with a function of its own in the port took
         // the port with it; going through "none" takes that function off.
         if skyward_sys::prop("sys.usb.state").is_some_and(|s| s != "adb") {
@@ -991,6 +1021,7 @@ fn identify(path: &Path) -> Result<()> {
                 println!("it brings its own init_boot image");
             }
         }
+        Package::Android(m) => println!("Android {} {} ({}), with {} bytes of system images and independent userdata", m.name, m.version, m.id, m.bytes()),
         Package::Unknown => println!("nothing this recovery installs"),
     }
     Ok(())

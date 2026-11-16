@@ -215,6 +215,12 @@ owner confirmed that internal storage was visible in the file manager. No
 screen credential was needed. This validates access to this ROM's unencrypted
 Data; encrypted Data decryption has not been validated on MIX Fold 2.
 
+## Dual boot
+
+The Linux boot-only layout and separate Android image-service installation are
+described in [MIX Fold 2 dual boot](zizhan-dualboot.md), including package
+conversion, storage layout and current device-validation results.
+
 ## WLAN and updates
 
 The WLAN module's internal name is `qca6490`; its actual loadable filename is
@@ -238,6 +244,143 @@ The update configuration selects Skyward's existing Xiaomi query provider.
 The owner confirmed a query result for `OS3.0.9.0.VLRCNXM`. Downloading or
 installing that package has not been tested on MIX Fold 2. A successful query
 does not establish installation compatibility over this custom ROM.
+
+## Data backup and display recovery
+
+Unencrypted Data does not keep `/data/unencrypted/ref`. Backups now record
+no shared file-key reference in that case, and restoration compares the same
+optional identity. An encrypted installation still requires its reference,
+and other read failures remain errors. The existing backup manifest format
+and encrypted-key encoding are unchanged. The reference is read before
+archiving, so a missing required record fails before writing a large backup.
+File-encryption detection is shared with the Data opener.
+
+Data backups also leave `/data/gsi` out, along with the existing Linux area
+and internal-storage exclusions. A Data restore leaves those second-system
+images as they are.
+
+A file-manager row tapped near the viewport edge could extend outside the
+drawn band. Cropping its pressed-state artwork then asserted and aborted
+the UI process. Drawing that row's full extent before cropping fixes the
+failure. A regression test reproduced the assertion with a tap inside the
+cover panel, and now covers both MIX Fold 2 panel sizes and several filenames.
+After a service restart, display encoders can also lose their routing. Panel
+initialization now chooses a CRTC that no other connector occupies, preventing
+preparation of one display from disconnecting the other. Panic messages are
+retained in the Recovery log for diagnosis.
+
+Native Android tests passed for the backup worker (3), backup archive/store/
+manifest (9), file manager (20), and page drawing (8). The manifest test covers
+both encrypted and unencrypted Data. Android Clippy with warnings denied and
+the independent image checks passed. A controlled Recovery-service restart
+retained separate nonzero CRTC routes for both displays.
+
+The normal UI then completed a Data-only uncompressed backup on the reference
+ROM: 18,146,092,032 bytes across 17 archive volumes, saved in
+`/sdcard/Skyward/backups/20261116-030434`. Its format-1 manifest was written
+successfully with no `data_key`; all listed volumes exist, and their combined
+size matches the manifest. `/data/unencrypted/ref` remains absent. The owner confirmed that deleting
+the test file, repeated folding and screen-off/power-key wake work normally.
+The UI process remained the same throughout those operations and the backup.
+Full Data restoration has not been performed on the reference phone.
+
+The Recovery containing these fixes is 104,857,600 bytes, SHA-256
+`391dff455b12b4420e8f3e841b8644ece50772961046862888987bc09e456a74`,
+and matches recovery_a. Final boot_a, boot_b, vendor_boot_a, dtbo_a and recovery_b
+hashes retain their originals; the dual-system state matches the state recorded
+before this update.
+
+## ADB sideload mount cleanup
+
+The reference device received and identified the official
+`OS3.0.9.0.VLRCNXM` package, but stopped before applying it with
+`move off the installed system: remove device-mapper device vendor_dlkm_a:
+Device or resource busy (os error 16)`. Ten vendor runtime namespaces still
+had the read-only `/vendor_dlkm` mount after the recovery's own copy had
+been unmounted. They kept its device open without holding any module files.
+
+Partition release now unmounts unused copies in other mount namespaces
+before removing the corresponding device-mapper mappings. Each namespace
+is visited once by a temporary thread with a separate filesystem context;
+the UI and other workers retain their namespace. Mount inspection uses
+`/proc/thread-self/mountinfo`. Nested firmware and RAM mounts are preserved.
+Filesystems that remain in use still fail to unmount rather than having
+their removal forced. The original confirmation and installation flow is
+unchanged.
+
+Two native regression tests exercise a real ext4 filesystem over a temporary
+loop/device-mapper device. They cover inherited mounts in two private
+namespaces, child RAM mount preservation, repeated cleanup, caller isolation,
+successful final device removal, and refusal while a private process still
+uses the filesystem. Both passed on the phone without changing the recovery
+process or its mounts. Nine ADB protocol and nine FUSE block-serving tests
+also passed, as did Android Clippy with warnings denied and the independent
+image checks.
+
+The normal UI then received and ran a harmless script package twice over
+`adb sideload`, including the result page's send-again action. Both runs
+passed the original failure point, with `vendor_dlkm` absent from all
+process mount namespaces, normal script completion, and MTP/ADB restored.
+The second package also verified the logical partition mappings before
+script cleanup. The recovery process remained the same. Guarded boot,
+vendor_boot, dtbo and recovery_b hashes and the dual-system state were
+unchanged. A complete official OTA installation was not performed.
+
+The Recovery containing this fix and the preceding Data/display fixes is
+104,857,600 bytes, SHA-256
+`810dc2a881ad9e64293354d5236669e6663d599859e11cde600e24711c028a12`.
+After restarting this image, the owner confirmed normal inner/cover displays,
+touch, Data access and computer file transfer. The original Data backup and
+its 17 archive volumes remain present with the same manifest and sizes.
+
+## Unfolded startup on official OS3.0.9.0
+
+On the installed official `OS3.0.9.0.VLRCNXM` in slot B, an unfolded boot
+showed the inner page briefly, went black, and repeated until the phone was
+closed and opened. The saved recovery log contains four UI panics at
+`Canvas::join`: a new band was 1916 by 2657 while the cached home page was
+1916 by 2504. These were recovery process restarts within one kernel boot.
+
+The first foldable frame was cached before the WLAN worker started. Its
+startup then added the WLAN entry by assigning page state directly, without
+invalidating that cached layout. On the shorter inner screen, drawing the
+remaining rows reached the mismatched page heights. WLAN availability and
+the online update capability are now initialized before the first cached
+frame; worker startup no longer changes the home page's structure. This
+retains the existing early display handoff and does not change panel power
+or folding behavior.
+
+A separate saved boot had reported `read how wlan0 stands: No such device
+(os error 19)` during background preparation. Driver preparation now waits
+for that specific transient ioctl error within the same 60-second deadline
+used for interface creation. Other errors still return immediately. There
+is no added delay when the interface is ready. This addresses the observed
+interface readiness race; the owner's single earlier enable failure was
+not captured with a complete contemporaneous log.
+
+Native Android tests passed for page drawing (9), display resizing/power
+(2), WLAN UI (8), and interface readiness/error handling (4). The new home
+page regression compares complete pixels and touch targets after banded
+drawing on both MIX Fold 2 panel sizes, with WLAN available before or after
+the first frame. The four runtime tests cover transient ENODEV followed by
+success, immediate success, another error without retry, and deadline
+expiry with the original error retained. Android Clippy with warnings
+denied and independent image checks passed.
+
+The fix was written to the active `recovery_b` and read back. The owner
+confirmed a direct unfolded boot with no repeated black screen, normal
+folding/touch/page retention, and three WLAN off/on cycles followed by a
+working Internet connection. The UI remained PID 660, with one startup and
+no panic or panel-switch failure. The log records four successful WLAN
+starts: 1625, 114, 118 and 118 ms. Background preparation completed in 9355
+ms. The final boot, vendor_boot and dtbo hashes for both slots and the
+inactive recovery_a match the values captured before this change.
+
+The image is 104,857,600 bytes, SHA-256
+`db7df16d32ac9f000d2649cb2ad3e51b1fd5079d5f220975f0e18e2552ee2c22`.
+It includes the preceding dual-system, Data backup, display and sideload
+fixes. No Android installation or system-slot change was performed during
+this startup fix.
 
 ## Build and validation status
 

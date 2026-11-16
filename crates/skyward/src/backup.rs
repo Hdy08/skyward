@@ -47,9 +47,9 @@ const RESTORE_ORDER: [Part; 4] = [Part::Boot, Part::System, Part::Efs, Part::Dat
 /// keys the partition opens with, and what the lock screen and the key
 /// service bind to the secure world, which an older copy would not open;
 /// what the system makes again, its caches, compiled code and the updates
-/// it downloaded; and the second system, which lies where /metadata keeps
-/// it.
-const DATA_SKIPPED: [&str; 21] = [
+/// it downloaded; and the Linux area or Android DSU images, whose state
+/// /metadata keeps separately.
+const DATA_SKIPPED: [&str; 22] = [
     "media",
     "lost+found",
     "per_boot",
@@ -71,6 +71,7 @@ const DATA_SKIPPED: [&str; 21] = [
     "ota",
     "ota_package",
     "skyward/systems",
+    "gsi",
 ];
 
 /// What of the data partition backups leave out on this phone: what every
@@ -289,11 +290,18 @@ fn copy(from: &mut impl Read, to: &mut impl Write, len: u64, cancel: &AtomicBool
     Ok(())
 }
 
-/// The reference of the key the data partition's own folders are encrypted
-/// with, in hex.
-fn data_key() -> Result<String> {
-    let bytes = fs::read(DATA_KEY).with_context(|| format!("read {DATA_KEY}"))?;
-    Ok(hex::encode(bytes))
+/// The shared file key's reference in hex, or none on unencrypted Data.
+/// A missing reference on encrypted Data remains an error.
+fn data_key() -> Result<Option<String>> {
+    data_key_at(Path::new(DATA_KEY), skyward_crypto::data::files_encrypted()?)
+}
+
+fn data_key_at(path: &Path, encrypted: bool) -> Result<Option<String>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(hex::encode(bytes))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !encrypted => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
 }
 
 /// The bytes free where `path` is, or would be made.
@@ -315,6 +323,9 @@ fn no_update() -> Result<()> {
 fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<PathBuf> {
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
     let [boot, system, data, efs] = t.parts;
+    // Read this before archiving, so an encrypted partition missing its
+    // key record fails before a large backup has been written.
+    let data_key = if data { data_key()? } else { None };
     if system {
         no_update()?;
     }
@@ -403,7 +414,6 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
                 check(&folder, &item.stored, cancel, &mut telling).with_context(|| format!("check {}", item.name))?;
             }
         }
-        let data_key = if data { Some(data_key()?) } else { None };
         let manifest =
             Manifest { format: FORMAT, device: t.device.clone(), made: t.made, slot: slot.suffix().into(), system: t.system.clone(), data_key, items };
         manifest.write(&folder, t.ownership)?;
@@ -489,7 +499,7 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
                 }
             }
             Part::Data => {
-                if manifest.data_key.as_deref() != Some(data_key()?.as_str()) {
+                if manifest.data_key != data_key()? {
                     return Err(Refusal::DataReset.into());
                 }
             }
@@ -577,4 +587,58 @@ fn write_image(device: &Path, folder: &Path, stored: &Stored, telling: &mut Tell
     let read = store::digest(back, stored.size, &mut |n| telling.done(stored.size + n)).with_context(|| format!("read {} back", device.display()))?;
     ensure!(read == stored.sha256, "{} reads back different from the backup", device.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unencrypted_data_needs_no_file_key_record() {
+        let at = tempfile::tempdir().unwrap();
+        let path = at.path().join("unencrypted/ref");
+        assert_eq!(data_key_at(&path, false).unwrap(), None);
+        let error = data_key_at(&path, true).unwrap_err();
+        assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn existing_file_key_records_keep_the_old_backup_identity() {
+        let at = tempfile::tempdir().unwrap();
+        let path = at.path().join("ref");
+        fs::write(&path, [0x12, 0x34, 0xab, 0xcd]).unwrap();
+        for encrypted in [false, true] {
+            assert_eq!(data_key_at(&path, encrypted).unwrap().as_deref(), Some("1234abcd"));
+        }
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        for encrypted in [false, true] {
+            assert!(data_key_at(&path, encrypted).is_err(), "an unreadable record is not an absent key");
+        }
+    }
+
+    #[test]
+    fn data_archives_leave_native_dsu_and_internal_storage_untouched() {
+        let at = tempfile::tempdir().unwrap();
+        let (from, to) = (at.path().join("from"), at.path().join("to"));
+        for root in [&from, &to] {
+            fs::create_dir_all(root.join("data/app/files")).unwrap();
+            fs::write(root.join("data/app/files/notes"), b"app data").unwrap();
+            for folder in ["gsi/dsu/second", "media/0", "skyward/systems"] {
+                fs::create_dir_all(root.join(folder)).unwrap();
+                fs::write(root.join(folder).join("kept"), root.as_os_str().as_encoded_bytes()).unwrap();
+            }
+        }
+        let skipped = Skipped::new(&data_skipped(&[]));
+        let cancel = AtomicBool::new(false);
+        assert_eq!(archive::measure(&from, &skipped, &cancel).unwrap().0, 8);
+        let mut packed = Vec::new();
+        archive::pack(&from, &skipped, &mut packed, &cancel, &mut |_| {}).unwrap();
+        fs::remove_file(to.join("data/app/files/notes")).unwrap();
+        archive::unpack(packed.as_slice(), &to, &skipped, &cancel, &mut |_| {}).unwrap();
+        assert_eq!(fs::read(to.join("data/app/files/notes")).unwrap(), b"app data");
+        for folder in ["gsi/dsu/second", "media/0", "skyward/systems"] {
+            assert_eq!(fs::read(to.join(folder).join("kept")).unwrap(), to.as_os_str().as_encoded_bytes());
+        }
+    }
 }

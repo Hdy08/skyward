@@ -89,6 +89,7 @@ unsafe extern "C" fn main(argc: libc::c_int, argv: *const *const libc::c_char) -
     };
     match std::path::Path::new(std::ffi::OsStr::from_bytes(started_as)).file_name().and_then(|n| n.to_str()) {
         Some("map") => sys::map(),
+        Some("init") if std::path::Path::new(skyward_systems::android::ORIGINAL_INIT).is_file() => unsafe { sys::android(argv) },
         _ => sys::init(),
     }
 }
@@ -114,6 +115,7 @@ mod sys {
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::FileExt;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -222,6 +224,40 @@ mod sys {
         }
         let kmsg = unsafe { File::from_raw_fd(fd) };
         let _ = (&kmsg).write_all(format!("<3>skyward system-init: {line}\n").as_bytes());
+    }
+
+    /// Xiaomi loads mi_ext properties and init scripts before mount_all.
+    /// The installed first stage has already mounted the DSU at /mi_ext,
+    /// but its old fstab mounted the main mi_ext at /mnt/vendor/mi_ext.
+    /// Correct that alias before the unchanged Android init runs. Bind the
+    /// retained init over this entry before SELinux setup, so its later
+    /// self-exec goes directly to the original executable and performs the
+    /// normal kernel-to-init transition only once.
+    ///
+    /// # Safety
+    /// `argv` is the C runtime's original, NUL-terminated argument vector.
+    pub unsafe fn android(argv: *const *const libc::c_char) -> libc::c_int {
+        let fixed = (|| -> Result<()> {
+            ensure!(unsafe { libc::getpid() } == 1, "Android init must be PID 1");
+            let source = fs::metadata("/mi_ext")?;
+            let target = fs::metadata("/mnt/vendor/mi_ext")?;
+            ensure!(source.dev() != fs::metadata("/")?.dev(), "DSU mi_ext is not mounted");
+            if (source.dev(), source.ino()) != (target.dev(), target.ino()) {
+                mount("/mi_ext", "/mnt/vendor/mi_ext", None, libc::MS_BIND, None)?;
+            }
+            mount(skyward_systems::android::ORIGINAL_INIT, "/system/bin/init", None, libc::MS_BIND, None)?;
+            Ok(())
+        })();
+        let ready = fixed.is_ok();
+        if let Ok(mut log) = OpenOptions::new().write(true).open("/dev/kmsg") {
+            let message = match fixed { Ok(()) => "DSU mi_ext and original Android init ready before SELinux setup".into(), Err(e) => format!("Android init handover: {e:#}") };
+            let _ = writeln!(log, "<3>skyward android-init: {message}");
+        }
+        if !ready { return 1; }
+        // Keep the first stage's arguments, environment and descriptors.
+        // Android's subsequent self-exec now bypasses this entry entirely.
+        unsafe { libc::execv(c(skyward_systems::android::ORIGINAL_INIT).as_ptr(), argv) };
+        1
     }
 
     /// The kernel's own filesystems, and the nodes the rest needs, in a

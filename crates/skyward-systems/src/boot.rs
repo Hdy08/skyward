@@ -7,6 +7,39 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use skyward_block::area::Area;
 use skyward_bootimg::{lz4_legacy, BootImage, Ramdisk};
+use std::path::Path;
+
+/// Where this phone's generic first-stage ramdisk lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    Separate,
+    InBoot,
+}
+
+impl Layout {
+    /// Both slots must use the same layout. A partial init_boot pair is
+    /// not a phone whose boot ramdisk can safely be assumed instead.
+    pub fn detect(by_name: &Path) -> Result<Option<Self>> {
+        let pair = |name: &str| -> Result<[bool; 2]> {
+            Ok([by_name.join(format!("{name}_a")).try_exists()?, by_name.join(format!("{name}_b")).try_exists()?])
+        };
+        if pair("boot")? != [true, true] {
+            return Ok(None);
+        }
+        Ok(match pair("init_boot")? {
+            [true, true] => Some(Self::Separate),
+            [false, false] => Some(Self::InBoot),
+            _ => None,
+        })
+    }
+
+    pub fn ramdisk_partition(self) -> &'static str {
+        match self {
+            Self::Separate => "init_boot",
+            Self::InBoot => "boot",
+        }
+    }
+}
 
 /// Where the program finds what to start, in the ramdisk.
 pub const START: &str = "skyward/system.toml";
@@ -51,6 +84,29 @@ pub fn init_boot(template: &[u8], program: &[u8], start: &Start) -> Result<Vec<u
     ensure!(image.kernel.is_empty(), "the phone's init_boot image holds a kernel");
     image.ramdisk = archive(INIT, program, start)?;
     image.to_bytes()
+}
+
+/// Android 12-era phones such as zizhan keep the generic ramdisk beside
+/// the kernel in boot. Keep the package's kernel and header, replacing
+/// its ramdisk, or taking the package's explicit init_boot ramdisk.
+pub fn in_boot(template: &[u8], own: Option<&[u8]>, program: &[u8], start: &Start) -> Result<(Vec<u8>, Option<u64>)> {
+    let mut image = BootImage::parse(template).context("read the second system's boot image")?;
+    ensure!(!image.kernel.is_empty(), "the second system's boot image has no kernel");
+    let own_ramdisk = match own {
+        Some(own) => {
+            let own = BootImage::parse(own).context("read the second system's init_boot image")?;
+            ensure!(own.kernel.is_empty(), "the second system's init_boot image holds a kernel");
+            image.ramdisk = own.ramdisk;
+            let bytes = image.ramdisk.len() as u64;
+            image.ramdisk.extend_from_slice(&archive(MAP, program, start)?);
+            Some(bytes)
+        }
+        None => {
+            image.ramdisk = archive(INIT, program, start)?;
+            None
+        }
+    };
+    Ok((image.to_bytes()?, own_ramdisk))
 }
 
 /// The system's own init_boot image `own` with the program as [`MAP`] and
@@ -130,6 +186,65 @@ pub(crate) mod tests {
 
     pub fn start() -> Start {
         Start { id: "test".into(), filesystem: "ext4".into(), init: "/sbin/init".into(), root: area("/data/skyward/systems/test", 1 << 20) }
+    }
+
+    pub fn kernel_image(version: u32) -> Vec<u8> {
+        let mut image = BootImage::parse(&template(b"the original Android ramdisk")).unwrap();
+        image.kernel = b"the Linux kernel".to_vec();
+        image.header.cmdline[..10].copy_from_slice(b"test=true\0");
+        if version == 3 {
+            image.header.v4_signature_size = None;
+        }
+        image.to_bytes().unwrap()
+    }
+
+    #[test]
+    fn a_matching_pair_of_boot_partitions_can_keep_the_generic_ramdisk() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(Layout::detect(dir.path()).unwrap(), None);
+        std::fs::write(dir.path().join("boot_a"), []).unwrap();
+        assert_eq!(Layout::detect(dir.path()).unwrap(), None);
+        std::fs::write(dir.path().join("boot_b"), []).unwrap();
+        assert_eq!(Layout::detect(dir.path()).unwrap(), Some(Layout::InBoot));
+        std::fs::write(dir.path().join("init_boot_a"), []).unwrap();
+        assert_eq!(Layout::detect(dir.path()).unwrap(), None, "a partial init_boot pair is refused");
+        std::fs::write(dir.path().join("init_boot_b"), []).unwrap();
+        assert_eq!(Layout::detect(dir.path()).unwrap(), Some(Layout::Separate));
+    }
+
+    #[test]
+    fn an_embedded_start_keeps_the_kernel_header_and_command_line() {
+        for version in [3, 4] {
+            let source = kernel_image(version);
+            let (made, own) = in_boot(&source, None, b"first program", &start()).unwrap();
+            let image = BootImage::parse(&made).unwrap();
+            assert_eq!(image.header.header_version(), version);
+            assert_eq!(image.kernel, b"the Linux kernel");
+            assert_eq!(&image.header.cmdline[..10], b"test=true\0");
+            assert_eq!(own, None);
+            assert_eq!(entries(&image.ramdisk)[0], (INIT.into(), b"first program".to_vec()));
+            assert!(starts_from_data(&made));
+            let updated = with_program(&made, None, b"updated program", &start()).unwrap();
+            let image = BootImage::parse(&updated).unwrap();
+            assert_eq!(image.kernel, b"the Linux kernel");
+            assert_eq!(entries(&image.ramdisk)[0].1, b"updated program");
+        }
+        assert!(in_boot(&template(b"ramdisk only"), None, b"program", &start()).is_err());
+    }
+
+    #[test]
+    fn an_own_first_ramdisk_can_be_carried_in_boot_without_its_own_partition() {
+        let own = template(b"the system's own first-stage archive");
+        let (made, kept) = in_boot(&kernel_image(3), Some(&own), b"map program", &start()).unwrap();
+        let image = BootImage::parse(&made).unwrap();
+        let kept = kept.unwrap() as usize;
+        assert_eq!(&image.ramdisk[..kept], b"the system's own first-stage archive");
+        assert_eq!(entries(&image.ramdisk[kept..])[1], (MAP.into(), b"map program".to_vec()));
+        let again = with_program(&made, Some(kept as u64), b"new map", &start()).unwrap();
+        let image = BootImage::parse(&again).unwrap();
+        assert_eq!(&image.ramdisk[..kept], b"the system's own first-stage archive");
+        assert_eq!(entries(&image.ramdisk[kept..])[1].1, b"new map");
+        assert!(in_boot(&kernel_image(3), Some(&kernel_image(4)), b"map", &start()).is_err());
     }
 
     #[test]

@@ -54,7 +54,7 @@ pub struct Manifest {
     pub system: Option<String>,
     /// With the data partition's files, the reference of the key the
     /// partition encrypts with: one made afresh, as a factory reset makes
-    /// it, has another.
+    /// it, has another. None for Data with no file encryption.
     pub data_key: Option<String>,
     pub items: Vec<Item>,
 }
@@ -122,8 +122,13 @@ mod tests {
                 Item { part: Part::Data, name: "data".into(), stored: stored("data", 9_000_000_000) },
             ],
         };
-        m.write(&at, Ownership::Kept).unwrap();
-        assert_eq!(Manifest::read(&at).unwrap(), m);
+        for data_key in [m.data_key.clone(), None] {
+            let mut manifest = m.clone();
+            manifest.data_key = data_key;
+            manifest.write(&at, Ownership::Kept).unwrap();
+            assert_eq!(Manifest::read(&at).unwrap(), manifest);
+            std::fs::remove_file(at.join(MANIFEST)).unwrap();
+        }
         assert_eq!(m.parts(), [true, false, true, false]);
         assert_eq!(m.size(), 100_663_296 + 4_500_000_000);
         std::fs::remove_dir_all(&at).unwrap();

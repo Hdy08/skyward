@@ -439,6 +439,7 @@ fn install<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done> {
         Package::Image(kind) => flash_image(ctx, kind, size),
         Package::Script => run_script(ctx, size),
         Package::System(contents) => install_system(ctx, &contents),
+        Package::Android(manifest) => install_android(ctx, &manifest),
         Package::Unknown => Ok(Done::Decided(Outcome::Refused(Refusal::Unknown))),
     }
 }
@@ -462,8 +463,9 @@ fn install_system(ctx: &Context, contents: &skyward_systems::package::Contents) 
     if !skyward_block::mount::is_mount_point(Path::new(DATA))? {
         return refused(Refusal::DataClosed);
     }
-    if let Some(other) = skyward_systems::install::state()?.system {
-        return refused(Refusal::SystemInstalled(other.name));
+    let saved = skyward_systems::install::state()?;
+    if let Some(name) = saved.system.map(|s| s.name).or_else(|| saved.android.map(|s| s.manifest.name)) {
+        return refused(Refusal::SystemInstalled(name));
     }
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
     let room = skyward_systems::install::room_now(slot)?;
@@ -500,6 +502,52 @@ fn install_system(ctx: &Context, contents: &skyward_systems::package::Contents) 
         }
     })?;
     let _ = kmsg(&format!("install: {name} installed beside the installed system, with {size} bytes for its root"));
+    Ok(Done::Decided(Outcome::SystemInstalled { name }))
+}
+
+fn install_android(ctx: &Context, manifest: &skyward_systems::android::Manifest) -> Result<Done> {
+    use skyward_systems::android::{self, Step};
+    let refused = |r| Ok(Done::Decided(Outcome::Refused(r)));
+    if matches!(ctx.origin, Origin::Asked { .. }) { return refused(Refusal::SystemAsked); }
+    if let Some(refusal) = short_of_charge(ctx.origin)? { return refused(refusal); }
+    let snapshot = skyward_vab::snapshot_state()?;
+    if snapshot != SnapshotState::None { return refused(Refusal::Pending(snapshot)); }
+    if !skyward_block::mount::is_mount_point(Path::new(DATA))? { return refused(Refusal::DataClosed); }
+    ensure!(prop("ro.product.device").as_deref() == Some(manifest.device.as_str()), "the Android package is for a different device");
+    let saved = skyward_systems::install::state()?;
+    if let Some(name) = saved.system.map(|s| s.name).or_else(|| saved.android.map(|s| s.manifest.name)) {
+        return refused(Refusal::SystemInstalled(name));
+    }
+    let client = android::Client::open()?;
+    ensure!(!client.installed()? && !client.busy()?, "Android already has an installed or unfinished dynamic system");
+    let room = android::room(Path::new(fuse::PACKAGE), manifest)?;
+    let sizes = skyward_systems::install::sizes(8_000_000_000, room);
+    if sizes.is_empty() { return refused(Refusal::NoRoom { least: 8_000_000_000, room }); }
+    if ctx.shared.cancelled() { return Ok(Done::Decided(Outcome::Cancelled)); }
+    let name = manifest.name.clone();
+    ctx.send(Event::AndroidSystem { name: name.clone(), version: manifest.version.clone(), sizes: sizes.clone() });
+    let size = match ctx.commands.recv() {
+        Ok(Command::InstallSystem { size }) => size,
+        Ok(Command::Cancel) | Err(_) => return Ok(Done::Decided(Outcome::Cancelled)),
+        Ok(other) => bail!("an Android system waiting for its size was told {other:?}"),
+    };
+    ensure!(sizes.contains(&size), "{size} bytes is not among the sizes offered");
+    let mut told: Option<Instant> = None;
+    android::install(Path::new(fuse::PACKAGE), manifest, size, &mut |step| {
+        ensure!(!ctx.shared.cancelled(), "the Android installation was cancelled");
+        let stage = match step {
+            Step::Allocating { done, total } => Stage::Allocating { done, total },
+            Step::Writing { done, total } => Stage::AndroidWriting { done, total },
+            Step::Finishing => Stage::AndroidFinishing,
+        };
+        let last = matches!(step, Step::Finishing | Step::Allocating { .. });
+        if last || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
+            ctx.send(Event::Progress(stage));
+            told = Some(Instant::now());
+        }
+        Ok(())
+    })?;
+    let _ = kmsg(&format!("install: {} installed as a second Android with {size} bytes of independent userdata; main system selected", manifest.version));
     Ok(Done::Decided(Outcome::SystemInstalled { name }))
 }
 
@@ -551,6 +599,7 @@ fn describe(package: &Package) -> String {
         Package::Image(kind) => format!("an image of {kind:?}"),
         Package::Script => "a zip with an install script".into(),
         Package::System(c) => format!("the system {} {}, to install beside the installed one", c.manifest.name, c.manifest.version),
+        Package::Android(m) => format!("Android {} {}, with independent userdata", m.name, m.version),
         Package::Unknown => "a file of no known kind".into(),
     }
 }

@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 pub mod boot;
+pub mod android;
 pub mod install;
 pub mod package;
 pub mod state;

@@ -102,6 +102,8 @@ pub enum Event {
     /// [`Command::InstallSystem`] says how much room its root takes: its
     /// name, its version, and the sizes there is room for, the least first.
     System { name: String, version: String, sizes: Vec<u64> },
+    /// A prepared Android package; the size is its independent userdata.
+    AndroidSystem { name: String, version: String, sizes: Vec<u64> },
     /// The install script has started.
     Running,
     /// A line the install script shows.
@@ -160,6 +162,8 @@ pub enum Stage {
     Root { done: u64, total: u64 },
     /// The system's boot set is put in the store.
     Storing,
+    AndroidWriting { done: u64, total: u64 },
+    AndroidFinishing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -221,7 +221,7 @@ impl App {
         if matches!(ev, Event::Wipe | Event::Reboot(_)) {
             return;
         }
-        if matches!(ev, Event::Image { .. } | Event::Ready { .. } | Event::Script | Event::System { .. } | Event::Done(_) | Event::Finished(_)) {
+        if matches!(ev, Event::Image { .. } | Event::Ready { .. } | Event::Script | Event::System { .. } | Event::AndroidSystem { .. } | Event::Done(_) | Event::Finished(_)) {
             self.wake(now);
         }
         let install = &mut self.state.install;
@@ -239,7 +239,8 @@ impl App {
                 *install = Install::Choosing(Choice { kind, size, partitions, partition: 0, pick: Pick::Current })
             }
             Event::Script => *install = Install::ConfirmingScript,
-            Event::System { name, version, sizes } => *install = Install::SystemChoosing(SystemChoice { name, version, sizes, size: 0 }),
+            Event::System { name, version, sizes } => *install = Install::SystemChoosing(SystemChoice { android: false, name, version, sizes, size: 0 }),
+            Event::AndroidSystem { name, version, sizes } => *install = Install::SystemChoosing(SystemChoice { android: true, name, version, sizes, size: 0 }),
             Event::Running => {
                 *install = Install::Scripting { stage: None, running: true };
                 self.state.script_output.clear();

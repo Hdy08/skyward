@@ -264,6 +264,7 @@ fn main() -> Result<()> {
             "199-sideload-system-choosing",
             false,
             Install::SystemChoosing(SystemChoice {
+                android: false,
                 name: "Ubuntu Touch".into(),
                 version: "24.04-1.x".into(),
                 sizes: [5, 8, 16, 32, 64].map(|gb: u64| gb * 1_000_000_000).to_vec(),

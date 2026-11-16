@@ -46,6 +46,18 @@ pub fn partition(dir: &Path, name: &str, slot: Slot) -> PathBuf {
     dir.join(format!("{name}{}", slot.suffix()))
 }
 
+/// The boot set's partition sizes, with zero for an absent init_boot.
+#[cfg(target_os = "android")]
+pub fn sizes(dir: &Path, slot: Slot) -> Result<(u64, u64)> {
+    let layout = crate::boot::Layout::detect(dir)?.context("the phone has no matching A/B boot layout")?;
+    let boot = skyward_block::size_bytes(partition(dir, BOOT, slot))?;
+    let init_boot = match layout {
+        crate::boot::Layout::Separate => skyward_block::size_bytes(partition(dir, INIT_BOOT, slot))?,
+        crate::boot::Layout::InBoot => 0,
+    };
+    Ok((boot, init_boot))
+}
+
 /// Copy `len` bytes from `from` to `to` where it stands, returning their
 /// SHA-256.
 fn copy(from: &mut dyn Read, to: &mut File, len: u64) -> Result<String> {
@@ -122,15 +134,16 @@ pub fn check(store: &Store, device: &Path, saved: &Saved) -> Result<()> {
     Ok(())
 }
 
-/// The init_boot image of the boot set `saved` names, once the store is
-/// found to hold it whole, with the zeros after it to its partition's size.
-pub fn init_boot(store: &Store, device: &Path, saved: &Saved) -> Result<Vec<u8>> {
+/// The image carrying the generic ramdisk, either init_boot or boot,
+/// with the zeros after it to its partition's size.
+pub fn ramdisk_image(store: &Store, device: &Path, saved: &Saved) -> Result<Vec<u8>> {
+    let (within, len, expected) = if store.init_boot > 0 { (store.boot, store.init_boot, &saved.init_boot) } else { (0, store.boot, &saved.boot) };
     let mut f = open(device, false)?;
     skyward_block::drop_cache(&f)?;
-    f.seek(SeekFrom::Start(store.offset(saved.entry) + store.boot))?;
-    let mut image = vec![0u8; store.init_boot as usize];
+    f.seek(SeekFrom::Start(store.offset(saved.entry) + within))?;
+    let mut image = vec![0u8; len as usize];
     f.read_exact(&mut image).with_context(|| format!("read {}", device.display()))?;
-    ensure!(hex::encode(Sha256::digest(&image)) == saved.init_boot, "the store's entry {} holds another init_boot image than was saved", saved.entry);
+    ensure!(hex::encode(Sha256::digest(&image)) == *expected, "the store's entry {} holds another ramdisk image than was saved", saved.entry);
     Ok(image)
 }
 
@@ -145,20 +158,20 @@ pub fn held(store: &Store, dir: &Path, slot: Slot) -> Result<Written> {
 }
 
 /// Write the boot set `saved` names into the partitions of `slot`, once the
-/// store is found to hold it whole, and read each back; with `init_boot`,
-/// that image goes into the init_boot partition in place of the one stored.
+/// store is found to hold it whole, and read each back; `ramdisk_image`
+/// replaces the stored image carrying its generic ramdisk.
 /// Gives what the partitions hold once written.
-pub fn restore(store: &Store, device: &Path, saved: &Saved, dir: &Path, slot: Slot, init_boot: Option<&[u8]>) -> Result<Written> {
+pub fn restore(store: &Store, device: &Path, saved: &Saved, dir: &Path, slot: Slot, ramdisk_image: Option<&[u8]>) -> Result<Written> {
     check(store, device, saved)?;
-    if let Some(image) = init_boot {
-        ensure!(store.init_boot > 0, "the phone has no init_boot partition for an init_boot image");
-        ensure!(image.len() as u64 <= store.init_boot, "the init_boot image takes {} bytes, more than the {} of the init_boot partition", image.len(), store.init_boot);
+    let (ramdisk_partition, ramdisk_size) = if store.init_boot > 0 { (INIT_BOOT, store.init_boot) } else { (BOOT, store.boot) };
+    if let Some(image) = ramdisk_image {
+        ensure!(image.len() as u64 <= ramdisk_size, "the {ramdisk_partition} image takes {} bytes, more than the {ramdisk_size} of its partition", image.len());
     }
     let mut from = open(device, false)?;
     let mut sums = Vec::new();
     for ((name, path, len, within), want) in parts(store, dir, slot).into_iter().zip([&saved.boot, &saved.init_boot]) {
         let mut out = open(&path, true)?;
-        let written = match init_boot.filter(|_| name == INIT_BOOT) {
+        let written = match ramdisk_image.filter(|_| name == ramdisk_partition) {
             Some(image) => {
                 let mut padded = image.chain(io::repeat(0).take(len - image.len() as u64));
                 copy(&mut padded, &mut out, len).with_context(|| format!("write {}", path.display()))?
@@ -244,7 +257,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store, device) = bench(dir.path());
         let saved = put(&store, &device, OTHER, &mut &[7u8; 8192][..], 8192, &[9u8; 100]).unwrap();
-        let stored = init_boot(&store, &device, &saved).unwrap();
+        let stored = ramdisk_image(&store, &device, &saved).unwrap();
         assert_eq!((&stored[..100], stored[100..].iter().all(|&b| b == 0), stored.len()), (&[9u8; 100][..], true, 16384), "the image stored, whole");
         restore(&store, &device, &saved, dir.path(), Slot::A, Some(&[3u8; 200])).unwrap();
         assert_eq!(std::fs::read(dir.path().join("boot_a")).unwrap(), vec![7u8; 8192], "the boot image as stored");
@@ -263,7 +276,7 @@ pub(crate) mod tests {
         let mut bytes = std::fs::read(&device).unwrap();
         bytes[(store.offset(OTHER) + store.boot + 50) as usize] ^= 1;
         std::fs::write(&device, bytes).unwrap();
-        assert!(init_boot(&store, &device, &saved).is_err());
+        assert!(ramdisk_image(&store, &device, &saved).is_err());
     }
 
     #[test]
@@ -284,5 +297,28 @@ pub(crate) mod tests {
         assert_eq!(Store::next_save(None), 0);
         assert_eq!(Store::next_save(Some(&Saved { entry: 0, boot: String::new(), init_boot: String::new() })), 1);
         assert_eq!(Store::next_save(Some(&Saved { entry: 1, boot: String::new(), init_boot: String::new() })), 0);
+    }
+
+    #[test]
+    fn a_boot_only_store_replaces_and_restores_the_ramdisk_carrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store { area: area("/data/skyward/systems/store", Store::size_for(16384, 0)), boot: 16384, init_boot: 0 };
+        let device = dir.path().join("store");
+        std::fs::write(&device, vec![0; store.area.size as usize]).unwrap();
+        for name in ["boot_a", "boot_b"] {
+            std::fs::write(dir.path().join(name), vec![0xa1; 16384]).unwrap();
+        }
+        let main = save(&store, &device, 0, dir.path(), Slot::A).unwrap();
+        let other = put(&store, &device, OTHER, &mut &[7u8; 100][..], 100, &[]).unwrap();
+        assert_eq!(&ramdisk_image(&store, &device, &other).unwrap()[..100], &[7u8; 100]);
+        let written = restore(&store, &device, &other, dir.path(), Slot::A, Some(&[9u8; 200])).unwrap();
+        assert_eq!(written, held(&store, dir.path(), Slot::A).unwrap());
+        assert!(written.init_boot.is_empty());
+        assert_eq!(&std::fs::read(dir.path().join("boot_a")).unwrap()[..200], &[9u8; 200]);
+        assert!(restore(&store, &device, &other, dir.path(), Slot::B, Some(&[0u8; 16385])).is_err());
+        assert_eq!(std::fs::read(dir.path().join("boot_b")).unwrap(), vec![0xa1; 16384]);
+        restore(&store, &device, &main, dir.path(), Slot::A, None).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("boot_a")).unwrap(), vec![0xa1; 16384]);
+        assert!(!dir.path().join("init_boot_a").exists());
     }
 }

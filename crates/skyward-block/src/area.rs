@@ -363,8 +363,16 @@ mod sys {
         /// Lay the whole area out as device-mapper device `name` over its
         /// partition; returns the device's node.
         pub fn map(&self, name: &str) -> Result<PathBuf> {
-            let device = crate::devnum(Path::new(crate::BY_NAME).join(&self.partition))?;
-            dm::create(name, &self.targets(0, self.size, device)?, false)
+            let partition = Path::new(crate::BY_NAME).join(&self.partition);
+            let device = crate::devnum(&partition)?;
+            match dm::create(name, &self.targets(0, self.size, device)?, false) {
+                Ok(node) => Ok(node),
+                Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.raw_os_error() == Some(libc::EBUSY)) => {
+                    let view = crate::loopdev::writable(&partition)?;
+                    dm::create(name, &self.targets(0, self.size, crate::devnum(&view.path)?)?, false)
+                }
+                Err(error) => Err(error),
+            }
         }
 
         /// Let the file go: no longer immutable, then deleted, and its
@@ -387,6 +395,37 @@ pub use sys::create;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "android")]
+    #[test]
+    #[ignore = "requires writable Data in a root Skyward Recovery"]
+    fn an_area_can_be_written_while_its_unencrypted_filesystem_is_mounted() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::fs::{File, OpenOptions};
+        let path = PathBuf::from(format!("/data/skyward/area-test-{}.img", std::process::id()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let area = create(&path, 4 << 20, &mut |_, _| {}).unwrap();
+        let name = format!("skyward-area-test-{}", std::process::id());
+        let done = (|| -> anyhow::Result<()> {
+            area.verify()?;
+            let node = area.map(&name)?;
+            let mut output = OpenOptions::new().read(true).write(true).open(node)?;
+            output.seek(SeekFrom::Start(HEADER))?;
+            output.write_all(&[0x5a; 4096])?;
+            output.sync_all()?;
+            output.seek(SeekFrom::Start(HEADER))?;
+            let mut back = [0; 4096];
+            output.read_exact(&mut back)?;
+            assert_eq!(back, [0x5a; 4096]);
+            drop(output);
+            let raw = File::open(std::path::Path::new(crate::BY_NAME).join(&area.partition))?;
+            crate::drop_cache(&raw)?;
+            area.check_header()
+        })();
+        if crate::dm::status(&name).unwrap().is_some() { crate::dm::remove(&name).unwrap(); }
+        area.remove().unwrap();
+        done.unwrap();
+    }
 
     fn area(extents: &[(u64, u64)], size: u64) -> Area {
         Area { partition: "userdata".into(), file: "/data/skyward/a".into(), id: "00112233445566778899aabbccddeeff".into(), size, extents: extents.to_vec() }
