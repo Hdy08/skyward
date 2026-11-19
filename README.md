@@ -4,7 +4,8 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Skyward is a recovery written in Rust, from scratch.
+Skyward is a recovery written in Rust by [Kirk Lin](https://github.com/kirklin/skyward).
+Hdy08 maintains this fork and the OnePlus 13, Xiaomi MIX Fold 2, and Nubia Z70 Ultra ports.
 
 <p align="center">
   <img src="assets/home.png" width="30%" alt="Home">
@@ -139,22 +140,24 @@ not been verified.
 
 ## Installing Skyward
 
-Skyward needs an unlocked bootloader. Download the zip for your phone from
-[Releases](https://github.com/kirklin/skyward/releases), where each shows as the
-phone's model and codename, such as Xiaomi 17 Ultra (nezha). Check it against
-`SHA256SUMS`, unzip it, and flash the image inside to the recovery partition of
-the slot the phone runs from, with the phone in fastboot mode:
+Skyward needs an unlocked bootloader. This fork's [Releases](https://github.com/Hdy08/skyward/releases)
+provide zips for OnePlus 13 (`dodge`), Xiaomi MIX Fold 2 (`zizhan`), and Nubia Z70
+Ultra (`NX733J`). The other stock-based builds are available from [upstream](https://github.com/kirklin/skyward/releases).
+Check the zip for your phone against `SHA256SUMS` and extract it. In fastboot
+mode, flash the image to the recovery partition of the current slot. For example,
+for Xiaomi MIX Fold 2:
 
 ```sh
-unzip skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.zip
-fastboot flash recovery skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.img
+unzip skyward-v0.3.2-zizhan-OS3.0.8.0.VLRCNXM.zip
+fastboot flash recovery skyward-v0.3.2-zizhan-OS3.0.8.0.VLRCNXM.img
 fastboot reboot recovery
 ```
 
-Afterwards Skyward updates itself over Wi-Fi from its newest release, on the
-Skyward update page in Settings; a newer image, unzipped, also installs from its own
-Install page. With **Flash Skyward again** on, a system update or zip that writes
-over the recovery partitions gets Skyward back in them.
+Install this fork's image once to switch to the `Hdy08/skyward` update channel.
+The Skyward update page in Settings then checks this fork's releases over Wi-Fi.
+You can also install a newer extracted image from Skyward's Install page. With
+**Flash Skyward again** on, a system update or zip that writes over the recovery
+partitions gets Skyward back in them.
 
 adb in Skyward is a root shell that needs no authorization on the phone: anyone
 with the phone and a cable can reach its storage while it is in recovery.

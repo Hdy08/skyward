@@ -3,9 +3,9 @@ name: Build
 # Every push is linted and tested, and the recovery is built for every
 # stock-based device in devices/, each image zipped. Locally supplied
 # recovery bases are built with their device-specific instructions.
-# A tag starting with v publishes
-# those zips as a release, each shown as the phone it is for. Run by hand,
-# it can build for one device alone.
+# A tag starting with v publishes the stock-based builds.
+# Hdy08/skyward publishes its local-base ports separately.
+# Run by hand, it can build for one stock-based device alone.
 on:
   push:
     branches: ["**"]
@@ -179,7 +179,7 @@ jobs:
 
   release:
     name: Publish the release
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' && github.repository != 'Hdy08/skyward'
     needs: [tag, check, recovery, devices]
     runs-on: ubuntu-24.04
     permissions:

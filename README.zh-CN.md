@@ -4,7 +4,8 @@
 
 [English](README.md) | 简体中文
 
-Skyward 是使用 Rust 编写的 recovery，从零开始编写。
+Skyward 是由 [Kirk Lin](https://github.com/kirklin/skyward) 使用 Rust 编写的 Recovery。
+Hdy08 维护此分支，以及 OnePlus 13、Xiaomi MIX Fold 2 和 Nubia Z70 Ultra 的移植。
 
 <p align="center">
   <img src="assets/home.png" width="30%" alt="首页">
@@ -126,15 +127,15 @@ OTA 公共证书。构建与测试步骤见
 
 ## 安装 Skyward
 
-Skyward 需要已解锁的 bootloader。从 [Releases](https://github.com/kirklin/skyward/releases) 下载对应机型的 zip，每个文件都标有机型和代号，例如 Xiaomi 17 Ultra (nezha)。使用 `SHA256SUMS` 核对并解压之后，在手机处于 fastboot 模式的时候，把其中的镜像刷入当前运行槽位的 recovery 分区：
+Skyward 需要已解锁的 bootloader。本分支的 [发布页](https://github.com/Hdy08/skyward/releases) 提供 OnePlus 13（`dodge`）、Xiaomi MIX Fold 2（`zizhan`）和 Nubia Z70 Ultra（`NX733J`）的安装包。其他原版机型请前往 [上游发布页](https://github.com/kirklin/skyward/releases)。下载对应机型的 ZIP，使用 `SHA256SUMS` 核对并解压。在 fastboot 模式下，将解压出的镜像刷入当前槽位的 recovery 分区。以下以 Xiaomi MIX Fold 2 为例：
 
 ```sh
-unzip skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.zip
-fastboot flash recovery skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.img
+unzip skyward-v0.3.2-zizhan-OS3.0.8.0.VLRCNXM.zip
+fastboot flash recovery skyward-v0.3.2-zizhan-OS3.0.8.0.VLRCNXM.img
 fastboot reboot recovery
 ```
 
-之后连接 WLAN，就可以在“设置”的“Skyward 更新”页面更新到最新版本，也可以在 Skyward 自己的“安装”页面安装解压出来的新版镜像。打开 **自动重新刷入 Skyward** 之后，系统更新或者刷机包覆盖 recovery 分区的时候，Skyward 会重新刷回这些分区。
+首次安装本分支镜像即可切换到 `Hdy08/skyward` 更新源。之后连接 WLAN，可在「设置 → Skyward 更新」查询本分支的新版本，也可从 Skyward 的「安装」页面安装解压出的新版镜像。打开 **自动重新刷入 Skyward** 后，系统更新或刷机包覆盖 recovery 分区时，Skyward 会重新刷回这些分区。
 
 Skyward 中的 adb 是 root shell，手机上无需授权：手机处于 recovery 的时候，任何人拿到手机和数据线都能访问其中的存储。
 

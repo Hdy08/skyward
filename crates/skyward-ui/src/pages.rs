@@ -512,8 +512,12 @@ pub fn mount(cx: &Ctx) -> Frame {
     Frame::new(t, fit(c, t, bottom), out, l.pick(["挂载", "掛載", "Mount"]), top)
 }
 
-/// Who made the recovery, as the About page names them under its version.
-const AUTHOR: &str = "© 2026 Kirk Lin";
+/// The original author and device porter, below the version.
+const AUTHOR: Text = [
+    "© 2026 Kirk Lin · Hdy08 移植",
+    "© 2026 Kirk Lin · Hdy08 移植",
+    "© 2026 Kirk Lin · Ports by Hdy08",
+];
 
 /// About this device, modelled on the stock「我的设备」: the wordmark, the
 /// version and its author over a moving colour field, and the summary,
@@ -531,7 +535,7 @@ pub fn about(cx: &Ctx) -> Frame {
     let art = HeroArt {
         wordmark: widgets::wordmark(t, f, "Skyward", m.dp(233.7), m.dp(37.8)),
         version: widgets::version_line(t, f, VERSION),
-        author: widgets::author_line(t, f, AUTHOR),
+        author: widgets::author_line(t, f, cx.state.lang.pick(AUTHOR)),
         runs: canvas.runs(),
     };
     Frame { header: false, hero: Some(art), ..Frame::new(t, canvas, out, cx.state.lang.pick(ABOUT), summary_top) }
