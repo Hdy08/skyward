@@ -341,6 +341,43 @@ mod tests {
     }
 
     #[test]
+    fn the_dual_boot_install_destination_survives_files_sideload_and_retries() {
+        let (f, i) = (fonts(), info());
+        let mut app = systems_page(&f, &i, Overview { other: None, ..two_systems() });
+        app.state.data = Data::Open;
+        tap(&mut app, &f, &i, Action::Open(Screen::Install));
+        assert!(app.state.install_second_system, "the empty second-system card chooses an independent install");
+        tap(&mut app, &f, &i, Action::Open(Screen::Choose(Place::Storage)));
+        app.set_place(Place::Storage, String::new(), Ok(vec![FileRow { name: "dsu.zip".into(), kind: FileKind::File, size: 4096, mode: 0o644, uid: 0, gid: 0, modified: 0 }]), 0);
+        assert_eq!(tap(&mut app, &f, &i, Action::ChooseEntry(0)), vec![Effect::InstallFile(Place::Storage, "dsu.zip".into())]);
+        assert!(app.state.install_second_system);
+        app.install(Event::AndroidSystem { name: "HyperOS".into(), version: "OS3.0.9.0.VLRCNXM".into(), sizes: vec![32_000_000_000] }, 0);
+        let track = app.frame(&f, &i).hits.iter().find(|h| h.action == Action::Confirm(Confirm::InstallSystem)).unwrap().rect;
+        let y = track.centre().1 - app.top().1;
+        app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
+        app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
+        assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::InstallSystem { size: 32_000_000_000 }]);
+        app.install(Event::Finished(Outcome::SystemInstalled { name: "HyperOS".into() }), 0);
+        app.key(Key::Back, 1000);
+        assert!(app.state.install_second_system, "choosing another file preserves the destination");
+        app.key(Key::Back, 1000);
+        assert_eq!(app.screen(), Screen::Install);
+        tap_at(&mut app, &f, &i, Action::Sideload, 1000);
+        assert!(app.state.install_second_system, "USB and internal-storage packages use the same destination");
+        app.install(Event::Finished(Outcome::Cancelled), 0);
+        tap_at(&mut app, &f, &i, Action::Sideload, 1000);
+        assert!(app.state.install_second_system, "send again retains the destination too");
+        app.install(Event::Finished(Outcome::Cancelled), 0);
+        app.key(Key::Back, 1000);
+        app.key(Key::Back, 1000);
+        assert_eq!(app.screen(), Screen::Systems);
+        assert!(!app.state.install_second_system, "leaving the installation methods clears the choice");
+        app.key(Key::Back, 1000);
+        tap_at(&mut app, &f, &i, Action::Open(Screen::Install), 1000);
+        assert!(!app.state.install_second_system, "the ordinary install entry updates the main system");
+    }
+
+    #[test]
     fn a_switch_asked_for_shows_before_the_systems_are_read() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);

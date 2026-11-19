@@ -1034,10 +1034,11 @@ pub mod kms {
             &self.summary
         }
 
-        /// Replace the other panel's boot splash with black and park it
-        /// before it is ever selected. Keep its normal KMS resources for
-        /// later switches, just as for a panel that has already shown UI.
-        pub fn prepare_panel(&mut self, wanted: &str, rotation: u16) -> Result<()> {
+        /// Replace the other panel's boot splash with black, retaining
+        /// both panels' KMS resources. When it is the first selected panel,
+        /// leave it awake instead of immediately resting and waking it:
+        /// the touchscreen's asynchronous suspend can outlast that cycle.
+        pub fn prepare_panel(&mut self, wanted: &str, rotation: u16, selected: bool) -> Result<()> {
             anyhow::ensure!(matches!(rotation, 0 | 90 | 180 | 270), "invalid panel rotation {rotation}");
             anyhow::ensure!(self.connector != wanted, "the other panel must differ from the active one");
             if let Some(parked) = &self.parked {
@@ -1049,7 +1050,11 @@ pub mod kms {
             let (w, h) = parked.size();
             parked.present(&Canvas::new(w, h))?;
             parked.settle()?;
-            parked.rest()?;
+            if selected {
+                std::mem::swap(self, &mut parked);
+            } else {
+                parked.rest()?;
+            }
             self.parked = Some(Box::new(parked));
             Ok(())
         }

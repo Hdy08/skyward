@@ -190,10 +190,10 @@ mod sys {
                 if to == Who::Other {
                     ensure!(android.complete, "the Android installation was interrupted; remove it and install it again");
                     ensure!(skyward_vab::snapshot_state()? == skyward_vab::SnapshotState::None, "finish the installed system's update before switching");
-                    ensure!(client.installed()? && client.active()? == android.manifest.slot(), "the recorded second Android is no longer installed");
-                    client.enable(&android.manifest.slot())?;
+                    ensure!(client.installed()? && client.active()? == android.slot(), "the recorded second Android is no longer installed");
+                    client.enable(&android.slot())?;
                 } else if client.installed()? {
-                    ensure!(client.active()? == android.manifest.slot(), "another Android image install has replaced the recorded one");
+                    ensure!(client.active()? == android.slot(), "another Android image install has replaced the recorded one");
                     client.disable()?;
                 }
                 android.enabled = to == Who::Other;
@@ -421,7 +421,7 @@ mod sys {
             if let Some(android) = &state.android {
                 let client = crate::android::Client::open()?;
                 crate::android::prepare()?;
-                client.remove(&android.manifest)?;
+                client.remove(android)?;
                 state.android = None;
                 state.save(path)?;
             }

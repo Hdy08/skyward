@@ -218,8 +218,8 @@ Data; encrypted Data decryption has not been validated on MIX Fold 2.
 ## Dual boot
 
 The Linux boot-only layout and separate Android image-service installation are
-described in [MIX Fold 2 dual boot](zizhan-dualboot.md), including package
-conversion, storage layout and current device-validation results.
+described in [MIX Fold 2 dual boot](zizhan-dualboot.md), including the prepared DSU
+package format, storage layout and current validation scope.
 
 ## WLAN and updates
 
@@ -831,6 +831,130 @@ The report signs off these feature groups. It does not supply per-option
 clearing logs, an install-then-reset sequence, post-clear settings timing
 or incorrect-credential cases. Those checklist details and other official
 ROM branches retain their separate status.
+
+## Basic DSU scope (2026-11-17)
+
+At the owner's request, Android dual boot now provides only prepared-image
+installation through the native `gsid` service: allocate independent Data,
+stream the package images unchanged, register the completed installation,
+select a system and remove the recorded installation.
+
+The previous official-OTA-to-DSU path, desktop `android-system` converter,
+EROFS-to-ext4 rewriting, generated AVB metadata, automatic vendor/fstab copy,
+private Android init handover, mi_ext aliases, fold defaults, display-layout
+translation and backlight-property overrides have all been removed. The
+Linux startup path and unrelated Recovery device fixes are retained.
+
+The second-system destination still survives storage, USB and sideload
+selection and retry. Ordinary OTAs, install scripts and physical partition
+images are refused through that destination, preventing another accidental
+main-system update. The ordinary Install entry retains its normal behavior.
+
+The historical v34 MIUI 13 / OS3 combination used the removed adaptations;
+its successful display, reboot and isolation checks do not establish a clean
+basic DSU boot. Recovery updates do not rewrite or delete an installed DSU.
+Existing modified images remain separately removable through Dual boot.
+See [the DSU package and state description](zizhan-dualboot.md) for current
+installation requirements and validation scope.
+
+The v35 basic-DSU image is 104,857,600 bytes, SHA-256
+`cced607e17dc262fd684ab3dd104f646d47eca22be60d8b01c7ff7cba3371706`.
+Forty-one related Android-native tests, fifteen host packing tests, Android
+workspace Clippy and independent image checks pass. recovery_b was updated
+and read back with this hash, and the running program matches the build.
+Both boot sets and recovery_a retain their prior hashes. The owner confirmed
+startup, both displays, folding, touch, Data access and the dual-system list.
+ADB returned after toggling file transfer. The existing MIUI 14 / 16 GB DSU
+record and metadata keys remain unchanged, and no DSU image was rewritten.
+That round ended in Recovery B v35. A clean DSU install/boot has not been
+validated, and these source changes are not committed.
+
+## Passwordless MIUI 13 Data access (2026-11-17)
+
+The owner reported that Data would not open without a screen lock after
+factory reset, and clearing a working screen lock still left Recovery
+asking for a password. On official V13.1.21.0.SLRCNXM / Android 12, the
+captured passwordless state retained a `.pwd` record with credential type
+`-1`, while the current CE key was marked `stretching=nopassword` and
+held a hardware key blob. The old path treated any `.pwd` file as a screen
+lock and always tried to open CE keys through a synthetic-password secret.
+
+v36 opens a legacy `nopassword` CE key through KeyMint before looking for
+a synthetic-password protector. This also permits the initial passwordless
+key to open when no protector has been created. A `.pwd` record of type
+NONE no longer prompts for a credential. Where such a record does protect
+a synthetic password, its default password is stretched with the recorded
+salt and costs; the newer format without a `.pwd` record retains its
+existing default-token derivation. Keys requiring a secret continue through
+the existing credential path, and hardware failures remain errors.
+
+All 48 crypto tests pass on Android, including passwordless hardware CE
+keys, the legacy default-password scrypt vector, secret-bound keys and
+wrong-secret refusal. Android workspace Clippy with warnings denied and
+independent image checks pass. The live passwordless state opened `/sdcard`
+without a credential, and the original CE/metadata keys, protector files
+and locksettings database retained their hashes.
+
+The v36 image is 104,857,600 bytes, SHA-256
+`ded06c9943ac734217ea9e600bccabf40ac59889d19443f48b3082df07251be0`.
+It was flashed to recovery_b and read back in full; the running program
+matches the build. Both boot sets and recovery_a retain their prior hashes.
+After reboot, the owner confirmed passwordless Data access and readable
+internal storage; the log reports no closed users. The owner then set a PIN
+in Android, returned to Recovery and unlocked Data successfully. After
+clearing the PIN in Android and returning again, Data opened without a
+prompt; the new `.pwd` record still held type `-1`, the CE key was again
+`nopassword`, and no user was listed as closed on the first open. Folding,
+both displays and touch were confirmed normal. All boot/recovery partition
+hashes still match their post-flash values. No factory reset was performed
+in this validation round, so a fresh reset/setup sequence remains separate
+from this completed credential-transition test. The v35 basic-DSU scope is retained; no removed ROM
+adaptations are restored. These source changes are not committed.
+
+## Intermittent OS1 inner touchscreen at startup (2026-11-17)
+
+The owner reported one official OS1 / Android 14 boot with a visible inner
+display but no inner touch response. Display switching and cover touch still
+worked; folding again did not restore inner touch, while rebooting did. The
+failure could not be reproduced reliably, and the first captured boot was
+already working, with both input devices registered and inner touch events
+present. The original failure's root cause is therefore not established.
+
+Startup preparation did identify a timing risk: clearing the inner panel's
+boot splash parked it in low power, then the first unfolded sensor event
+immediately woke it again. v37 consumes the available initial fold state
+before parking the panels and keeps the selected inner panel awake. The
+cover remains cached and its boot splash is still cleared. The first
+frame, touch device, dimensions and backlight use the same selected panel.
+Normal switching and screen-off behavior retain their existing paths.
+
+Input handling also retries discovery while a selected panel is missing
+and rescans immediately after an old evdev handle reports ENODEV. This
+handles a replacement whose notification was consumed before that old
+handle was dropped. Device removal and moves are now watched. The selected
+touch node, name, axis ranges and first received contact are kept in the
+Recovery log; contact coordinates and typed credentials are not added.
+
+Two Android-native virtual-input tests exercise late discovery with an
+already-drained notification and replacement after the old handle dies.
+They use uniquely named temporary devices, without injecting events into
+the running Recovery's physical touchscreens. Both pass, along with six
+surface tests, twenty-nine display-power tests and two resize tests: 39
+related tests total. Android workspace Clippy with warnings denied and the
+independent image checks pass.
+
+The v37 image is 104,857,600 bytes, SHA-256
+`22776d2fc0fd1616add55678cddccd67b275a7530b29699418bda4e5e505827a`.
+It was written only to recovery_b and read back in full. Three unfolded
+Recovery boots each started the UI once, selected the inner display
+directly and logged an inner contact. Their kernel logs no longer show
+the startup inner-panel low-power/wake cycle. The owner confirmed menu
+touch, both panels across repeated folds, screen-off preservation and
+power-key wake. The original intermittent failure did not occur during
+this regression; these results support the startup hardening rather than
+prove the original failure can never recur. The device remains in Recovery
+B v37, retaining v36's crypto changes and v35's basic-DSU scope. Source
+changes are not committed.
 
 ## Build and validation status
 

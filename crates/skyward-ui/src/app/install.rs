@@ -134,6 +134,7 @@ impl App {
     /// the recovery started: the installing page opens over the home page,
     /// looking for it. `security` for a security update.
     pub fn start_asked(&mut self, security: bool, name: String) {
+        self.state.install_second_system = false;
         self.begin_install(Install::Starting, Source::Asked { security }, Some(name));
         self.open(Screen::Installing);
     }
@@ -159,6 +160,7 @@ impl App {
     /// installing page opens over the home page, already waiting for the
     /// computer.
     pub fn start_rescue(&mut self) {
+        self.state.install_second_system = false;
         self.begin_install(Install::Starting, Source::Rescue, None);
         self.open(Screen::Installing);
     }
@@ -186,6 +188,7 @@ impl App {
     /// The system asked for sideload before the recovery started: the page
     /// opens over the home page, already receiving.
     pub fn start_sideload(&mut self) {
+        self.state.install_second_system = false;
         self.begin_install(Install::Starting, Source::Computer, None);
         self.open(Screen::Installing);
     }
@@ -289,6 +292,7 @@ impl App {
     /// Install the file of `size` bytes at the full `path`, opened in the
     /// file manager, as a file chosen in a place installs.
     pub(super) fn install_opened(&mut self, path: String, size: u64, now: u64) -> Vec<Effect> {
+        self.state.install_second_system = false;
         let source = Source::Opened { drive: std::path::Path::new(&path).starts_with(USB_DRIVE) };
         let name = file_name(&path);
         self.install_named(source, name, size, Effect::InstallPath(path), now)

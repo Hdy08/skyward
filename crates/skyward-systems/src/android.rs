@@ -6,16 +6,12 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
+use std::path::PathBuf;
 use zip::{CompressionMethod, ZipArchive};
-
-#[cfg(target_os = "android")]
-mod compat;
 
 pub const MANIFEST: &str = "android.toml";
 pub const FOLDER: &str = "/data/gsi/dsu";
 pub const PREFIX: &str = "skyward-";
-/// The Android init retained beside the private DSU compatibility entry.
-pub const ORIGINAL_INIT: &str = "/system/bin/init.skyward-original";
 pub const PARTITIONS: &[&str] = &["system", "system_ext", "product", "mi_ext", "vendor", "odm", "vendor_dlkm", "odm_dlkm", "system_dlkm"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,7 +21,7 @@ pub struct Manifest {
     pub name: String,
     pub version: String,
     pub device: String,
-    /// Raw images, with the payload's verified SHA-256 values.
+    /// Prepared raw images, streamed unchanged to Android's image service.
     pub images: BTreeMap<String, Image>,
 }
 
@@ -65,6 +61,10 @@ impl Manifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Installed {
     pub manifest: Manifest,
+    /// Android 12 accepts only /data/gsi/dsu. Older Skyward records used
+    /// a named child of that folder and must retain their original location.
+    #[serde(default)]
+    pub default_slot: bool,
     pub userdata: u64,
     pub enabled: bool,
     /// Native DSU can remain enabled after exhausting its boot attempts.
@@ -76,6 +76,16 @@ pub struct Installed {
     pub boot: String,
     pub vendor_boot: String,
     pub dtbo: String,
+}
+
+impl Installed {
+    pub fn slot(&self) -> String {
+        if self.default_slot { "dsu".into() } else { self.manifest.slot() }
+    }
+
+    pub fn folder(&self) -> PathBuf {
+        if self.default_slot { FOLDER.into() } else { PathBuf::from(FOLDER).join(self.manifest.slot()) }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +123,7 @@ mod sys {
     use std::fs::{self, File, OpenOptions};
     use std::io::{SeekFrom, ErrorKind};
     use std::os::fd::AsFd;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
@@ -207,9 +218,9 @@ mod sys {
             Ok(())
         }
 
-        pub fn begin(&self, slot: &str) -> Result<()> {
+        pub fn begin(&self, folder: &Path) -> Result<()> {
             let mut call = Parcel::call(INTERFACE);
-            call.string(&format!("{FOLDER}/{slot}"));
+            call.string(folder.to_str().context("the Android install path is not UTF-8")?);
             self.success(18, &call)
         }
 
@@ -251,16 +262,17 @@ mod sys {
 
         /// Native removeGsi waits for Android's vold, which a recovery does
         /// not run. Use its image manager for this one owned slot instead.
-        pub fn remove(&self, manifest: &Manifest) -> Result<()> {
-            manifest.check()?;
-            let slot = manifest.slot();
+        pub fn remove(&self, installed: &Installed) -> Result<()> {
+            installed.manifest.check()?;
+            let slot = installed.slot();
             ensure!(!self.installed()? || self.active()? == slot, "another Android install is active");
             self.cancel()?;
             if self.installed()? { self.disable()?; }
-            let folder = Path::new(FOLDER).join(&slot);
+            let folder = installed.folder();
+            let parent = if installed.default_slot { Path::new("/data/gsi") } else { Path::new(FOLDER) };
             let metadata = Path::new(METADATA).join(&slot);
             if folder.exists() && metadata.exists() {
-                check_folder(&folder, Path::new(FOLDER))?;
+                check_folder(&folder, parent)?;
                 check_folder(&metadata, Path::new(METADATA))?;
                 let images = self.images(&slot)?;
                 let reply = images.transact(8, &Parcel::call(IMAGE_INTERFACE))?;
@@ -285,7 +297,7 @@ mod sys {
                     status::ok(&mut reply.read())?;
                 }
             }
-            remove_folder(&folder, Path::new(FOLDER))?;
+            remove_folder(&folder, parent)?;
             remove_folder(&metadata, Path::new(METADATA))?;
             let keys = Path::new("/metadata/vold/metadata_encryption/dsu");
             remove_folder(&keys.join(&slot), keys)?;
@@ -300,6 +312,49 @@ mod sys {
     fn check_folder(path: &Path, parent: &Path) -> Result<()> {
         ensure!(path.parent() == Some(parent), "an Android folder is outside its expected parent");
         ensure!(fs::canonicalize(path)? == fs::canonicalize(parent)?.join(path.file_name().context("the Android folder has no name")?), "the Android folder redirects elsewhere");
+        Ok(())
+    }
+
+    fn absent_or_empty(path: &Path) -> Result<bool> {
+        match fs::read_dir(path) {
+            Ok(mut entries) => {
+                check_folder(path, path.parent().context("the Android folder has no parent")?)?;
+                Ok(entries.next().transpose()?.is_none())
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    /// Android 12's closeInstall writes only the completion marker and
+    /// leaves the last partition open. Unlike newer services it does not
+    /// create a disabled installation. Publish that native state directly;
+    /// enabling and then disabling would briefly select the second system.
+    fn record_disabled(root: &Path, slot: &str, folder: &Path) -> Result<()> {
+        let owned = root.join(slot);
+        ensure!(fs::read_to_string(owned.join("complete"))? == "OK", "the Android image service did not complete the installation");
+        let saved = fs::read_to_string(owned.join("install_dir"))?;
+        ensure!(Path::new(saved.trim()) == folder, "the Android image service completed a different directory");
+        ensure!(!root.join("install_status").try_exists()?, "an Android boot status appeared while finishing the install");
+        for (name, value) in [("active", slot), ("install_status", "disabled")] {
+            use std::io::Write;
+            let mut file = tempfile::NamedTempFile::new_in(root)?;
+            file.as_file().set_permissions(fs::Permissions::from_mode(0o644))?;
+            file.write_all(value.as_bytes())?;
+            file.as_file().sync_all()?;
+            file.persist(root.join(name)).map_err(|error| error.error)?;
+            File::open(root)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn finish_disabled(client: &Client, installed: &Installed) -> Result<()> {
+        client.finish()?;
+        if !client.installed()? {
+            client.cancel()?;
+            record_disabled(Path::new(METADATA), &installed.slot(), &installed.folder())?;
+        }
+        ensure!(client.installed()? && client.active()? == installed.slot() && !client.enabled()? && !client.busy()?, "the Android image service did not finish in the main-system boot state");
         Ok(())
     }
 
@@ -329,37 +384,38 @@ mod sys {
     }
 
     pub fn matches(client: &Client, recorded: &Installed) -> Result<bool> {
-        Ok(client.installed()? && client.active()? == recorded.manifest.slot())
+        Ok(client.installed()? && client.active()? == recorded.slot())
     }
 
-    pub fn room(package: &Path, manifest: &Manifest) -> Result<u64> {
-        let compatibility = super::compat::extra_space(package, manifest)?;
-        Ok(crate::install::free()?.saturating_sub(manifest.bytes() + compatibility + skyward_block::size_bytes(Path::new(skyward_block::BY_NAME).join("super"))? + (1 << 30)))
+    pub fn room(manifest: &Manifest) -> Result<u64> {
+        Ok(crate::install::free()?.saturating_sub(manifest.bytes() + skyward_block::size_bytes(Path::new(skyward_block::BY_NAME).join("super"))? + (1 << 30)))
     }
 
     /// Install into Android's image service, leaving the main system selected.
     /// An incomplete record is saved before the first allocation, and retained
     /// if cleanup fails, so a subsequent Recovery can remove the partial slot.
     pub fn install(package: &Path, manifest: &Manifest, userdata: u64, progress: &mut dyn FnMut(Step) -> Result<()>) -> Result<()> {
-        ensure!(skyward_sys::prop("ro.product.device").as_deref() == Some(manifest.device.as_str()), "the Android package is for a different device");
-        ensure!(userdata >= 8_000_000_000 && userdata.is_multiple_of(4096), "the independent Android data space must be at least 8 GB and block aligned");
         let mut zip = ZipArchive::new(File::open(package)?)?;
         ensure!(read(&mut zip)? == *manifest, "the Android package description changed");
+        ensure!(skyward_sys::prop("ro.product.device").as_deref() == Some(manifest.device.as_str()), "the Android package is for a different device");
+        ensure!(userdata >= 8_000_000_000 && userdata.is_multiple_of(4096), "the independent Android data space must be at least 8 GB and block aligned");
         crate::install::writable(|| {
             use crate::state::{State, PATH};
             let path = Path::new(PATH);
             let mut state = State::load(path)?;
             ensure!(state.system.is_none() && state.android.is_none() && state.occupied.is_none() && state.switching.is_none(), "a second system or unfinished switch exists already");
             ensure!(skyward_vab::snapshot_state()? == skyward_vab::SnapshotState::None, "finish the installed system's update before installing");
-            ensure!(userdata <= room(package, manifest)?, "there is not enough free space for the Android images and independent data");
+            ensure!(userdata <= room(manifest)?, "there is not enough free space for the Android images and independent data");
             let client = Client::open()?;
             ensure!(!client.installed()? && !client.busy()?, "Android already has an installed or unfinished dynamic system");
-            let folder = Path::new(FOLDER).join(manifest.slot());
-            let metadata = Path::new(METADATA).join(manifest.slot());
-            ensure!(!folder.try_exists()? && !metadata.try_exists()?, "an unrecorded Android slot already exists; it has not been overwritten");
+            // The stock Android 12 service rejects named children of this
+            // directory. Its default slot works on newer services too.
+            let folder = Path::new(FOLDER);
+            let metadata = Path::new(METADATA).join("dsu");
+            ensure!(absent_or_empty(folder)? && !metadata.try_exists()?, "an unrecorded Android slot already exists; it has not been overwritten");
             let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
             state.android = Some(Installed {
-                manifest: manifest.clone(), userdata, enabled: false, starts: false, complete: false,
+                manifest: manifest.clone(), default_slot: true, userdata, enabled: false, starts: false, complete: false,
                 boot: crate::install::sum_of(&crate::store::partition(Path::new(skyward_block::BY_NAME), "boot", slot))?,
                 vendor_boot: crate::install::sum_of(&crate::store::partition(Path::new(skyward_block::BY_NAME), "vendor_boot", slot))?,
                 dtbo: crate::install::sum_of(&crate::store::partition(Path::new(skyward_block::BY_NAME), "dtbo", slot))?,
@@ -367,68 +423,97 @@ mod sys {
             state.save(path)?;
             let made = (|| -> Result<()> {
                 prepare()?;
-                let vendor = super::compat::vendor(manifest)?;
-                let vendor_size = vendor.as_ref().map_or(0, |p| p.size);
-                let total = manifest.bytes() + vendor_size;
-                fs::create_dir_all(&folder)?;
+                let total = manifest.bytes();
+                fs::create_dir_all(folder)?;
                 fs::create_dir_all(&metadata)?;
-                client.begin(&manifest.slot())?;
+                client.begin(folder)?;
                 progress(Step::Allocating { done: 0, total: userdata + total })?;
                 client.partition("userdata", userdata, false)?;
                 client.close_partition()?;
                 let mut allocated = userdata;
-                let mut allocation_total = userdata + total;
+                let allocation_total = userdata + total;
                 let mut written = 0;
                 for (name, image) in &manifest.images {
                     let offset = zip.by_name(&format!("{name}.img"))?.data_start().context("the image has no data offset")?;
-                    let converted = super::compat::prepare(manifest, name, package, offset, image.size)?;
-                    let size = converted.as_ref().map_or(image.size, |p| p.size);
-                    allocation_total += size.saturating_sub(image.size);
+                    let size = image.size;
                     progress(Step::Allocating { done: allocated, total: allocation_total })?;
                     client.partition(name, size, true)?;
                     allocated += size;
-                    let mut original = File::open(package)?;
-                    original.seek(SeekFrom::Start(offset))?;
-                    let file = converted.as_ref().map_or(&original, |p| &p.file);
+                    let mut file = File::open(package)?;
+                    file.seek(SeekFrom::Start(offset))?;
                     let mut left = size;
                     while left > 0 {
-                        let credit = ((size - left) as u128 * image.size as u128 / size as u128) as u64;
-                        progress(Step::Writing { done: written + credit, total })?;
+                        progress(Step::Writing { done: written + size - left, total })?;
                         let bytes = left.min(16 << 20);
-                        client.stream(file, bytes)?;
+                        client.stream(&file, bytes)?;
                         left -= bytes;
                     }
                     client.close_partition()?;
                     written += image.size;
                 }
-                if let Some(vendor) = &vendor {
-                    progress(Step::Allocating { done: allocated, total: allocation_total })?;
-                    client.partition("vendor", vendor.size, true)?;
-                    let mut left = vendor.size;
-                    while left > 0 {
-                        progress(Step::Writing { done: written, total })?;
-                        let bytes = left.min(16 << 20);
-                        client.stream(&vendor.file, bytes)?;
-                        left -= bytes;
-                        written += bytes;
-                    }
-                    client.close_partition()?;
-                }
                 progress(Step::Writing { done: written, total })?;
                 progress(Step::Finishing)?;
-                client.finish()?;
-                ensure!(client.installed()? && client.active()? == manifest.slot() && !client.enabled()?, "the Android image service did not finish in the main-system boot state");
+                finish_disabled(&client, state.android.as_ref().expect("recorded above"))?;
                 state.android.as_mut().expect("recorded above").complete = true;
                 state.save(path)
             })();
             if let Err(error) = made {
-                return match client.remove(manifest) {
+                return match client.remove(state.android.as_ref().expect("recorded above")) {
                     Ok(()) => { state.android = None; state.save(path)?; Err(error) }
                     Err(cleanup) => Err(error.context(format!("the incomplete install remains recorded for removal: {cleanup:#}"))),
                 };
             }
             Ok(())
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_default_slot_never_reuses_unrecorded_images_or_redirected_folders() {
+            let work = tempfile::tempdir().unwrap();
+            let folder = work.path().join("dsu");
+            assert!(absent_or_empty(&folder).unwrap());
+            fs::create_dir(&folder).unwrap();
+            assert!(absent_or_empty(&folder).unwrap());
+            fs::write(folder.join("userdata_gsi.img"), b"existing data").unwrap();
+            assert!(!absent_or_empty(&folder).unwrap());
+            fs::remove_file(folder.join("userdata_gsi.img")).unwrap();
+            fs::create_dir(folder.join("skyward-older-install")).unwrap();
+            assert!(!absent_or_empty(&folder).unwrap());
+            let redirected = work.path().join("redirected");
+            std::os::unix::fs::symlink(&folder, &redirected).unwrap();
+            assert!(absent_or_empty(&redirected).is_err());
+        }
+
+        #[test]
+        fn an_old_service_completion_is_recorded_disabled_without_enabling_a_boot() {
+            let work = tempfile::tempdir().unwrap();
+            let owned = work.path().join("dsu");
+            let folder = Path::new("/data/gsi/dsu");
+            fs::create_dir(&owned).unwrap();
+            assert!(record_disabled(work.path(), "dsu", folder).is_err());
+            assert!(!work.path().join("active").exists());
+            assert!(!work.path().join("install_status").exists());
+            fs::write(owned.join("complete"), "OK").unwrap();
+            fs::write(owned.join("install_dir"), "/data/gsi/dsu/another/").unwrap();
+            assert!(record_disabled(work.path(), "dsu", folder).is_err());
+            assert!(!work.path().join("install_status").exists());
+            fs::write(owned.join("install_dir"), "/data/gsi/dsu/").unwrap();
+            record_disabled(work.path(), "dsu", folder).unwrap();
+            assert_eq!(fs::read_to_string(work.path().join("active")).unwrap(), "dsu");
+            assert_eq!(fs::read_to_string(work.path().join("install_status")).unwrap(), "disabled");
+            for name in ["active", "install_status"] {
+                assert_eq!(fs::metadata(work.path().join(name)).unwrap().permissions().mode() & 0o777, 0o644);
+            }
+            // Repeating completion cannot replace a boot selection made
+            // since the previous installation finished.
+            fs::write(work.path().join("install_status"), "ok").unwrap();
+            assert!(record_disabled(work.path(), "dsu", folder).is_err());
+            assert_eq!(fs::read_to_string(work.path().join("install_status")).unwrap(), "ok");
+        }
     }
 }
 

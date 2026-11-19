@@ -429,6 +429,12 @@ fn conclude(done: Done, served: Result<Option<Fault>>, origin: Origin) -> Outcom
 fn install(ctx: &mut Context, size: u64) -> Result<Done> {
     let file = File::open(fuse::PACKAGE).context("open the package")?;
     let package = package::identify(BufReader::with_capacity(1 << 16, file))?;
+    let package = if ctx.options.second_system {
+        match package.for_second_system() {
+            Ok(package) => package,
+            Err(refusal) => return Ok(Done::Decided(Outcome::Refused(refusal))),
+        }
+    } else { package };
     let _ = kmsg(&format!("install: {}", describe(&package)));
     match package {
         Package::Update(update) => update_system(ctx, &update),
@@ -520,7 +526,7 @@ fn install_android(ctx: &Context, manifest: &skyward_systems::android::Manifest)
     }
     let client = android::Client::open()?;
     ensure!(!client.installed()? && !client.busy()?, "Android already has an installed or unfinished dynamic system");
-    let room = android::room(Path::new(fuse::PACKAGE), manifest)?;
+    let room = android::room(manifest)?;
     let sizes = skyward_systems::install::sizes(8_000_000_000, room);
     if sizes.is_empty() { return refused(Refusal::NoRoom { least: 8_000_000_000, room }); }
     if ctx.shared.cancelled() { return Ok(Done::Decided(Outcome::Cancelled)); }
@@ -608,6 +614,7 @@ fn describe(package: &Package) -> String {
 }
 
 fn update_system(ctx: &mut Context, update: &Update) -> Result<Done> {
+    ensure!(!ctx.options.second_system, "a second-system install cannot update the main system");
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
     if let Err(refusal) = package::check(update, &phone(slot)?) {
         return Ok(Done::Decided(Outcome::Refused(refusal)));

@@ -8,6 +8,9 @@ impl App {
         let l = self.state.lang;
         match action {
             Action::Open(s) => {
+                if s == Screen::Install {
+                    self.state.install_second_system = self.screen() == Screen::Systems;
+                }
                 if s == Screen::Search && self.screen() == Screen::Home {
                     // The bar moves up from where it stands unfolded: a
                     // page easing there for the keys gets there at once.
@@ -517,6 +520,7 @@ impl App {
                 }
             }
             Action::InstallDownloaded => {
+                self.state.install_second_system = false;
                 let name = self.state.newest().expect("the package installed is the newest system's").name.clone();
                 let Have::Whole(size) = self.state.have else { unreachable!("only a whole package is offered to install") };
                 return self.install_file(Place::Storage, format!("{DOWNLOADS}/{name}"), size, now);

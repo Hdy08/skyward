@@ -13,9 +13,6 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { version = "4.5.51", features = ["derive"] }
 hex = { workspace = true }
-serde = { workspace = true }
-toml = { workspace = true }
-zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # Reads the filesystem of a partition where it lies in a package, through
 # whatever gives it the partition's bytes.
 rust-fs-core = "0.4.4"

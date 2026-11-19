@@ -865,7 +865,9 @@ pub fn install(cx: &Ctx) -> Frame {
     }
     if let Some(s) = i.slot {
         let (slot, other) = (s.letter(), s.other().letter());
-        let detail = tr!(l, "{slot}，系统更新将安装到槽位 {other}", "{slot}，系統更新將安裝到槽位 {other}", "{slot}, and a system update installs to slot {other}");
+        let detail = if cx.state.install_second_system { slot.to_string() } else {
+            tr!(l, "{slot}，系统更新将安装到槽位 {other}", "{slot}，系統更新將安裝到槽位 {other}", "{slot}, and a system update installs to slot {other}")
+        };
         facts.push((l.pick(CURRENT_SLOT), detail));
     }
     let ways = l.pick(["安装方式", "安裝方式", "Ways to install"]);
@@ -908,7 +910,11 @@ pub fn install(cx: &Ctx) -> Frame {
     let from_usb = Action::Open(Screen::Choose(Place::UsbDrive));
     let mut out = hits(&methods.rows[methods.rows.len() - 3..], &[from_storage, from_usb, Action::Sideload]);
     // A phone that can hold a second system installs one from here too.
-    let what = l.pick(match cx.state.dual_boot {
+    let what = l.pick(if cx.state.install_second_system { [
+        "选择准备好的 DSU 或 Linux 第二系统安装包，安装到 data 分区中的独立空间。",
+        "選擇準備好的 DSU 或 Linux 第二系統安裝檔，安裝到 data 分割區中的獨立空間。",
+        "Choose a prepared DSU or Linux second-system package to install in independent space in the data partition.",
+    ] } else { match cx.state.dual_boot {
         true => [
             "支持安装 A/B 完整更新包、带安装脚本的刷机包和第二系统的安装包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分区镜像。系统更新将安装到另一个槽位，重启后从该槽位启动；第二系统安装在 data 分区中，可在「双系统」中切换。选择文件时仅列出文件夹以及 .zip、.img 文件。",
             "支援安裝 A/B 完整更新檔、帶有安裝指令碼的刷機包和第二系統的安裝檔，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分割區映像檔。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動；第二系統安裝在 data 分割區中，可在「雙系統」中切換。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
@@ -919,7 +925,7 @@ pub fn install(cx: &Ctx) -> Frame {
             "支援安裝 A/B 完整更新檔和帶有安裝指令碼的刷機包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分割區映像檔。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
             "Installs A/B full OTA packages and flashable zips with an install script, and flashes boot, init_boot, vendor_boot, recovery, dtbo and vbmeta partition images. A system update installs to the other slot, which starts after a reboot. Choosing a file lists only folders and .zip and .img files.",
         ],
-    });
+    } });
     let y = widgets::footnote(&mut c, t, f, methods.bottom, what);
     let y = widgets::section(&mut c, t, f, y, l.pick(["选项", "選項", "Options"]));
     let check = Row::new(l.pick(["验证刷机包签名", "驗證刷機包簽章", "Verify zip signatures"])).trail(Trail::Switch(cx.state.check_signature));
@@ -927,7 +933,7 @@ pub fn install(cx: &Ctx) -> Frame {
     out.extend(hits(&signature.rows, &[Action::Toggle(Switch::Signature)]));
     let note = l.pick(["开启后，仅安装带有本机官方签名的刷机包。", "開啟後，僅安裝帶有本機官方簽章的刷機包。", "When on, only zips signed with this phone's official keys install."]);
     let mut y = widgets::footnote(&mut c, t, f, signature.bottom, note);
-    if cx.state.recovery_partitions {
+    if cx.state.recovery_partitions && !cx.state.install_second_system {
         let row = Row::new(l.pick(["自动重新刷入 Skyward", "自動重新刷入 Skyward", "Flash Skyward again"])).trail(Trail::Switch(cx.state.keep_recovery));
         let options = widgets::list(&mut c, t, f, y + t.m.card_gap, &[row]);
         out.extend(hits(&options.rows, &[Action::Toggle(Switch::KeepRecovery)]));
@@ -938,7 +944,8 @@ pub fn install(cx: &Ctx) -> Frame {
         ]);
         y = widgets::footnote(&mut c, t, f, options.bottom, note);
     }
-    Frame::new(t, fit(c, t, y), out, l.pick(["安装", "安裝", "Install"]), top)
+    let title = if cx.state.install_second_system { ["安装第二系统", "安裝第二系統", "Install a second system"] } else { ["安装", "安裝", "Install"] };
+    Frame::new(t, fit(c, t, y), out, l.pick(title), top)
 }
 
 const SECURITY_PATCH: Text = ["安全补丁", "安全性修補程式", "Security patch"];

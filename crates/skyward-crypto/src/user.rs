@@ -53,8 +53,8 @@ pub struct Protector {
     /// What the secret that opens the blob takes besides what the user
     /// knows.
     pub bound: Bound,
-    /// What the phone recorded about the screen lock the user set, where
-    /// one is set. A user who has set none has nothing recorded.
+    /// What the phone recorded about its credential. Older Android also
+    /// keeps a record when no screen lock is set, with kind `Lock::NONE`.
     pub lock: Option<Lock>,
 }
 
@@ -117,6 +117,12 @@ impl Lock {
     pub const PIN: i32 = 3;
     pub const PASSWORD: i32 = 4;
 
+    /// Older Android records a passwordless protector in a `.pwd` file
+    /// too. Its presence alone does not mean the user has a screen lock.
+    pub fn needs_credential(&self) -> bool {
+        self.kind != Self::NONE
+    }
+
     /// Read what the phone recorded. The numbers in it are written in the
     /// order the network uses, which is what the phone's own writer does.
     pub fn of(raw: &[u8]) -> Result<Lock> {
@@ -131,6 +137,10 @@ impl Lock {
     /// Stretch what the user typed into the secret the rest of this works
     /// from. The work is deliberately slow, and the phone chose how slow.
     pub fn stretched(&self, credential: &[u8]) -> Result<Vec<u8>> {
+        // A passwordless protector with a record uses scrypt on the
+        // default password and its recorded salt. Newer protectors with
+        // no record use `stretched_without_credential` instead.
+        let credential = if self.needs_credential() { credential } else { NO_CREDENTIAL };
         let [log_n, log_r, log_p] = self.cost;
         let cost = scrypt::Params::new(log_n, 1 << log_r, 1 << log_p, STRETCHED_BYTES)
             .map_err(|e| anyhow::anyhow!("the phone asks for stretching this code cannot do: {e}"))?;
@@ -402,6 +412,19 @@ mod tests {
         assert_eq!(lock.cost, [11, 3, 1]);
         assert_eq!(lock.salt, vec![0xCD; 16]);
         assert_eq!(lock.enrolled, vec![0xAB; 58]);
+    }
+
+    #[test]
+    fn a_passwordless_record_uses_the_legacy_default_password_and_its_salt() {
+        let lock = Lock::of(&recorded(Lock::NONE, &[0xCD; 16], &[0xAB; 58])).unwrap();
+        assert!(!lock.needs_credential());
+        // Python hashlib.scrypt(default-password, salt=cd*16,
+        // n=2048, r=8, p=2, dklen=32), independent of this implementation.
+        assert_eq!(hex::encode(lock.stretched(&[]).unwrap()), "cf8b040fa463a150629b66dfd6d283ca0d8eb6a96206078b9129ed09f31cc388");
+        assert_ne!(lock.stretched(&[]).unwrap(), stretched_without_credential());
+        for kind in [Lock::PATTERN, 2, Lock::PIN, Lock::PASSWORD] {
+            assert!(Lock::of(&recorded(kind, &[0xCD; 16], &[0xAB; 58])).unwrap().needs_credential());
+        }
     }
 
     #[test]

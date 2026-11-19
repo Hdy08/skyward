@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 mod avb;
 mod base;
 mod described;
-mod android;
 
 use skyward_bootimg::{BootImage, Ramdisk};
 
@@ -23,18 +22,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Prepare an official full OTA as a separate Android system package.
-    /// Uses the phone's installed kernel, vendor and firmware.
-    AndroidSystem {
-        #[arg(long)]
-        package: PathBuf,
-        #[arg(long)]
-        config: PathBuf,
-        #[arg(long)]
-        out: PathBuf,
-        #[arg(long)]
-        id: Option<String>,
-    },
     /// Print an image's header and the files in its ramdisk.
     List { image: PathBuf },
     /// Write one ramdisk file to stdout.
@@ -122,7 +109,6 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::AndroidSystem { package, config, out, id } => android::prepare(&package, &config, &out, id.as_deref()),
         Cmd::List { image } => list(&image),
         Cmd::Cat { image, path } => {
             let rd = Ramdisk::decode(&BootImage::read(&image)?.ramdisk)?;

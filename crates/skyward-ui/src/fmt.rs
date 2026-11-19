@@ -1089,6 +1089,11 @@ pub fn refusal(l: Lang, r: &Refusal, codename: &str, source: Source, _zone: usiz
                 "The system asked for another system to be installed, which only goes in by hand on this phone.",
             ])
             .into(),
+        Refusal::SystemPackage => l.pick([
+            "请选择准备好的 DSU 或 Linux 第二系统安装包。",
+            "請選擇準備好的 DSU 或 Linux 第二系統安裝檔。",
+            "Choose a prepared DSU or Linux second-system package.",
+        ]).into(),
         Refusal::DataClosed => l
             .pick([
                 "另一个系统将安装在 data 分区中，请先完成「解密」。",

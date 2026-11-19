@@ -37,6 +37,9 @@ pub struct State {
     /// How far the swipe-to-confirm knob is dragged, 0 to 1.
     pub confirm: f32,
     pub install: Install,
+    /// The install page was opened from Dual boot, including retries and
+    /// sideload. This choice is passed to the installer before it reads a package.
+    pub install_second_system: bool,
     /// Where the package being installed comes from.
     pub source: Source,
     /// The name of the file being installed, when it is one on the phone.
@@ -202,6 +205,7 @@ impl Default for State {
             pattern: Vec::new(),
             confirm: 0.0,
             install: Install::Idle,
+            install_second_system: false,
             source: Source::Computer,
             package_name: None,
             script_output: Vec::new(),

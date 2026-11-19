@@ -1023,7 +1023,7 @@ fn detach(services: Vec<Service>) -> Detach {
 /// on a phone that has them, and checks a zip's signature before its
 /// install script runs.
 fn install_options(app: &App) -> Options {
-    Options { keep: app.state.keep_recovery && app.state.recovery_partitions, signed: app.state.check_signature }
+    Options { second_system: app.state.install_second_system, keep: app.state.keep_recovery && app.state.recovery_partitions, signed: app.state.check_signature }
 }
 
 /// How often the WLAN page scans while it shows.
@@ -1281,7 +1281,7 @@ impl<'a> Pages<'a> {
         let mut unread = Untaken::default();
         let battery = skyward_info::battery_now();
         untaken(&mut unread.battery, "the battery", battery.as_ref().err())?;
-        let info = skyward_info::collect_with(cfg, battery.unwrap_or_default())?;
+        let mut info = skyward_info::collect_with(cfg, battery.unwrap_or_default())?;
         let fonts = Fonts::load(font, 0, mono)?;
         // A foldable's configured upright dimensions let its first page,
         // fonts and canvas cache be prepared while the boot logo remains.
@@ -1420,6 +1420,18 @@ impl<'a> Pages<'a> {
             if let Some(monitor) = &fold_monitor { wait(&[monitor.fd()], 2500)?; }
             skyward_sys::kmsg("fold display: first-frame resources ready; taking over the boot display")?;
         }
+        // Select the first panel before parking either one. In particular,
+        // an unfolded boot must not rest the inner touch controller and
+        // immediately send it a resume while its suspend is still queued.
+        let mut unfolded = false;
+        if let Some(monitor) = &fold_monitor {
+            for state in monitor.events() {
+                match state {
+                    Ok(folded) => unfolded = !folded,
+                    Err(error) => skyward_sys::kmsg(&format!("fold sensor: {error}"))?,
+                }
+            }
+        }
         let mut surface = match surface {
             Some(surface) => surface,
             None => KmsSurface::open_panel("/dev/dri/card0", cfg.display.connector.as_deref(), cfg.display.rotation)?,
@@ -1428,8 +1440,22 @@ impl<'a> Pages<'a> {
         if let Some(fold) = &cfg.fold {
             Backlight::open(&cfg.display)?.show(None)?;
             Backlight::open(&fold.display)?.show(None)?;
-            surface.prepare_panel(fold.display.connector.as_deref().context("a foldable panel has a connector")?, fold.display.rotation)?;
+            surface.prepare_panel(fold.display.connector.as_deref().context("a foldable panel has a connector")?, fold.display.rotation, unfolded)?;
             skyward_sys::kmsg("fold display: the inactive panel's boot splash is cleared and its display rests")?;
+        }
+        let (display, touch) = if unfolded {
+            let fold = cfg.fold.as_ref().context("an unfolded state without a foldable display")?;
+            (&fold.display, &fold.touch)
+        } else {
+            (&cfg.display, &cfg.touch)
+        };
+        let (w, h) = surface.size();
+        if unfolded {
+            app.resize(w, h, display.density as f32 / 160.0, monotonic_ms());
+            app.set_screen_corners(display.corner_radius as f32);
+            screen = Canvas::new(w, h);
+            info.panel = Some((w, h));
+            info.screen = display.diagonal;
         }
         // A controller following a rested panel must be woken before its
         // settings are written, including when the UI service runs again.
@@ -1438,10 +1464,10 @@ impl<'a> Pages<'a> {
             surface.present(&Canvas::new(w, h))?;
             surface.settle()?;
         }
-        eprintln!("display {}", surface.describe());
-        let inputs = Inputs::open(w, h, cfg.touch.writes.clone(), cfg.touch.name.clone())?;
+        skyward_sys::kmsg(&format!("initial display: {} — {}", if unfolded { "open" } else { "closed" }, surface.describe()))?;
+        let inputs = Inputs::open(w, h, touch.writes.clone(), touch.name.clone())?;
         let started = Instant::now();
-        let backlight = Backlight::open(&cfg.display)?;
+        let backlight = Backlight::open(display)?;
         Ok(Pages {
             cfg,
             programs,
@@ -1454,7 +1480,7 @@ impl<'a> Pages<'a> {
             screen,
             inputs,
             fold: fold_monitor,
-            unfolded: false,
+            unfolded,
             started,
             touch_known: false,
             control,

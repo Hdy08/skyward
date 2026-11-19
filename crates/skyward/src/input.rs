@@ -10,6 +10,9 @@ use std::fs;
 use std::io::{self, ErrorKind};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+const RETRY: Duration = Duration::from_secs(1);
 
 pub enum Event {
     /// A touch and when the panel reported it, on [`monotonic_ms`]'s clock.
@@ -82,6 +85,8 @@ struct Panel {
     /// The kernel dropped events that were not read in time; what arrives
     /// up to the next report is incomplete.
     dropped: bool,
+    /// Log the first report carrying a finger, without its coordinates.
+    reported: bool,
 }
 
 impl Panel {
@@ -109,12 +114,12 @@ impl Panel {
         }
         set_nonblocking(dev.as_raw_fd()).context("make touch non-blocking")?;
         let mut panel =
-            Panel { dev, path, x_range, y_range, slots, slot: 0, down: false, was_down: false, raw: (0, 0), moved: false, dropped: false };
+            Panel { dev, path, x_range, y_range, slots, slot: 0, down: false, was_down: false, raw: (0, 0), moved: false, dropped: false, reported: false };
         // The kernel drops a position equal to the one a slot already holds,
         // so a touch landing where the last one lifted carries no position;
         // start from what the panel holds now.
         panel.resync().context("read the touch state")?;
-        eprintln!("touch {:?}: x {:?} y {:?}, {slots} slots, slot 0 at {:?}", panel.dev.name().unwrap_or("?"), x_range, y_range, panel.raw);
+        skyward_sys::kmsg(&format!("touch {} {:?}: x {:?} y {:?}, {slots} slots", panel.path.display(), panel.dev.name().unwrap_or("?"), x_range, y_range))?;
         Ok(panel)
     }
 
@@ -143,6 +148,10 @@ impl Panel {
                 EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
                     if std::mem::take(&mut self.dropped) {
                         self.resync()?;
+                    }
+                    if self.down && !self.reported {
+                        self.reported = true;
+                        let _ = skyward_sys::kmsg(&format!("touch {} {:?}: first contact received", self.path.display(), self.dev.name().unwrap_or("?")));
                     }
                     let time = e.as_ref().time;
                     let at = time.tv_sec as u64 * 1000 + time.tv_usec as u64 / 1000;
@@ -187,6 +196,7 @@ pub struct Inputs {
     panel: Option<Panel>,
     buttons: Vec<(PathBuf, RawDevice)>,
     seen: HashSet<PathBuf>,
+    scanned_at: Instant,
     /// What the touchscreen is told each time its panel is taken in.
     touch_writes: Vec<Write>,
     touch_name: Option<String>,
@@ -204,7 +214,7 @@ impl Inputs {
         let dir = CString::new("/dev/input")?;
         // IN_ATTRIB too: ueventd sets a node's owner and mode right after
         // creating it, and the node may only open once that is done.
-        if unsafe { libc::inotify_add_watch(fd, dir.as_ptr(), libc::IN_CREATE | libc::IN_ATTRIB) } < 0 {
+        if unsafe { libc::inotify_add_watch(fd, dir.as_ptr(), libc::IN_CREATE | libc::IN_ATTRIB | libc::IN_DELETE | libc::IN_MOVED_TO | libc::IN_MOVED_FROM) } < 0 {
             return Err(io::Error::last_os_error()).context("watch /dev/input");
         }
         let wakeful = Wakeful::new()?;
@@ -215,6 +225,7 @@ impl Inputs {
             panel: None,
             buttons: Vec::new(),
             seen: HashSet::new(),
+            scanned_at: Instant::now(),
             touch_writes,
             touch_name,
             w: w as f32,
@@ -222,7 +233,7 @@ impl Inputs {
         };
         inputs.scan()?;
         if inputs.panel.is_none() {
-            eprintln!("no touch panel yet; waiting for one to appear under /dev/input");
+            skyward_sys::kmsg(&format!("no touch panel {:?} yet; waiting under /dev/input", inputs.touch_name))?;
         }
         Ok(inputs)
     }
@@ -232,6 +243,7 @@ impl Inputs {
     /// power, volume or back key as buttons. A panel taken in is told what
     /// the device description writes to the touchscreen.
     fn scan(&mut self) -> Result<()> {
+        self.scanned_at = Instant::now();
         for (path, dev) in evdev::raw_stream::enumerate() {
             if !self.seen.insert(path.clone()) {
                 continue;
@@ -293,17 +305,19 @@ impl Inputs {
 
     /// Everything the devices have queued, as touches and key presses.
     pub fn read(&mut self) -> Result<Vec<Event>> {
-        if self.changed()? {
+        if self.changed()? || (self.panel.is_none() && self.scanned_at.elapsed() >= RETRY) {
             self.scan()?;
         }
         let mut out = Vec::new();
+        let mut panel_removed = false;
         if let Some(panel) = &mut self.panel {
             match panel.read(self.w, self.h, &mut out) {
                 Ok(()) => {}
                 Err(e) if gone(&e) => {
-                    eprintln!("input {}: removed", panel.path.display());
+                    skyward_sys::kmsg(&format!("touch {}: removed", panel.path.display()))?;
                     self.seen.remove(&panel.path);
                     self.panel = None;
+                    panel_removed = true;
                 }
                 Err(e) => return Err(e).context("read touch events"),
             }
@@ -334,6 +348,90 @@ impl Inputs {
             let (path, _) = self.buttons.remove(i);
             self.seen.remove(&path);
         }
+        // A replacement can have reused the same event path before the
+        // old handle reports ENODEV. The first scan still saw that path as
+        // owned; retry after dropping it rather than wait for another event
+        // that may never come.
+        if panel_removed {
+            self.scan()?;
+        }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evdev::uinput::VirtualDevice;
+    use evdev::{AbsInfo, AttributeSet, EventType, UinputAbsSetup};
+
+    /// Only this process's named virtual panel is selected. No events are
+    /// injected into either physical touchscreen or the running Recovery.
+    fn panel(name: &str) -> VirtualDevice {
+        let properties = AttributeSet::from_iter([PropType::DIRECT]);
+        let mut builder = VirtualDevice::builder().unwrap().name(name).with_properties(&properties).unwrap();
+        for (code, value, min, max) in [
+            (AbsoluteAxisCode::ABS_MT_SLOT, 0, 0, 9),
+            (AbsoluteAxisCode::ABS_MT_TRACKING_ID, -1, 0, 65535),
+            (AbsoluteAxisCode::ABS_MT_POSITION_X, 0, 0, 1000),
+            (AbsoluteAxisCode::ABS_MT_POSITION_Y, 0, 0, 1000),
+        ] {
+            builder = builder.with_absolute_axis(&UinputAbsSetup::new(code, AbsInfo::new(value, min, max, 0, 0, 0))).unwrap();
+        }
+        let mut panel = builder.build().unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            let path = panel.enumerate_dev_nodes_blocking().unwrap().next().and_then(Result::ok);
+            if path.is_some_and(|path| path.exists()) {
+                break;
+            }
+            assert!(Instant::now() < until, "ueventd did not create the virtual panel node");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panel
+    }
+
+    fn tap(panel: &mut VirtualDevice, inputs: &mut Inputs) {
+        panel.emit(&[
+            InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_MT_SLOT.0, 0),
+            InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, 12),
+            InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_MT_POSITION_X.0, 250),
+            InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_MT_POSITION_Y.0, 500),
+        ]).unwrap();
+        let events = inputs.read().unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::Touch(Touch::Down(x, y), _) if *x == 250.0 && *y == 500.0)));
+        panel.emit(&[InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_MT_TRACKING_ID.0, -1)]).unwrap();
+        assert!(inputs.read().unwrap().iter().any(|e| matches!(e, Event::Touch(Touch::Up, _))));
+    }
+
+    #[test]
+    #[ignore = "requires root and /dev/uinput on an Android test device"]
+    fn a_late_panel_is_found_even_if_its_notification_was_already_drained() {
+        let name = format!("skyward-late-touch-{}", std::process::id());
+        let mut inputs = Inputs::open(1000, 1000, Vec::new(), Some(name.clone())).unwrap();
+        assert!(!inputs.has_panel());
+        let mut device = panel(&name);
+        inputs.changed().unwrap();
+        inputs.scanned_at = Instant::now() - RETRY;
+        inputs.read().unwrap();
+        assert!(inputs.has_panel());
+        tap(&mut device, &mut inputs);
+    }
+
+    #[test]
+    #[ignore = "requires root and /dev/uinput on an Android test device"]
+    fn a_removed_panel_is_replaced_without_waiting_for_another_notification() {
+        let name = format!("skyward-replaced-touch-{}", std::process::id());
+        let device = panel(&name);
+        let mut inputs = Inputs::open(1000, 1000, Vec::new(), Some(name.clone())).unwrap();
+        assert!(inputs.has_panel());
+        drop(device);
+        let mut replacement = panel(&name);
+        // The watch was handled before the old evdev handle returned
+        // ENODEV. There need not be another notification after this one.
+        inputs.changed().unwrap();
+        inputs.read().unwrap();
+        assert!(inputs.has_panel());
+        tap(&mut replacement, &mut inputs);
     }
 }

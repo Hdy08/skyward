@@ -62,6 +62,9 @@ pub const SCRIPT_LOG: &str = "/skyward/run/install-script.log";
 /// What the screen asks of an install besides the package.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Options {
+    /// The package was chosen through Dual boot. It must install beside
+    /// the main system; an ordinary official OTA is refused on this route.
+    pub second_system: bool,
     /// This recovery goes back into the recovery partitions an install
     /// writes over.
     pub keep: bool,
@@ -232,6 +235,9 @@ pub enum Refusal {
     /// A system to install beside the installed one, which only someone
     /// at the screen installs, not the system.
     SystemAsked,
+    /// Dual boot accepts only a prepared second-system package, never an
+    /// OTA, script or partition image that could overwrite the main system.
+    SystemPackage,
     /// A system to install while the data partition, where its root goes,
     /// is not open.
     DataClosed,

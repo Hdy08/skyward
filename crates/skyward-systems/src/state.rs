@@ -230,10 +230,23 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("systems.toml");
         let manifest = Manifest { id: "hyperos".into(), name: "HyperOS".into(), version: "3".into(), device: "zizhan".into(), images: BTreeMap::from([("system".into(), Image { size: 4096, sha256: "ab".repeat(32) })]) };
-        let mut state = State { android: Some(Installed { manifest, userdata: 32_000_000_000, enabled: false, starts: false, complete: false, boot: "a".into(), vendor_boot: "b".into(), dtbo: "c".into() }), ..Default::default() };
+        let mut state = State { android: Some(Installed { manifest, default_slot: false, userdata: 32_000_000_000, enabled: false, starts: false, complete: false, boot: "a".into(), vendor_boot: "b".into(), dtbo: "c".into() }), ..Default::default() };
         state.save(&path).unwrap();
         assert_eq!(State::load(&path).unwrap(), state);
         assert_eq!(Who::named("hyperos", &state), Some(Who::Other));
+        // A record written before default-slot support keeps its named
+        // directory; new installs retain the stock Android 12 location.
+        let older = fs::read_to_string(&path).unwrap().replace("default_slot = false\n", "");
+        fs::write(&path, older).unwrap();
+        let old = State::load(&path).unwrap().android.unwrap();
+        assert_eq!(old.slot(), "skyward-hyperos");
+        assert_eq!(old.folder(), Path::new("/data/gsi/dsu/skyward-hyperos"));
+        state.android.as_mut().unwrap().default_slot = true;
+        state.save(&path).unwrap();
+        let default = State::load(&path).unwrap().android.unwrap();
+        assert_eq!(default.slot(), "dsu");
+        assert_eq!(default.folder(), Path::new("/data/gsi/dsu"));
+        assert_eq!(State::load(&path).unwrap(), state);
         state.occupied = Some("_a".into());
         assert!(state.save(&path).is_err());
         assert!(!State::load(&path).unwrap().android.unwrap().complete);

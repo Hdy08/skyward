@@ -2598,16 +2598,13 @@ dependencies = [
  "hex",
  "rust-fs-core",
  "rust-fs-erofs",
- "serde",
  "serde_json",
  "sha2 0.10.9",
  "skyward-bootimg",
  "skyward-config",
  "skyward-programs",
  "tempfile",
- "toml",
  "unpayload",
- "zip 8.6.0",
 ]
 
 [[package]]

@@ -203,15 +203,24 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
     let mut closed = Vec::new();
     let mut owner = Note::default();
     for user in open_users(service)? {
+        // MIUI 13 / older vold stores a passwordless CE key as
+        // `nopassword` in hardware, including after clearing a screen
+        // lock. Open it without depending on a synthetic-password blob.
+        if let Some(raw) = user_key(user)?.without_credential(service)? {
+            install_user_key(service, user, &raw)?;
+            continue;
+        }
         let protector = protector(user)?;
         match protector.lock {
-            None => {
+            Some(lock) if lock.needs_credential() => {
+                closed.push(Closed { user, lock: lock.kind, made_up: made_up(user, &protector.id), why: None });
+            }
+            _ => {
                 let note = open_user_files(service, user, None, None)?;
                 if user == OWNER {
                     owner = note;
                 }
             }
-            Some(lock) => closed.push(Closed { user, lock: lock.kind, made_up: made_up(user, &protector.id), why: None }),
         }
     }
     Ok(Opening { mounted, closed: open_made_up(service, closed, &owner) })
@@ -354,8 +363,8 @@ fn protector(user: u32) -> Result<crate::user::Protector> {
             ),
         },
     };
-    // A user who has set a screen lock has what the phone recorded about
-    // it beside the blob; a user who has set none has nothing there.
+    // Older Android also leaves a record with kind NONE when the user
+    // has no screen lock. Keep its salt and enrolment for that format.
     let recorded = dir.join(format!("{id}.pwd"));
     let lock = match recorded.exists() {
         true => Some(crate::user::Lock::of(
@@ -460,11 +469,14 @@ fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owne
     let protector = protector(user)?;
     let stretched = match &protector.lock {
         Some(lock) => {
-            let typed = match made_up_credential(service, user, &protector.id, owner)? {
-                Some(made_up) => made_up,
-                None => credential
-                    .with_context(|| format!("user {user} has set a screen lock, and their files do not open without it"))?
-                    .to_vec(),
+            let typed = match lock.needs_credential() {
+                false => Vec::new(),
+                true => match made_up_credential(service, user, &protector.id, owner)? {
+                    Some(made_up) => made_up,
+                    None => credential
+                        .with_context(|| format!("user {user} has set a screen lock, and their files do not open without it"))?
+                        .to_vec(),
+                },
             };
             lock.stretched(&typed).context("stretch the credential")?
         }
@@ -507,20 +519,32 @@ fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owne
     let synthetic_password = crate::user::open_inner(&secret, &inner)?;
     let file_secret = crate::user::file_secret(&synthetic_password);
 
+    let raw = user_key(user)?.unwrap(Unwrap::<KeyMint>::Secret(&file_secret)).with_context(|| format!("unwrap user {user}'s file key"))?;
+    install_user_key(service, user, &raw)?;
+    secret_note(user, &synthetic_password)
+}
+
+/// The current key for a user's own files. Recovery reads it in place;
+/// it does not change which of vold's key directories is current.
+fn user_key(user: u32) -> Result<StoredKey> {
+    let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
+    StoredKey::load(&dir).with_context(|| format!("read the key in {}", dir.display()))
+}
+
+/// Let a recovered CE key into the filesystem, using the same hardware
+/// wrapping for both the passwordless and credential-bound formats.
+fn install_user_key(service: &KeyMint, user: u32, raw: &[u8]) -> Result<()> {
     let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
     let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
-    let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
-    let stored = StoredKey::load(&dir).with_context(|| format!("read the key in {}", dir.display()))?;
-    let raw = stored.unwrap(Unwrap::<KeyMint>::Secret(&file_secret)).with_context(|| format!("unwrap the key in {}", dir.display()))?;
     let raw = match wrapped {
-        true => service.ephemeral_storage_key(&raw).with_context(|| format!("make the key in {} usable now", dir.display()))?,
-        false => raw,
+        true => service.ephemeral_storage_key(raw).with_context(|| format!("make user {user}'s file key usable now"))?,
+        false => raw.to_vec(),
     };
     crate::fscrypt::add_key(Path::new(MOUNT), &raw, wrapped)?;
     if user == OWNER {
         show_owner_storage()?;
     }
-    secret_note(user, &synthetic_password)
+    Ok(())
 }
 
 /// What the secure world wrote for a user's own secret, which is what the

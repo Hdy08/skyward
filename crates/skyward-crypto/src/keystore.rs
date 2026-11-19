@@ -117,6 +117,16 @@ impl StoredKey {
         service.authorizations(blob, &self.app_id(&[]))
     }
 
+    /// Older vold keeps a passwordless user's CE key in hardware, marked
+    /// `nopassword`, before any synthetic-password protector is needed.
+    /// A key that requires a secret is left for the credential path.
+    pub fn without_credential<K: Decryptor>(&self, service: &K) -> Result<Option<Vec<u8>>> {
+        if !matches!(self.stretching, Stretching::NoPassword) {
+            return Ok(None);
+        }
+        self.unwrap(Unwrap::Hardware(service)).map(Some)
+    }
+
     /// The key itself.
     pub fn unwrap<K: Decryptor>(&self, how: Unwrap<K>) -> Result<Vec<u8>> {
         if self.encrypted.len() < NONCE_BYTES + TAG_BYTES {
@@ -253,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn an_android_13_passwordless_hardware_key_uses_its_secdiscardable_binding() {
+    fn a_legacy_passwordless_ce_key_opens_in_hardware_without_a_protector() {
         struct Hardware;
         impl Decryptor for Hardware {
             fn gcm_decrypt(&self, blob: &[u8], app_id: &[u8], nonce: &[u8], body: &[u8]) -> Result<Vec<u8>> {
@@ -272,7 +282,11 @@ mod tests {
         fs::write(dir.join(FN_ENCRYPTED_KEY), [vec![3; NONCE_BYTES], vec![7; TAG_BYTES + KEY_BYTES]].concat()).unwrap();
         let stored = StoredKey::load(&dir).unwrap();
         assert_eq!(stored.unwrap(Unwrap::Hardware(&Hardware)).unwrap(), vec![0xAB; KEY_BYTES]);
+        assert_eq!(stored.without_credential(&Hardware).unwrap(), Some(vec![0xAB; KEY_BYTES]));
+        assert!(stored.without_credential(&NoService).is_err(), "a hardware refusal must remain an error");
         assert_eq!(stored.app_id(b"not part of this binding"), stored.app_id(&[]));
+        fs::remove_file(dir.join(FN_KEY_BLOB)).unwrap();
+        assert!(StoredKey::load(&dir).unwrap().without_credential(&Hardware).is_err(), "a missing hardware key is not a software key");
     }
 
     #[test]
@@ -289,6 +303,7 @@ mod tests {
                 fs::write(dir.join(FN_STRETCHING), "none").unwrap();
             }
             let stored = StoredKey::load(&dir).unwrap();
+            assert_eq!(stored.without_credential(&NoService).unwrap(), None, "a secret-bound key must not open on the passwordless path");
             assert_eq!(stored.unwrap(Unwrap::<NoService>::Secret(b"the user's secret")).unwrap(), vec![0xAD; 64]);
             assert!(stored.unwrap(Unwrap::<NoService>::Secret(b"wrong secret")).is_err());
         }

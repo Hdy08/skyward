@@ -89,6 +89,7 @@ impl App {
         }
         let left = self.screen();
         match left {
+            Screen::Install => self.state.install_second_system = false,
             Screen::Mount => self.state.mount_failure = None,
             // A slot picked and not switched to is put down.
             Screen::Slot => self.state.next_slot = None,

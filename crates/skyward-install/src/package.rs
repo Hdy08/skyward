@@ -34,6 +34,17 @@ pub enum Package {
     Unknown,
 }
 
+impl Package {
+    /// Keep the destination chosen on the systems page. No fallback from
+    /// this route may invoke update_engine, a script, or a partition flash.
+    pub fn for_second_system(self) -> Result<Self, Refusal> {
+        match self {
+            package @ (Package::System(_) | Package::Android(_)) => Ok(package),
+            Package::Update(_) | Package::Image(_) | Package::Script | Package::Unknown => Err(Refusal::SystemPackage),
+        }
+    }
+}
+
 /// An A/B update package: the payload update_engine applies, where it
 /// starts in the zip, and the package's own description.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +236,21 @@ METADATA_SIZE=1024
     #[test]
     fn a_full_package_for_this_phone_is_accepted() {
         assert_eq!(check(&update_with(METADATA_TEXT, PROPERTIES_TEXT), &phone()), Ok(()));
+    }
+
+    #[test]
+    fn choosing_an_official_ota_for_dual_boot_never_routes_to_an_update() {
+        let bytes = zip_with(&[
+            (PAYLOAD, b"payload", CompressionMethod::Stored),
+            (PROPERTIES, PROPERTIES_TEXT.as_bytes(), CompressionMethod::Stored),
+            (METADATA, METADATA_TEXT.as_bytes(), CompressionMethod::Stored),
+        ]);
+        let normal = identify(Cursor::new(&bytes)).unwrap();
+        assert!(matches!(normal, Package::Update(_)), "the ordinary install entry still updates Android");
+        assert_eq!(normal.for_second_system(), Err(Refusal::SystemPackage), "an official OTA is not a prepared DSU package");
+        for package in [Package::Script, Package::Image(ImageKind::Dtbo), Package::Unknown] {
+            assert_eq!(package.for_second_system(), Err(Refusal::SystemPackage));
+        }
     }
 
     #[test]
