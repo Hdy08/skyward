@@ -68,8 +68,8 @@ pub struct Options {
     /// This recovery goes back into the recovery partitions an install
     /// writes over.
     pub keep: bool,
-    /// A zip with an install script runs only if it was signed with one of
-    /// the keys the phone's updates are signed with.
+    /// Verify script ZIP signatures and manually installed A/B payload
+    /// signatures with the phone's update keys.
     pub signed: bool,
 }
 

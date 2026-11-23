@@ -15,6 +15,8 @@ Hdy08 维护此分支，以及 OnePlus 13、Xiaomi MIX Fold 2 和 Nubia Z70 Ultr
 
 ## 功能
 
+长按电源键 0.5 秒打开重启页；开启振动时会振动一次。选择目标后仍需确认，刷写、恢复或清除等任务进行时忽略长按。
+
 ### 双系统
 
 ![一台手机可以安装两个系统](slides/zh-CN/out/01-dual-boot.png)
@@ -130,8 +132,8 @@ OTA 公共证书。构建与测试步骤见
 Skyward 需要已解锁的 bootloader。本分支的 [发布页](https://github.com/Hdy08/skyward/releases) 提供 OnePlus 13（`dodge`）、Xiaomi MIX Fold 2（`zizhan`）和 Nubia Z70 Ultra（`NX733J`）的安装包。其他原版机型请前往 [上游发布页](https://github.com/kirklin/skyward/releases)。下载对应机型的 ZIP，使用 `SHA256SUMS` 核对并解压。在 fastboot 模式下，将解压出的镜像刷入当前槽位的 recovery 分区。以下以 Xiaomi MIX Fold 2 为例：
 
 ```sh
-unzip skyward-v0.3.2-zizhan-OS3.0.8.0.VLRCNXM.zip
-fastboot flash recovery skyward-v0.3.2-zizhan-OS3.0.8.0.VLRCNXM.img
+unzip skyward-v0.3.3-zizhan-OS3.0.8.0.VLRCNXM.zip
+fastboot flash recovery skyward-v0.3.3-zizhan-OS3.0.8.0.VLRCNXM.img
 fastboot reboot recovery
 ```
 

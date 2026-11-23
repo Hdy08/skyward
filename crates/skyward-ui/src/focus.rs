@@ -81,7 +81,7 @@ pub fn spots(t: &Theme, frame: &Frame) -> Vec<Spot> {
     out.extend(page);
     if let Some(d) = &frame.dock {
         let mut dock: Vec<Spot> = d.hits.iter().map(|h| Spot { stop: Stop::Hit(h.action), group: Group::Dock, rect: h.rect }).collect();
-        dock.sort_by(across);
+        dock.sort_by(|a, b| a.rect.y.total_cmp(&b.rect.y).then(across(a, b)));
         out.extend(dock);
     }
     out

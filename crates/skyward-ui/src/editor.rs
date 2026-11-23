@@ -104,6 +104,31 @@ impl Editor {
         self.lines.join(if self.crlf { "\r\n" } else { "\n" })
     }
 
+    /// Rewrap for a new panel, keeping the file, cursor and visible text.
+    pub fn resize(&mut self, cols: usize, view: usize) {
+        if (cols, view) == (self.cols, self.view) {
+            return;
+        }
+        let (cursor, _) = self.cursor();
+        let follows = (self.top..self.top + self.view).contains(&cursor);
+        if self.cols != cols {
+            let (line, row) = self.line_of(self.top);
+            let at = breaks(&self.lines[line], self.cols)[row];
+            self.cols = cols;
+            for (rows, text) in self.rows.iter_mut().zip(&self.lines) {
+                *rows = breaks(text, cols).len();
+            }
+            self.top = self.first_row(line) + breaks(&self.lines[line], cols).partition_point(|&s| s <= at) - 1;
+            self.tail = false;
+            self.goal = None;
+        }
+        self.view = view;
+        if follows {
+            self.follow();
+        }
+        self.scroll(0);
+    }
+
     /// The first row in view.
     pub fn top(&self) -> usize {
         self.top

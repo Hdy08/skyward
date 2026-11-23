@@ -8,6 +8,57 @@ use super::*;
 const POWER_SETTLE_MS: u64 = 2000;
 
 impl App {
+    /// Work that must finish before the phone can leave. Check the jobs
+    /// themselves: a merge or a download can outlive its original page.
+    fn reboot_shortcut_blocked(&self) -> bool {
+        let installer = match self.state.install {
+            Install::Idle => false,
+            Install::Finished { .. } | Install::Wiped(_) => self.screen() == Screen::Installing && self.state.source == Source::Rescue,
+            _ => true,
+        };
+        let erasing = self.state.erase.outcome.is_none() && (self.screen() == Screen::Erase || !self.state.erase.parts.is_empty());
+        installer
+            || erasing
+            || self.screen() == Screen::Fastboot
+            || matches!(self.state.data, Data::Opening | Data::Locked { checking: true, .. })
+            || matches!(self.state.update, Standing::Merging(_))
+            || self.state.systems_work.is_some()
+            || self.state.backup_job.as_ref().is_some_and(|job| job.outcome.is_none())
+            || self.state.part_work.as_ref().is_some_and(|job| job.outcome.is_none())
+            || self.state.job.as_ref().is_some_and(|job| job.outcome.is_none())
+            || self.state.relabel.as_ref().is_some_and(|job| job.outcome.is_none())
+            || self.state.download.as_ref().is_some_and(|job| job.outcome.is_none())
+            || self.state.skyward_job.as_ref().is_some_and(|job| job.outcome.is_none())
+    }
+
+    /// Holding power goes to the picker once. A key explicitly working a
+    /// confirmation slider is already a separate gesture (`Press::Slide`).
+    pub(super) fn power_held(&mut self, now: u64) -> Vec<Effect> {
+        let Some((Key::Power, Press::Power { at, .. })) = self.button else { return Vec::new() };
+        if now < at + POWER_REBOOT_MS {
+            return Vec::new();
+        }
+        self.button = Some((Key::Power, Press::Spent));
+        self.dirty = true;
+        if self.screen() == Screen::Reboot || self.reboot_shortcut_blocked() {
+            return Vec::new();
+        }
+        if matches!(self.drag, Drag::Pattern) {
+            self.state.pattern.clear();
+        }
+        self.drag = Drag::Idle;
+        self.menu.cancel();
+        self.state.confirm = 0.0;
+        self.state.held = None;
+        self.dismiss_charging(now);
+        let mut effects = Vec::new();
+        if self.state.vibrate {
+            effects.push(Effect::Haptic);
+        }
+        effects.extend(self.act(Action::Open(Screen::Reboot), now));
+        effects
+    }
+
     /// Take a battery driver's cable reading. The first valid reading
     /// establishes the state without an animation or wake. Startup
     /// observations must stay known and unchanged for two seconds before
@@ -132,6 +183,7 @@ impl App {
         self.curtain.set(false, now);
         self.display_on = false;
         self.bright = full_brightness();
+        self.menu.cancel();
         match std::mem::replace(&mut self.drag, Drag::Idle) {
             Drag::Confirm { .. } => {
                 self.state.confirm = 0.0;
@@ -139,6 +191,10 @@ impl App {
             }
             Drag::Pattern => {
                 self.state.pattern.clear();
+                self.refresh();
+            }
+            Drag::WideKey { .. } => {
+                self.state.held = None;
                 self.refresh();
             }
             _ => {}
@@ -177,15 +233,79 @@ mod tests {
         assert!(app.key(Key::Power, 0).is_empty());
         assert_eq!(app.panel(0), Some(SLIDER_START), "it waits for volume down first");
         assert_eq!(app.deadline(0), Some(CHORD_MS));
-        assert_eq!(app.tick(CHORD_MS), vec![Effect::Ticks], "held on alone, it turns the panel off, ticking the motor");
+        assert!(app.tick(CHORD_MS).is_empty(), "the panel stays lit until the press is decided");
+        assert_eq!(app.deadline(CHORD_MS), Some(POWER_REBOOT_MS));
+        assert_eq!(app.key_up(Key::Power, CHORD_MS + 50), vec![Effect::Ticks], "a tap turns the panel off and ticks the motor");
         assert!(!app.display_on());
-        assert!(app.key_up(Key::Power, CHORD_MS + 50).is_empty());
         assert!(app.key(Key::Power, CHORD_MS + 60).is_empty());
         assert_eq!(app.panel(CHORD_MS + 60), Some(SLIDER_START));
         assert!(app.key_up(Key::Power, CHORD_MS + 100).is_empty());
         assert!(app.key(Key::Power, 1000).is_empty());
         assert_eq!(app.key_up(Key::Power, 1050), vec![Effect::Ticks]);
         assert!(!app.display_on(), "let go sooner, it turns the panel off then");
+    }
+
+    #[test]
+    fn a_half_second_power_hold_opens_reboot_once_without_choosing_a_target() {
+        let mut app = App::new(Screen::Settings, W, H, PPD);
+        assert!(app.key(Key::Power, 1000).is_empty());
+        assert!(app.tick(1499).is_empty());
+        assert_eq!(app.screen(), Screen::Settings);
+        assert!(app.display_on());
+        assert_eq!(app.tick(1500), vec![Effect::Haptic, Effect::ReadSlots]);
+        assert_eq!(app.screen(), Screen::Reboot);
+        assert!(app.tick(2000).is_empty());
+        assert!(app.key_up(Key::Power, 2100).is_empty());
+        assert!(app.display_on());
+        app.back(2200);
+        assert_eq!(app.screen(), Screen::Settings);
+    }
+
+    #[test]
+    fn a_hold_can_wake_the_display_and_open_reboot_even_if_release_beats_tick() {
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.vibrate = false;
+        app.sleep(0);
+        assert!(app.key(Key::Power, 1000).is_empty());
+        assert!(app.display_on());
+        assert_eq!(app.key_up(Key::Power, 1500), vec![Effect::ReadSlots]);
+        assert_eq!(app.screen(), Screen::Reboot);
+    }
+
+    #[test]
+    fn the_shortcut_is_silent_while_installing_and_available_after_completion() {
+        let mut app = App::new(Screen::Installing, W, H, PPD);
+        app.state.install = Install::Updating { version: None, stage: Some(Stage::Writing { done: 1, total: 2 }), overwriting: true };
+        assert!(app.key(Key::Power, 1000).is_empty());
+        assert!(app.tick(1500).is_empty());
+        assert!(app.key_up(Key::Power, 1600).is_empty());
+        assert_eq!(app.screen(), Screen::Installing);
+        assert!(app.display_on());
+        assert!(matches!(app.state.install, Install::Updating { .. }));
+
+        app.state.install = Install::Finished { outcome: Outcome::Installed { slot: Slot::B, wipe: false }, damage: None };
+        assert!(app.key(Key::Power, 2000).is_empty());
+        assert_eq!(app.key_up(Key::Power, 2500), vec![Effect::Haptic, Effect::ReadSlots]);
+        assert_eq!(app.screen(), Screen::Reboot);
+        assert!(matches!(app.state.install, Install::Finished { .. }));
+    }
+
+    #[test]
+    fn factory_reset_and_background_merging_keep_their_page_on_a_power_hold() {
+        let mut app = App::new(Screen::Erase, W, H, PPD);
+        app.state.erase.parts = vec![Part::Data, Part::Metadata];
+        assert!(app.key(Key::Power, 1000).is_empty());
+        assert!(app.key_up(Key::Power, 1500).is_empty());
+        assert_eq!(app.screen(), Screen::Erase);
+        app.state.erase.outcome = Some(Ok(()));
+        assert!(app.key(Key::Power, 2000).is_empty());
+        assert_eq!(app.key_up(Key::Power, 2500), vec![Effect::Haptic, Effect::ReadSlots]);
+
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        app.state.update = Standing::Merging(0.25);
+        assert!(app.key(Key::Power, 1000).is_empty());
+        assert!(app.key_up(Key::Power, 1500).is_empty());
+        assert_eq!(app.screen(), Screen::Home);
     }
 
     #[test]

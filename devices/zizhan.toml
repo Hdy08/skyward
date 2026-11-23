@@ -5,6 +5,7 @@ model = "Xiaomi MIX Fold 2"
 ab = true
 soc = { hans = "第一代骁龙®8+移动平台", hant = "Snapdragon® 8+ Gen 1 行動平台", en = "Snapdragon® 8+ Gen 1 Mobile Platform" }
 os_version_prop = "ro.mi.os.version.incremental"
+status_bar = { height_dp = 40, margin_dp = 16 }
 
 # Both DSI connectors report connected even with the phone closed. The
 # cover comes up first; the fold sensor selects the inner panel when open.

@@ -36,11 +36,12 @@ impl App {
     fn render(&mut self, f: &Fonts, info: &DeviceInfo, wide: u32) -> &Frame {
         if self.frame.is_some() && !self.stale.is_empty() {
             let t = self.theme();
-            let screen = self.screen();
+            let screen = self.shown_page();
             for rows in std::mem::take(&mut self.stale) {
                 let band = Band { rows, cols: (0, self.cols) };
                 let cx = Ctx { t: &t, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
-                let fresh = pages::render(screen, &cx);
+                let mut fresh = pages::render(screen, &cx);
+                self.dock_keyboard(&mut fresh, f);
                 let mut canvas = self.frame.take().expect("checked above").canvas;
                 assert_eq!(canvas.h, fresh.canvas.h, "a page drawn again in part is as tall as it was");
                 canvas.replace(&fresh.canvas);
@@ -49,11 +50,15 @@ impl App {
         }
         if self.frame.is_none() {
             let t = self.theme();
-            let screen = self.screen();
+            let screen = self.shown_page();
             let first = self.top().1.max(0.0) as u32;
             let band = Band { rows: (first, first + self.h), cols: (0, wide.min(self.w)) };
             let cx = Ctx { t: &t, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
             let mut frame = pages::render(screen, &cx);
+            self.dock_keyboard(&mut frame, f);
+            if self.screen() == Screen::Home {
+                frame.back = false;
+            }
             // A page drawn in part across holds its rows whole, the columns
             // of them drawn on as they are needed.
             self.cols = frame.canvas.cols().end;
@@ -72,6 +77,15 @@ impl App {
             }
         }
         self.frame.as_ref().expect("rendered above")
+    }
+
+    fn dock_keyboard(&self, frame: &mut Frame, f: &Fonts) {
+        let Some(keys) = frame.keyboard else { return };
+        let t = self.theme_at(self.panel_w);
+        let height = (widgets::keyboard_height(&t).ceil() as u32).min(self.h);
+        let mut canvas = Canvas::filled(self.panel_w, height, t.pal.bg);
+        let hits = keys.draw(&mut canvas, &t, f, &self.state, 0.0);
+        frame.dock = Some(Dock { canvas, hits });
     }
 
     /// The current page rendered, all of it drawn.
@@ -114,7 +128,7 @@ impl App {
         let t = self.theme();
         let band = Band { rows: (held.start, held.end), cols: (self.cols, wide) };
         let cx = Ctx { t: &t, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
-        let part = pages::render(self.screen(), &cx).canvas;
+        let part = pages::render(self.shown_page(), &cx).canvas;
         self.frame.as_mut().expect("drawn above").canvas.replace(&part);
         self.cols = wide;
         self.layer = None;
@@ -141,7 +155,7 @@ impl App {
         }
         self.draw_cols(f, info, self.w);
         let t = self.theme();
-        let screen = self.screen();
+        let screen = self.shown_page();
         for rows in bands {
             let band = Band { rows, cols: (0, self.w) };
             let cx = Ctx { t: &t, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
@@ -167,7 +181,23 @@ impl App {
     pub fn compose(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
         let charge = self.charging.as_ref().map_or(0.0, |c| c.shown.level(now));
         if charge < 1.0 {
-            self.compose_page(out, f, info, clock, now);
+            if let Some(x) = self.pane_at() {
+                let mut detail = self.menu.detail.take().unwrap_or_else(|| Canvas::new(self.w, self.h));
+                self.compose_page(&mut detail, f, info, clock, now);
+                let bottom = self.keyboard_top();
+                out.put_pane(&detail, x, 0, 0..bottom);
+                self.menu.detail = Some(detail);
+                self.paint_menu(out, f, info, bottom, now);
+                if let Some(dock) = self.frame.as_ref().and_then(Frame::wide_keyboard) {
+                    out.put(&dock.canvas, bottom as i32);
+                    if let Some((Group::Dock, r, radius, tint)) = self.shown.as_ref().and_then(|v| v.light) {
+                        out.fill_round_rect(r.x, r.y, r.w, r.h, radius, tint);
+                    }
+                }
+                self.paint_status_bar(out, f, info, clock);
+            } else {
+                self.compose_page(out, f, info, clock, now);
+            }
         }
         if charge > 0.0 {
             self.compose_charging(out, f, info, charge, now);
@@ -175,15 +205,23 @@ impl App {
         out.dim(self.curtain.level(now));
     }
 
+    fn paint_status_bar(&self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str) {
+        // The clock and readings span the panel. Each pane draws its own
+        // page and scroll mask beneath them, as it does on the cover.
+        let t = self.theme_at(self.panel_w);
+        widgets::status_bar(out, &t, f, &self.bar(clock, info), t.pal.status);
+    }
+
     /// The charging screen, `level` of the way over the page drawn on `out`.
     fn compose_charging(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, level: f32, now: u64) {
         let battery = info.battery.as_ref().expect("a cable went in on a phone whose battery is read");
-        let (t, lang) = (self.theme(), self.state.lang);
+        let (t, lang) = (self.theme_at(self.panel_w), self.state.lang);
         if !self.charge_art.as_ref().is_some_and(|a| a.shows(lang, battery)) {
             self.charge_art = Some(charge::Art::new(f, &t.m, lang, battery).expect("the screens' face takes the charging screen's weight"));
         }
         let since = self.charging.as_ref().map_or(now, |c| c.since);
-        let dither = self.dither.get_or_insert_with(|| glow::Dither::new(out.w as usize, out.h as usize));
+        let dither = if self.w == out.w { &mut self.dither } else { &mut self.menu.charge_dither };
+        let dither = dither.get_or_insert_with(|| glow::Dither::new(out.w as usize, out.h as usize));
         let art = self.charge_art.as_ref().expect("drawn above");
         if level >= 1.0 {
             charge::draw(out, art, &t.m, battery.level, now.saturating_sub(since), dither);
@@ -203,7 +241,7 @@ impl App {
         // A page opened is drawn from its left edge as it slides in.
         let opening = self.turn.as_ref().is_some_and(|t| !t.back);
         self.render(f, info, if opening { 0 } else { self.w });
-        let screen = self.screen();
+        let screen = self.shown_page();
         let scroll = self.top().1;
         let offset = (scroll + self.overscroll(now)).round();
         let caret_on = match self.frame.as_ref().is_some_and(|fr| fr.caret.is_some()) {
@@ -221,6 +259,9 @@ impl App {
             self.morph = None;
         }
         let t = self.theme();
+        if screen == Screen::About && self.glow.is_none() {
+            self.glow = Some(GlowClock::new(t.hero.glow, now));
+        }
         if let Some((which, track)) = self.knob.take() {
             self.paint_knob(&t, f, which, track);
         }
@@ -323,9 +364,13 @@ impl App {
         }
         self.shown = Some(view);
 
-        widgets::status_bar(out, &t, f, &self.bar(clock, info), t.pal.status);
+        if self.pane_at().is_none() {
+            self.paint_status_bar(out, f, info, clock);
+        }
         if let Some((text, _)) = &self.toast {
-            widgets::toast(out, &t, f, text);
+            let mut above_keys = t;
+            above_keys.m.h = self.keyboard_top();
+            widgets::toast(out, &above_keys, f, text);
         }
         match self.drag {
             Drag::Edge { start, from_left, armed, x, cy } => {
@@ -346,7 +391,7 @@ impl App {
     /// as it last showed has them drawn already.
     pub(super) fn paint_page(&mut self, out: &mut Canvas, t: &Theme, fresh: Option<(&Fonts, &DeviceInfo)>, view: &View) {
         let m = t.m;
-        let screen = self.screen();
+        let screen = self.shown_page();
         let (scroll, offset, pressing) = (view.scroll, view.offset, view.pressing);
         // The light goes over its control, in the part of the screen the
         // control is drawn in, under whatever is laid over that part.
@@ -373,13 +418,13 @@ impl App {
             // cards scroll over it. The version and the author's line fade
             // and shrink away first, then the wordmark.
             let glow = self.glow.as_ref().expect("the About page keeps its field");
-            let fade = (1.0 - scroll / m.dp(ABOUT_FIELD_DP)).clamp(0.0, 1.0);
-            let top = (widgets::bar_bottom(t) + m.dp(ABOUT_FIELD_DP)) / m.h as f32;
+            let fade = (1.0 - scroll / m.about_y(ABOUT_FIELD_DP)).clamp(0.0, 1.0);
+            let top = (widgets::bar_bottom(t) + m.about_y(ABOUT_FIELD_DP)) / m.h as f32;
             let field = glow::sample(glow, out.w as usize, out.h as usize, FIELD_CELL, top, t.pal.bg, fade);
             let dither = self.dither.get_or_insert_with(|| glow::Dither::new(out.w as usize, out.h as usize));
             glow::paint(out, &field, fade, &glow::Layer { canvas: &frame.canvas, runs: &art.runs, offset: offset as isize }, dither);
             press_row(out);
-            let range = m.dp(ABOUT_LOGO_DP) - widgets::bar_bottom(t);
+            let range = m.about_y(ABOUT_LOGO_DP) - widgets::bar_bottom(t);
             let v = (scroll / range).clamp(0.0, 1.0);
             art.version.draw_scaled(out, 0.0, 0.0, 1.0 - 0.1 * v, t.hero.version, 1.0 - v);
             art.author.draw_scaled(out, 0.0, 0.0, 1.0 - 0.1 * v, t.hero.version, 1.0 - v);
@@ -434,8 +479,7 @@ impl App {
                 fold.draw(out, t, words, offset);
             }
             if frame.header {
-                let level = (1.0 - frame.title_lift(scroll) / m.dp(TITLE_FADE_DP)).clamp(0.0, 1.0);
-                draw_faded(out, big, 0.0, -frame.title_lift(offset), t.pal.text, level, (1.0 - level) * m.dp(TITLE_BLUR_DP));
+                draw_large_title(out, t, frame, big, scroll, offset);
             }
         }
         // The search page's round button and the home page's search bar
@@ -469,7 +513,9 @@ impl App {
             out.put(&p.canvas, top.round() as i32);
             shine(out, Group::Strip);
         }
-        if let Some(d) = &frame.dock {
+        if let Some(d) = &frame.dock
+            && frame.keyboard.is_none()
+        {
             out.put(&d.canvas, (out.h - d.canvas.h) as i32);
             shine(out, Group::Dock);
         }
@@ -593,7 +639,9 @@ impl App {
         draw_faded(out, disc, 0.0, 0.0, t.pal.search, shown, blur);
         draw_faded(out, cross, 0.0, 0.0, t.pal.text, shown, blur);
         self.morph = Some(morph);
-        widgets::status_bar(out, &t, f, &self.bar(clock, info), t.pal.status);
+        if self.pane_at().is_none() {
+            self.paint_status_bar(out, f, info, clock);
+        }
         if let Some((text, _)) = &self.toast {
             widgets::toast(out, &t, f, text);
         }
@@ -602,6 +650,7 @@ impl App {
     /// Put the page back where it rests, for a page just opened or returned
     /// to; its first frame shows the bar as its scroll has it.
     pub(super) fn settle_page(&mut self) {
+        self.drop_wide_key();
         self.height = 0.0;
         self.fling = None;
         self.glide = None;
@@ -613,7 +662,7 @@ impl App {
         self.glow = None;
         self.row_press = None;
         self.row_art = None;
-        let hero = self.screen() == Screen::About;
+        let hero = self.shown_page() == Screen::About;
         self.title = title_fade(hero);
         self.bar = bar_fade(hero);
         self.snap = true;

@@ -626,7 +626,8 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
         secure::prepare_hardware_directory(&hardware)?;
         skyward_sys::kmsg("the directory for the phone's hardware services can run")?;
     }
-    secure::prepare_service_directory()?;
+    let installed_sdk = props.get("ro.system.build.version.sdk").or_else(|| props.get("ro.build.version.sdk"));
+    secure::prepare_service_directory(installed_sdk.map(String::as_str))?;
     // A program that registers with the service directory needs the
     // directory to know the phone describes what it registers, and so does
     // the secure element service where the recovery serves it. The WLAN's

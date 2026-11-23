@@ -373,6 +373,15 @@ pub struct Device {
     /// System property that carries the vendor OS version.
     #[serde(default = "default_os_version_prop")]
     pub os_version_prop: String,
+    /// Status bar dimensions shared by the device's displays.
+    #[serde(default)]
+    pub status_bar: Option<StatusBar>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct StatusBar {
+    pub height_dp: u32,
+    pub margin_dp: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

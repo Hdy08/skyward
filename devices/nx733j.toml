@@ -5,6 +5,7 @@ model = "Nubia Z70 Ultra"
 ab = true
 soc = { hans = "骁龙®8至尊版移动平台", hant = "Snapdragon® 8 Elite 行動平台", en = "Snapdragon® 8 Elite Mobile Platform" }
 os_version_prop = "ro.build.display.id"
+status_bar = { height_dp = 40, margin_dp = 16 }
 
 [display]
 width = 1216

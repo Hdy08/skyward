@@ -1020,8 +1020,8 @@ fn detach(services: Vec<Service>) -> Detach {
 
 /// What an install does besides installing, as the install page's switches
 /// are set: puts Skyward back into the recovery partitions it writes over,
-/// on a phone that has them, and checks a zip's signature before its
-/// install script runs.
+/// on a phone that has them, and verifies script ZIP and A/B payload
+/// signatures for manual installs.
 fn install_options(app: &App) -> Options {
     Options { second_system: app.state.install_second_system, keep: app.state.keep_recovery && app.state.recovery_partitions, signed: app.state.check_signature }
 }
@@ -1126,6 +1126,7 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
     if cfg.fold.is_some() && matches!(pages.request.work, Work::Menu) {
         let now = monotonic_ms();
         pages.fold_told(now)?;
+        pages.finish_fold(now, false)?;
         pages.show(now)?;
         skyward_sys::kmsg("fold display: first recovery frame presented")?;
     }
@@ -1161,6 +1162,7 @@ struct Pages<'a> {
     screen: Canvas,
     inputs: Inputs,
     fold: Option<fold::Monitor>,
+    fold_fade: fold::PanelFade,
     unfolded: bool,
     started: Instant,
     /// Whether the wait for a touch panel to come up is over.
@@ -1315,6 +1317,9 @@ impl<'a> Pages<'a> {
         };
         let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
         app.set_screen_corners(cfg.display.corner_radius as f32);
+        if let Some(bar) = cfg.device.status_bar {
+            app.set_status_bar(bar.height_dp, bar.margin_dp);
+        }
         // The settings kept from the starts before are back before the first
         // frame, and before file transfer starts with its switch and the time
         // zone. The pages speak the language chosen then, or else the one the
@@ -1451,7 +1456,7 @@ impl<'a> Pages<'a> {
         };
         let (w, h) = surface.size();
         if unfolded {
-            app.resize(w, h, display.density as f32 / 160.0, monotonic_ms());
+            app.resize_panel(w, h, display.density as f32 / 160.0, cfg.device.codename == "zizhan", monotonic_ms());
             app.set_screen_corners(display.corner_radius as f32);
             screen = Canvas::new(w, h);
             info.panel = Some((w, h));
@@ -1480,6 +1485,7 @@ impl<'a> Pages<'a> {
             screen,
             inputs,
             fold: fold_monitor,
+            fold_fade: fold::PanelFade::default(),
             unfolded,
             started,
             touch_known: false,
@@ -1683,6 +1689,8 @@ impl<'a> Pages<'a> {
             self.app.set_fastboot(running, link);
             self.port_at = Instant::now();
         }
+        self.finish_fold(monotonic_ms(), true)?;
+        let now = monotonic_ms();
         let (lit, shown) = self.show(now)?;
         self.wait(sleeper, uevents, now, lit, shown)?;
         let now = monotonic_ms();
@@ -1721,18 +1729,11 @@ impl<'a> Pages<'a> {
         self.offer_storage(now)
     }
 
-    /// What time passing asks for: the motor's clicks and ticks, and the
-    /// status bar's clock drawn again as its minute turns.
+    /// Handle timed actions, including opening the reboot page, and redraw
+    /// the clock when its minute turns.
     fn tick(&mut self, now: u64) -> Result<()> {
-        for fx in self.app.tick(now) {
-            match fx {
-                Effect::Haptic => self.click()?,
-                // The power key held past its wait for volume down turns
-                // the screen off.
-                Effect::Ticks => self.ticks()?,
-                other => unreachable!("time passing asks for nothing but the motor, not {other:?}"),
-            }
-        }
+        let effects = self.app.tick(now);
+        self.run_effects(effects, now)?;
         let time = clock(self.app.state.time_zone)?;
         if time != self.shown_clock {
             self.shown_clock = time;
@@ -1763,53 +1764,75 @@ impl<'a> Pages<'a> {
 
     fn fold_told(&mut self, now: u64) -> Result<()> {
         let events = self.fold.as_ref().map(fold::Monitor::events).unwrap_or_default();
+        let mut wanted = None;
         for state in events {
             match state {
-                Ok(folded) => {
-                    if let Err(error) = self.select_panel(folded, now) {
-                        skyward_sys::kmsg(&format!("fold sensor: panel switch failed: {error:#}"))?;
-                        self.app.report(&format!("{error:#}"), now);
-                    }
-                }
+                Ok(folded) => wanted = Some(folded),
                 Err(error) => {
                     skyward_sys::kmsg(&format!("fold sensor: {error}"))?;
                     self.fold = None;
                 }
             }
         }
+        if let Some(folded) = wanted
+            && self.fold_fade.request(!self.unfolded, folded, now)
+        {
+            self.app.cancel_touch();
+        }
+        Ok(())
+    }
+
+    fn finish_fold(&mut self, now: u64, animate: bool) -> Result<()> {
+        let light_next = animate && self.app.display_on();
+        let visible = light_next && self.backlight.level != 0;
+        let Some(folded) = self.fold_fade.ready(now, visible) else {
+            return Ok(());
+        };
+        self.fold_fade = fold::PanelFade::Steady;
+        match self.select_panel(folded, now) {
+            Ok(()) if light_next => self.fold_fade = fold::PanelFade::FirstFrame,
+            Ok(()) => (),
+            Err(error) => {
+                skyward_sys::kmsg(&format!("fold sensor: panel switch failed: {error:#}"))?;
+                self.app.report(&format!("{error:#}"), now);
+                self.app.redraw();
+            }
+        }
         Ok(())
     }
 
     fn select_panel(&mut self, folded: bool, now: u64) -> Result<()> {
-        if self.unfolded != folded {
-            return Ok(());
-        }
         let fold = self.cfg.fold.as_ref().context("a fold event without a foldable display")?;
         let (display, touch) = if folded { (&self.cfg.display, &self.cfg.touch) } else { (&fold.display, &fold.touch) };
-        let backlight = Backlight::open(display)?;
+        let connector = display.connector.as_deref().context("a foldable panel has a connector")?;
+        let mut backlight = Backlight::open(display)?;
         let mut inputs = Inputs::open(display.width, display.height, touch.writes.clone(), touch.name.clone())?;
-        self.backlight.show(None)?;
-        if let Err(error) = self.surface.switch_panel(display.connector.as_deref().context("a foldable panel has a connector")?, display.rotation) {
-            self.backlight.show(self.app.panel(now))?;
-            return Err(error);
+        backlight.show(None)?;
+        // An OLED can still show its last frame at the lowest level. Park
+        // it with black so the old page cannot flash the next time it wakes.
+        if self.surface.is_on() && !self.blanked {
+            self.black_frame()?;
         }
+        self.backlight.show(None)?;
+        self.surface.switch_panel(connector, display.rotation)?;
         let (w, h) = self.surface.size();
         inputs.resize(w, h);
         self.inputs = inputs;
         self.backlight = backlight;
         self.screen = Canvas::new(w, h);
-        self.app.resize(w, h, display.density as f32 / 160.0, now);
+        self.app.resize_panel(w, h, display.density as f32 / 160.0, !folded && self.cfg.device.codename == "zizhan", now);
         self.app.set_screen_corners(display.corner_radius as f32);
-        let (rows, cols) = self.app.term_size(&self.fonts);
-        self.app.resize_terminal(rows, cols);
-        if let Some(shell) = &self.shell {
-            shell.resize(rows, cols)?;
-        }
         self.info.panel = Some((w, h));
         self.info.screen = display.diagonal;
         self.blanked = false;
         self.rested_at = None;
         self.unfolded = !folded;
+        let (rows, cols) = self.app.term_size(&self.fonts);
+        self.app.resize_terminal(rows, cols);
+        self.app.resize_editor(&self.fonts);
+        if let Some(shell) = &self.shell {
+            shell.resize(rows, cols)?;
+        }
         skyward_sys::kmsg(&format!("fold sensor: {} — {}", if folded { "closed" } else { "open" }, self.surface.describe()))?;
         Ok(())
     }
@@ -1869,7 +1892,7 @@ impl<'a> Pages<'a> {
     fn show(&mut self, now: u64) -> Result<(bool, bool)> {
         let panel = self.app.panel(now);
         let (w, h) = self.surface.size();
-        let painting = panel.is_some() && self.app.screen() == Screen::About && u64::from(w) * u64::from(h) >= 3_000_000;
+        let painting = panel.is_some() && self.app.shown_page() == Screen::About && u64::from(w) * u64::from(h) >= 3_000_000;
         if painting && self.painting.is_none() {
             self.painting = Some(skyward_ui::glow::PaintPerformance::request());
         } else if !painting {
@@ -1893,10 +1916,7 @@ impl<'a> Pages<'a> {
             // Black out the panel's frame memory before the backlight goes
             // to 0 and the display off, so an OLED that floors the backlight
             // above zero rather than cutting it shows nothing as it goes off.
-            self.screen.data.fill(0);
-            self.surface.present(&self.screen)?;
-            self.surface.settle()?;
-            self.blanked = true;
+            self.black_frame()?;
         }
         // After the frame is on the panel, so a panel coming back on lights
         // with what it should show now, never with what it showed when it
@@ -1904,7 +1924,20 @@ impl<'a> Pages<'a> {
         if self.backlight.level == 0 && panel.is_some() {
             self.surface.settle()?;
         }
-        self.backlight.show(panel)?;
+        match panel {
+            Some(level) if self.app.display_on() => {
+                let fade = self.fold_fade.illuminate(monotonic_ms());
+                self.backlight.show(Some(level * fade))?;
+            }
+            // The power curtain handles sleep from the current light. A
+            // fold ramp must not turn the light up again while it darkens.
+            Some(_) if !matches!(self.fold_fade, fold::PanelFade::Steady) => (),
+            Some(_) => self.backlight.show(panel)?,
+            None => {
+                self.fold_fade = fold::PanelFade::Steady;
+                self.backlight.show(None)?;
+            }
+        }
         if panel.is_some() {
             // Lit, a panel that came on again switches to its fastest
             // refresh.
@@ -1924,13 +1957,22 @@ impl<'a> Pages<'a> {
         Ok((panel.is_some(), shown))
     }
 
+    fn black_frame(&mut self) -> Result<()> {
+        self.screen.data.fill(0);
+        self.surface.present(&self.screen)?;
+        self.surface.settle()?;
+        self.blanked = true;
+        Ok(())
+    }
+
     /// Wait until something the loop listens to has something, or the page
     /// is due to change; the phone is let sleep meanwhile where nothing
     /// needs it awake. `lit` and `shown` are as [`Pages::show`] gave them.
     fn wait(&mut self, sleeper: &Sleeper, uevents: &uevent::Listener, now: u64, lit: bool, shown: bool) -> Result<()> {
+        let fold_step = self.fold_fade.next_in(monotonic_ms()).filter(|_| self.app.display_on());
         // A page at rest draws the rows it has yet to while nothing else
         // is to be done, a band at a time, looking for input between bands.
-        let ahead = lit && !shown && self.app.draw_ahead(&self.fonts, &self.info);
+        let ahead = lit && !shown && fold_step.is_none() && self.app.draw_ahead(&self.fonts, &self.info);
         // A frame shown has waited for the one before it to reach the
         // panel, which keeps the loop to the panel's pace; otherwise the CPU
         // gets at least a millisecond.
@@ -1938,7 +1980,7 @@ impl<'a> Pages<'a> {
         let until_due = self.app.deadline(now).map(|d| d.saturating_sub(now) as i32);
         // A resting panel turns off once its rest is over.
         let rest_left = self.rested_at.map(|at| REST.saturating_sub(at.elapsed()).as_millis() as i32);
-        let timeout = if ahead { 0 } else { until_due.into_iter().chain(rest_left).min().map_or(1000, |t| t.clamp(floor, 1000)) };
+        let timeout = if ahead { 0 } else { until_due.into_iter().chain(rest_left).chain(fold_step).min().map_or(1000, |t| t.clamp(floor, 1000)) };
         sleeper.allow(self.may_sleep()?);
         let mut fds = vec![self.inputs.fd(), uevents.fd(), sleeper.fd()];
         if let Some(fold) = &self.fold {
@@ -2646,17 +2688,21 @@ impl Pages<'_> {
                     skyward_sys::kmsg(&format!("asked on the recovery socket: {asked:?}"))?;
                     answer(asked, self.fastboot)
                 }
+                Incoming::Input(Event::Touch(..)) if self.fold_fade.leaving() => Vec::new(),
                 Incoming::Input(Event::Touch(t, at)) => self.app.touch(t, &self.fonts, at),
                 Incoming::Input(Event::Key(k, true)) => self.app.key(k, now),
                 Incoming::Input(Event::Key(k, false)) => self.app.key_up(k, now),
             };
-            // What the pages ask for in answer to the work done goes on
-            // after it.
-            let mut queue = VecDeque::from(effects);
-            while let Some(fx) = queue.pop_front() {
-                eprintln!("effect {fx:?}");
-                queue.extend(self.effect(fx, now)?);
-            }
+            self.run_effects(effects, now)?;
+        }
+        Ok(())
+    }
+
+    fn run_effects(&mut self, effects: Vec<Effect>, now: u64) -> Result<()> {
+        let mut queue = VecDeque::from(effects);
+        while let Some(fx) = queue.pop_front() {
+            eprintln!("effect {fx:?}");
+            queue.extend(self.effect(fx, now)?);
         }
         Ok(())
     }

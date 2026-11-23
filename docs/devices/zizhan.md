@@ -11,6 +11,17 @@ interface 31, vendor patch `2026-02-01`, and a 5.10 GKI kernel. These are the
 installed custom ROM's reported versions, not a claim of an official Xiaomi
 release for this device.
 
+## Inner display layout
+
+Unfolded, Skyward displays its recovery menu in the left 45% and the selected
+page in the right pane, starting with About. The panes scroll independently.
+Closing the phone reflows the current page to the single-column cover display.
+Decryption, confirmations, and task progress stay in the right pane as well.
+Only the full on-screen keyboard spans both panes; the PIN keypad and pattern
+grid stay in the right pane.
+The sidebar respects the current page's navigation guards. Use `skyward-preview preview-out
+--zizhan-inner` to render the inner and cover layouts with sample readings.
+
 ## Local base and backups
 
 `devices/zizhan.toml` pins the complete 100 MiB `recovery.img` from the local ROM
@@ -136,7 +147,9 @@ The UI selects the active panel's named touch controller and reflows the
 current page. Page navigation, text fields and background work remain in the
 same process. Display power is preserved: folding a dark phone selects its
 next panel without lighting it, including during the fade to black. One press
-of the power key wakes the selected panel. Touch gestures
+of the power key wakes the selected panel. When switching while lit, the
+old panel fades out over 112 ms; the new one fades up to the chosen
+brightness over 160 ms after its first frame is ready. Touch gestures
 and unfinished confirmation gestures are cancelled at a switch. A running
 terminal receives its new size without replacing its shell. During startup,
 both backlights are first darkened, then the other panel receives a black frame

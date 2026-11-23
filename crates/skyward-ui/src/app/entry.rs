@@ -76,6 +76,15 @@ impl App {
         self.open(Screen::Editor);
     }
 
+    /// Fit the open editor to the new detail width without losing edits.
+    pub fn resize_editor(&mut self, f: &Fonts) {
+        if self.state.editor.is_some() {
+            let l = editor::layout(&self.theme(), f);
+            self.state.editor.as_mut().expect("the editor is open").resize(l.cols as usize, l.rows as usize);
+            self.refresh();
+        }
+    }
+
     /// How writing the file the editor page shows went: done, it stands as
     /// saved; or why not.
     pub fn text_saved(&mut self, outcome: Result<(), String>, now: u64) {

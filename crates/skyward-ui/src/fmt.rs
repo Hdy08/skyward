@@ -1069,14 +1069,14 @@ pub fn refusal(l: Lang, r: &Refusal, codename: &str, source: Source, _zone: usiz
             .pick([
                 "该刷机包未签名，请关闭「验证刷机包签名」后重试。",
                 "這個刷機包未簽署，請關閉「驗證刷機包簽章」後重試。",
-                "This zip isn't signed. Turn off “Verify zip signatures”, then try again.",
+                "This zip isn't signed. Turn off “Verify package signatures”, then try again.",
             ])
             .into(),
         Refusal::Unverified => l
             .pick([
                 "该刷机包未通过签名验证，请关闭「验证刷机包签名」后重试。",
                 "這個刷機包未通過簽章驗證，請關閉「驗證刷機包簽章」後重試。",
-                "This zip's signature didn't verify. Turn off “Verify zip signatures”, then try again.",
+                "This zip's signature didn't verify. Turn off “Verify package signatures”, then try again.",
             ])
             .into(),
         Refusal::Panicked => l

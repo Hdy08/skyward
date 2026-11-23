@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod fade;
 mod ssc;
+pub(crate) use fade::PanelFade;
 pub use ssc::watch;
 
 const HOME: &str = "/skyward/run/fold";

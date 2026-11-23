@@ -137,10 +137,14 @@ fn main() -> Result<()> {
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let font_path = font_path()?;
-    let fonts = Fonts::load(&font_path, 0, root.join("resources/fonts/KirkMono-Regular.ttf"))?;
+    let mono = std::env::var_os("SKYWARD_MONO").map_or_else(|| root.join("resources/fonts/KirkMono-Regular.ttf"), PathBuf::from);
+    let fonts = Fonts::load(&font_path, 0, mono)?;
     eprintln!("font: {}", font_path.display());
     for (tag, min, def, max) in fonts.axes() {
         eprintln!("axis {tag}: {min}..{max} (default {def})");
+    }
+    if args.get(2).is_some_and(|a| a == "--zizhan-inner") {
+        return zizhan_inner(&out, &fonts);
     }
 
     let cfg = DeviceConfig::load(root.join("devices/nezha.toml"))?;
@@ -1529,6 +1533,95 @@ fn whole_page(app: &mut App, f: &Fonts, info: &DeviceInfo) -> Canvas {
     }
     widgets::status_bar(&mut c, &t, f, &app.bar(CLOCK, info), t.pal.status);
     c
+}
+
+/// The two panes and the same page carried over to the cover display.
+fn zizhan_inner(out: &Path, fonts: &Fonts) -> Result<()> {
+    let cfg = DeviceConfig::parse(include_str!("../../../devices/zizhan.toml"))?;
+    let cover = &cfg.display;
+    let inner = &cfg.fold.as_ref().expect("MIX Fold 2 has an inner display").display;
+    let mut info = DeviceInfo {
+        model: cfg.device.model.clone(),
+        cpu: Cpu { cores: 8, max_khz: None },
+        ram_kib: 12_000_000,
+        panel: Some((inner.width, inner.height)),
+        screen: inner.diagonal,
+        os_version: Some("OS4.0.31.0.XPNCNXM".into()),
+        storage: Storage { total: 512_000_000_000, free: Some(474_000_000_000) },
+        battery: nezha(&cfg).battery.map(|b| Battery { level: 73, design: Some(4_500_000), ..b }),
+        ..nezha(&cfg)
+    };
+    let cover_ppd = cover.density as f32 / 160.0;
+    let inner_ppd = inner.density as f32 / 160.0;
+    let mut app = opened(Screen::Home, cover.width, cover.height, cover_ppd);
+    if let Some(bar) = cfg.device.status_bar {
+        app.set_status_bar(bar.height_dp, bar.margin_dp);
+    }
+    app.state.dark = true;
+    app.state.dual_boot = true;
+    app.state.wlan = Some(joined(Joining::Connected(router_link())));
+    let mut cover_frame = Canvas::new(cover.width, cover.height);
+    app.compose(&mut cover_frame, fonts, &info, CLOCK, 0);
+    write_png(&out.join("zizhan-cover-home.png"), &cover_frame)?;
+    let mut about = opened(Screen::About, cover.width, cover.height, cover_ppd);
+    about.state = app.state.clone();
+    if let Some(bar) = cfg.device.status_bar {
+        about.set_status_bar(bar.height_dp, bar.margin_dp);
+    }
+    about.compose(&mut cover_frame, fonts, &info, CLOCK, 1000);
+    write_png(&out.join("zizhan-cover-about.png"), &cover_frame)?;
+    app.resize_panel(inner.width, inner.height, inner_ppd, true, 0);
+    let mut frame = Canvas::new(inner.width, inner.height);
+    app.compose(&mut frame, fonts, &info, CLOCK, 1000);
+    write_png(&out.join("zizhan-inner-about.png"), &frame)?;
+
+    app.resize(cover.width, cover.height, cover_ppd, 1500);
+    let (x, y) = app.frame(fonts, &info).hits.iter().find(|h| h.action == Action::Open(Screen::Wlan)).expect("WLAN at home").rect.centre();
+    app.touch(Touch::Down(x, y), fonts, 2000);
+    app.touch(Touch::Up, fonts, 2001);
+    app.resize_panel(inner.width, inner.height, inner_ppd, true, 2500);
+    app.compose(&mut frame, fonts, &info, CLOCK, 3000);
+    write_png(&out.join("zizhan-inner-wlan.png"), &frame)?;
+
+    for (name, screen) in [("search", Screen::Search), ("decrypt-pin", Screen::Decrypt), ("decrypt-pattern", Screen::Decrypt), ("install-confirm", Screen::Installing)] {
+        let mut sample = opened(screen, inner.width, inner.height, inner_ppd);
+        if let Some(bar) = cfg.device.status_bar {
+            sample.set_status_bar(bar.height_dp, bar.margin_dp);
+        }
+        sample.state.dark = true;
+        sample.state.wlan = app.state.wlan.clone();
+        match screen {
+            Screen::Search => sample.state.search = "bf".into(),
+            Screen::Decrypt => {
+                let keys = if name == "decrypt-pin" { Keys::Digits } else { Keys::Pattern };
+                sample.state.data = Data::Locked { user: 0, keys, checking: false };
+            }
+            Screen::Installing => {
+                sample.state.source = Source::File(Place::Storage);
+                sample.state.install = Install::Confirming { version: Some("OS3.0.9.0.VLRCNXM".into()), wipe: false };
+            }
+            _ => unreachable!(),
+        }
+        sample.resize_panel(inner.width, inner.height, inner_ppd, true, 0);
+        sample.compose(&mut frame, fonts, &info, CLOCK, 1000);
+        write_png(&out.join(format!("zizhan-inner-{name}.png")), &frame)?;
+        if screen == Screen::Installing {
+            sample.state.install = Install::Updating {
+                version: Some("OS3.0.9.0.VLRCNXM".into()),
+                stage: Some(Stage::Writing { done: 2_100_000_000, total: 6_200_000_000 }),
+                overwriting: false,
+            };
+            sample.refresh();
+            sample.compose(&mut frame, fonts, &info, CLOCK, 2000);
+            write_png(&out.join("zizhan-inner-install-progress.png"), &frame)?;
+        }
+    }
+
+    app.resize(cover.width, cover.height, cover_ppd, 3500);
+    info.panel = Some((cover.width, cover.height));
+    info.screen = cover.diagonal;
+    app.compose(&mut cover_frame, fonts, &info, CLOCK, 4000);
+    write_png(&out.join("zizhan-cover-wlan.png"), &cover_frame)
 }
 
 /// Xiaomi 17 Ultra by Leica as `skyward info` read it on 2026-10-18 (the

@@ -82,6 +82,10 @@ pub struct Hero {
 /// converted at the panel's density.
 #[derive(Clone, Copy)]
 pub struct Metrics {
+    /// Vertical scale of the About page's header on a wide inner display.
+    pub(crate) about_scale: f32,
+    /// Keyboard drawing is deferred to the shared panel, below both panes.
+    pub(crate) wide_keyboard: bool,
     pub w: u32,
     pub h: u32,
     pub px_per_dp: f32,
@@ -131,6 +135,7 @@ pub struct Metrics {
     pub knob: f32,
     pub slider_h: f32,
     pub slider_knob: f32,
+    pub status_height: f32,
     pub status_x: f32,
     /// Where the battery ends, from the right edge; with the cable in, the
     /// bolt's box ends at `status_bolt_right` instead and the battery moves
@@ -144,6 +149,23 @@ pub struct Metrics {
 impl Metrics {
     pub fn dp(&self, v: f32) -> f32 {
         v * self.px_per_dp
+    }
+
+    pub(crate) fn set_status_bar(&mut self, height_dp: u32, margin_dp: u32) {
+        let height = self.dp(height_dp as f32);
+        let margin = self.dp(margin_dp as f32);
+        let shift = height - self.status_height;
+        self.status_height = height;
+        self.status_cy = height / 2.0;
+        (self.status_x, self.status_right, self.status_bolt_right) = (margin, margin, margin);
+        // Keep the 56 dp title bar and page spacing below the new status bar.
+        self.back_cy = height + self.dp(28.0);
+        self.title_top += shift;
+        self.content_top += shift;
+    }
+
+    pub(crate) fn about_y(&self, dp: f32) -> f32 {
+        self.dp(dp) * self.about_scale
     }
 }
 
@@ -174,9 +196,13 @@ impl Theme {
     }
 }
 
+const DEFAULT_STATUS_DP: f32 = 47.7;
+
 fn metrics(w: u32, h: u32, px_per_dp: f32) -> Metrics {
     let dp = |v: f32| v * px_per_dp;
     Metrics {
+        about_scale: 1.0,
+        wide_keyboard: false,
         w,
         h,
         px_per_dp,
@@ -225,6 +251,7 @@ fn metrics(w: u32, h: u32, px_per_dp: f32) -> Metrics {
         knob: dp(19.3),
         slider_h: dp(27.5),
         slider_knob: dp(18.7),
+        status_height: dp(DEFAULT_STATUS_DP),
         status_x: dp(37.0),
         status_right: dp(40.0),
         status_bolt_right: dp(36.0),

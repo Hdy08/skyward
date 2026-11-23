@@ -685,7 +685,7 @@ fn arrow_at(c: &mut Canvas, t: &Theme, dx: f32, dy: f32, color: Rgba) {
 /// The area that answers a tap on the `<` control.
 pub fn back_rect(t: &Theme) -> Rect {
     let m = &t.m;
-    Rect::new(0.0, m.back_cy - m.dp(28.0), m.back_x + m.back_w + m.dp(24.0), m.dp(56.0))
+    Rect::new(0.0, m.status_height, m.back_x + m.back_w + m.dp(24.0), m.dp(56.0))
 }
 
 /// How deep the back cue bulges for a finger `travel` pixels in from the
@@ -803,11 +803,14 @@ pub const BAR_MASK: [(f32, f32); 17] = [
 /// The About page's mask, solid at its top.
 pub const ABOUT_BAR_MASK: [(f32, f32); 5] = [(0.0, 1.0), (0.52, 0.98), (0.74, 0.8), (0.85, 0.5), (1.0, 0.0)];
 
-/// The mask over the top of a scrolled page: `color`, nearly solid behind
-/// the status bar and title, thinning out by 20 dp below them, with an
-/// ordered dither against banding. `level` brings it in and out.
+pub(crate) fn bar_mask_height(t: &Theme) -> f32 {
+    bar_bottom(t) + t.m.dp(20.0)
+}
+
+/// The mask over the status bar and title of a scrolled page, thinning out
+/// by 20 dp below them. The viewport width limits it to a pane on the inner screen.
 pub fn bar_mask(c: &mut Canvas, t: &Theme, stops: &[(f32, f32)], color: Rgba, level: f32) {
-    mask(c, bar_bottom(t) + t.m.dp(20.0), stops, color, level, 0..0);
+    mask(c, t.m.w, bar_mask_height(t), stops, color, level, 0..0);
 }
 
 /// How far below a pinned strip the list thins out from under the mask, as
@@ -825,17 +828,18 @@ pub fn strip_mask(c: &mut Canvas, t: &Theme, color: Rgba, level: f32, top: f32, 
     let (solid, _) = BAR_MASK.iter().rev().find(|&&(_, a)| a == BAR_MASK[0].1).expect("the bar mask starts solid");
     let mut stops = vec![(0.0, BAR_MASK[0].1)];
     stops.extend(BAR_MASK.iter().filter(|&&(p, _)| p >= *solid).map(|&(p, a)| (s + (p - solid) / (1.0 - solid) * (1.0 - s), a)));
-    mask(c, h, &stops, color, level, top.max(0.0) as u32..bottom.max(0.0) as u32);
+    mask(c, c.w, h, &stops, color, level, top.max(0.0) as u32..bottom.max(0.0) as u32);
 }
 
 /// `color` over the top `h` pixels at the strength `stops` give from top (0)
-/// to bottom (1), with an ordered dither against banding; the rows in `skip`
-/// are left as they are.
-fn mask(c: &mut Canvas, h: f32, stops: &[(f32, f32)], color: Rgba, level: f32, skip: std::ops::Range<u32>) {
+/// to bottom (1), with an ordered dither against banding. Leave rows in
+/// `skip` and columns outside the viewport alone.
+fn mask(c: &mut Canvas, width: u32, h: f32, stops: &[(f32, f32)], color: Rgba, level: f32, skip: std::ops::Range<u32>) {
     const BAYER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
     assert!(c.whole(), "the mask lies over a whole screen");
     let ink = [color.r as u32, color.g as u32, color.b as u32];
     let row_len = c.w as usize * 4;
+    let mask_len = width.min(c.w) as usize * 4;
     for y in (0..(h.ceil() as u32).min(c.h)).filter(|y| !skip.contains(y)) {
         let f = (y as f32 + 0.5) / h;
         let a = ramp(stops, f) * level * 255.0;
@@ -852,18 +856,16 @@ fn mask(c: &mut Canvas, h: f32, stops: &[(f32, f32)], color: Rgba, level: f32, s
         // one multiply, then its green; its alpha kept.
         let lit: [(u32, u32, u32); 4] = k.map(|k| ((ink[0] | ink[2] << 16) * k + 0x0080_0080, ink[1] * k + 0x80, 256 - k));
         let start = y as usize * row_len;
-        let row = &mut c.data[start..start + row_len];
+        let row = &mut c.data[start..start + mask_len];
         #[cfg(target_arch = "aarch64")]
         let done = mask_vectors(row, k, ink);
         #[cfg(not(target_arch = "aarch64"))]
         let done = 0;
-        for quad in row[done..].as_chunks_mut::<16>().0 {
-            for (px, &(lit_rb, lit_g, keep)) in quad.as_chunks_mut::<4>().0.iter_mut().zip(&lit) {
-                let v = u32::from_le_bytes(*px);
-                let rb = ((lit_rb + (v & 0x00ff_00ff) * keep) >> 8) & 0x00ff_00ff;
-                let g = ((lit_g + ((v >> 8) & 0xff) * keep) >> 8) & 0xff;
-                *px = (rb | (g << 8) | (v & 0xff00_0000)).to_le_bytes();
-            }
+        for (px, &(lit_rb, lit_g, keep)) in row[done..].as_chunks_mut::<4>().0.iter_mut().zip(lit.iter().cycle()) {
+            let v = u32::from_le_bytes(*px);
+            let rb = ((lit_rb + (v & 0x00ff_00ff) * keep) >> 8) & 0x00ff_00ff;
+            let g = ((lit_g + ((v >> 8) & 0xff) * keep) >> 8) & 0xff;
+            *px = (rb | (g << 8) | (v & 0xff00_0000)).to_le_bytes();
         }
     }
 }
@@ -1004,7 +1006,7 @@ const CARET_RADIUS_DP: f32 = 0.35;
 /// The search page, as the stock one lays it out: how far down its field
 /// stands, and the round button beside it that leaves the search, its
 /// distance from the screen's edge and from the field, and its cross.
-const SEARCH_TOP_DP: f32 = 51.7;
+const SEARCH_GAP_DP: f32 = 4.0;
 const CANCEL_RIGHT_DP: f32 = 14.0;
 const CANCEL_GAP_DP: f32 = 10.0;
 const CANCEL_ARM_DP: f32 = 8.0;
@@ -1014,7 +1016,7 @@ const CANCEL_STROKE_DP: f32 = 1.8;
 /// search.
 pub fn search_layout(t: &Theme) -> (Rect, Rect) {
     let m = &t.m;
-    let (top, d) = (m.dp(SEARCH_TOP_DP), m.search_h);
+    let (top, d) = (m.status_height + m.dp(SEARCH_GAP_DP), m.search_h);
     let cancel = Rect::new(m.w as f32 - m.dp(CANCEL_RIGHT_DP) - d, top, d, d);
     (Rect::new(m.margin, top, cancel.x - m.dp(CANCEL_GAP_DP) - m.margin, d), cancel)
 }
@@ -1394,11 +1396,13 @@ pub struct Row<'a> {
     pub sub: Option<&'a str>,
     pub trail: Trail<'a>,
     pub tint: Option<Rgba>,
+    navigation: bool,
+    selected: bool,
 }
 
 impl<'a> Row<'a> {
     pub fn new(title: &'a str) -> Self {
-        Row { icon: None, fan: None, title, tag: None, sub: None, trail: Trail::Arrow, tint: None }
+        Row { icon: None, fan: None, title, tag: None, sub: None, trail: Trail::Arrow, tint: None, navigation: false, selected: false }
     }
     pub fn icon(mut self, color: Rgba, icon: Icon) -> Self {
         self.icon = Some((color, icon));
@@ -1424,11 +1428,19 @@ impl<'a> Row<'a> {
         self.tint = Some(color);
         self
     }
+
+    /// A row leading to the other pane. Keep the original row layout and
+    /// shorten trailing values that would otherwise leave no room for labels.
+    pub(crate) fn navigation(&mut self, selected: bool) {
+        self.navigation = true;
+        self.selected = selected;
+    }
 }
 
 struct Layout {
     text_x: f32,
     text_max: f32,
+    value_limit: Option<f32>,
     sub_lines: Vec<String>,
     h: f32,
 }
@@ -1441,10 +1453,19 @@ fn layout(c: &Canvas, t: &Theme, f: &Fonts, r: &Row) -> Layout {
         (None, Some(_)) => m.inner + m.icon + m.icon_gap,
         (None, None) => m.inner,
     };
+    let mut value_limit = None;
     let trail_w = match r.trail {
         Trail::None => m.inner,
         Trail::Arrow => m.chevron_inset + m.chevron_w + m.value_gap,
-        Trail::Value(s) => m.chevron_inset + m.chevron_w + m.value_gap * 2.0 + c.text_width(&f.value, s, m.sub_px),
+        Trail::Value(s) => {
+            let gap = m.chevron_inset + m.chevron_w + m.value_gap * 2.0;
+            let width = c.text_width(&f.value, s, m.sub_px);
+            if r.navigation {
+                let room = (card_w - text_x - gap - c.text_width(&f.heading, r.title, m.row_title_px)).max(0.0);
+                value_limit = (width > room).then_some(room);
+            }
+            gap + value_limit.unwrap_or(width)
+        }
         Trail::Text(s) => m.inner + m.value_gap + c.text_width(&f.value, s, m.sub_px),
         Trail::Switch(_) => m.inner + m.switch_w + m.value_gap,
         Trail::Badge(_) => m.inner + m.badge_w + m.value_gap,
@@ -1468,7 +1489,7 @@ fn layout(c: &Canvas, t: &Theme, f: &Fonts, r: &Row) -> Layout {
         let block = (tb - tt) + m.sub_gap + (sub_lines.len() as f32 - 1.0) * m.sub_pitch + (sb - st);
         (block + m.row_pad_v * 2.0).max(m.row_h)
     };
-    Layout { text_x, text_max, sub_lines, h }
+    Layout { text_x, text_max, value_limit, sub_lines, h }
 }
 
 fn draw_row(c: &mut Canvas, t: &Theme, f: &Fonts, r: &Row, lay: &Layout, top: f32, tone: &Tone) {
@@ -1520,8 +1541,10 @@ fn draw_row(c: &mut Canvas, t: &Theme, f: &Fonts, r: &Row, lay: &Layout, top: f3
         Trail::Value(s) => {
             let chev_left = right - m.chevron_inset - m.chevron_w;
             chevron(c, t, right - m.chevron_inset, cy, tone.chevron);
-            let w = c.text_width(&f.value, s, m.sub_px);
-            c.text_vc(&f.value, s, chev_left - m.value_gap - w, cy, m.sub_px, tone.value, None);
+            if lay.value_limit.is_none_or(|max| max >= c.text_width(&f.value, "…", m.sub_px)) {
+                let w = lay.value_limit.unwrap_or_else(|| c.text_width(&f.value, s, m.sub_px));
+                c.text_vc(&f.value, s, chev_left - m.value_gap - w, cy, m.sub_px, tone.value, lay.value_limit);
+            }
         }
         Trail::Text(s) => {
             let w = c.text_width(&f.value, s, m.sub_px);
@@ -1681,21 +1704,33 @@ pub fn list_toned(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, rows: &[Row], 
     let mut y = top;
     let mut rects = Vec::new();
     for (r, l) in rows.iter().zip(&lays) {
+        let rect = Rect::new(m.margin, y, w, l.h);
+        row_selection(c, t, r, rect);
         draw_row(c, t, f, r, l, y, tone);
-        rects.push(Rect::new(m.margin, y, w, l.h));
+        rects.push(rect);
         y += l.h;
     }
     Block { bottom: top + h, rows: rects }
 }
 
+fn row_selection(c: &mut Canvas, t: &Theme, row: &Row, r: Rect) {
+    if row.selected {
+        let inset = t.m.dp(2.0);
+        c.fill_round_rect(r.x + inset, r.y + inset, r.w - 2.0 * inset, r.h - 2.0 * inset, t.m.card_radius - inset, t.pal.row_press);
+    }
+}
+
 /// Account-style card: avatar, name and detail, then optional rows. The
 /// first rect returned covers the name row.
-pub fn device_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, title: &str, sub: &str, rows: &[Row]) -> Block {
+pub(crate) fn device_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, name: &Row, rows: &[Row]) -> Block {
     let m = &t.m;
     let lays: Vec<Layout> = rows.iter().map(|r| layout(c, t, f, r)).collect();
     let h = m.account_row_h + lays.iter().map(|l| l.h).sum::<f32>();
     let (card_x, right) = (m.margin, m.w as f32 - m.margin);
-    c.fill_round_rect(card_x, top, right - card_x, h, m.card_radius, t.pal.card);
+    let w = right - card_x;
+    c.fill_round_rect(card_x, top, w, h, m.card_radius, t.pal.card);
+    let device = Rect::new(card_x, top, w, m.account_row_h);
+    row_selection(c, t, name, device);
 
     let cy = top + m.account_row_h / 2.0;
     let av = m.avatar;
@@ -1708,16 +1743,19 @@ pub fn device_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, title: &str, 
     let (st, sb) = f.body.ink(m.sub_px);
     let block = (tb - tt) + m.sub_gap + (sb - st);
     let ink_top = cy - block / 2.0;
-    c.text_top(&f.heading, title, tx, ink_top, m.account_title_px, t.pal.text, None);
-    c.text_top(&f.body, sub, tx, ink_top + (tb - tt) + m.sub_gap, m.sub_px, t.pal.subtitle, None);
+    let limit = name.navigation.then_some((right - m.chevron_inset - m.chevron_w - m.value_gap - tx).max(0.0));
+    c.text_top(&f.heading, name.title, tx, ink_top, m.account_title_px, t.pal.text, limit);
+    c.text_top(&f.body, name.sub.unwrap_or_default(), tx, ink_top + (tb - tt) + m.sub_gap, m.sub_px, t.pal.subtitle, limit);
     chevron(c, t, right - m.chevron_inset, cy, t.pal.chevron);
 
     let tone = Tone::page(t);
-    let mut rects = vec![Rect::new(card_x, top, right - card_x, m.account_row_h)];
+    let mut rects = vec![device];
     let mut y = top + m.account_row_h;
     for (r, l) in rows.iter().zip(&lays) {
+        let rect = Rect::new(card_x, y, w, l.h);
+        row_selection(c, t, r, rect);
         draw_row(c, t, f, r, l, y, &tone);
-        rects.push(Rect::new(card_x, y, right - card_x, l.h));
+        rects.push(rect);
         y += l.h;
     }
     Block { bottom: top + h, rows: rects }
@@ -2253,7 +2291,7 @@ fn hero_line(t: &Theme, f: &Fonts, text: &str, below: f32) -> Sprite {
     let m = &t.m;
     let px = m.dp(13.3);
     let w = Canvas::new(0, 0).text_width(&f.body, text, px);
-    let base = m.dp(296.3) + f.body.cap(px) + below;
+    let base = m.about_y(296.3) + f.body.cap(px) + below;
     let (left, top) = ((m.w as f32 - w) / 2.0 - m.dp(2.0), base - px * 1.2);
     Sprite::capture(left, top, (w + m.dp(4.0)).ceil() as u32, (px * 1.6).ceil() as u32, |c, dx, dy| {
         c.text(&f.body, text, (m.w as f32 - w) / 2.0 + dx, base + dy, px, Rgba::rgb(0, 0, 0), None);
@@ -2790,6 +2828,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_long_navigation_value_does_not_hide_the_label_or_change_row_height() {
+        let f = crate::font::bundled();
+        let t = Theme::light(862, 2160, 2.75);
+        let c = Canvas::new(0, 0);
+        let ssid = "W".repeat(32);
+        let row = |value| Row::new("WLAN").icon(t.pal.accent, Icon::Wlan).trail(Trail::Value(value));
+        let plain = layout(&c, &t, &f, &row("Skyward"));
+        let mut nav = row(&ssid);
+        nav.navigation(true);
+        let lay = layout(&c, &t, &f, &nav);
+        assert_eq!(lay.h, plain.h);
+        assert!(lay.text_max + 0.001 >= c.text_width(&f.heading, nav.title, t.m.row_title_px));
+        let max = lay.value_limit.expect("the label takes some of the room the long value needs");
+        assert!(max >= c.text_width(&f.value, "…", t.m.sub_px) && max < c.text_width(&f.value, &ssid, t.m.sub_px));
+    }
+
+    #[test]
     fn the_bar_mask_keeps_rounding_dither_alpha_and_skipped_rows() {
         const BAYER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
         for w in [4, 8, 12, 16, 32, 36] {
@@ -2798,12 +2853,12 @@ mod tests {
                 let mut frame = Canvas::new(w, 11);
                 for (i, v) in frame.data.iter_mut().enumerate() { *v = (i * 37 + i / 7) as u8; }
                 let original = frame.data.clone();
-                mask(&mut frame, 7.5, &ABOUT_BAR_MASK, color, level, 2..4);
+                mask(&mut frame, w - 1, 7.5, &ABOUT_BAR_MASK, color, level, 2..4);
                 for y in 0..11 {
                     for x in 0..w as usize {
                         let at = (y * w as usize + x) * 4;
                         let mut expected: [u8; 4] = original[at..at + 4].try_into().unwrap();
-                        if y < 8 && !(2..4).contains(&y) {
+                        if x < (w - 1) as usize && y < 8 && !(2..4).contains(&y) {
                             let a = ramp(&ABOUT_BAR_MASK, (y as f32 + 0.5) / 7.5) * level * 255.0;
                             if a > 0.0 {
                                 let a = (a + f32::from(BAYER[y % 4][x % 4]) / 16.0 - 0.5).clamp(0.0, 255.0).round() as u32;
@@ -3141,7 +3196,7 @@ mod tests {
             "boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery",
             "Copyright 2026 The Kirk Mono Project Authors (https://github.com/kirklin/kirk-mono)",
             "This phone's system doesn't make an emptied data partition anew when it starts, so it can't be wiped.",
-            "This zip isn't signed. Turn off “Verify zip signatures”, then try again.",
+            "This zip isn't signed. Turn off “Verify package signatures”, then try again.",
             "這個刷機包未簽署，請關閉「驗證刷機包簽章」後重試。",
         ];
         let latin = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':' | '\'');

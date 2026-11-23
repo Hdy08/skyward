@@ -17,6 +17,43 @@ pub fn arguments(package: &str, update: &Update, status_fd: i32) -> Vec<String> 
     ]
 }
 
+/// For a manual install with signature checks off, update_engine must see
+/// the OTA archive as absent; an empty archive is a broken verifier. The
+/// engine still checks the payload size and hash from the original headers.
+#[cfg(target_os = "android")]
+pub(crate) fn payload_signatures(command: &mut std::process::Command, verify: bool) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::ffi::CString;
+    use std::io;
+    use std::os::unix::{ffi::OsStrExt, process::CommandExt};
+    use std::path::Path;
+    use std::ptr::null;
+
+    let store = Path::new(crate::signature::CERTIFICATES);
+    if verify || !store.try_exists().with_context(|| format!("look for {}", store.display()))? {
+        return Ok(());
+    }
+    let directory = CString::new(store.parent().expect("the trust store is in a directory").as_os_str().as_bytes())?;
+    // The engine reads a local file. Hide the OTA store only in its mount
+    // namespace, leaving recovery and subsequent installs on the original.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::unshare(libc::CLONE_NEWNS) != 0
+                || libc::mount(null(), c"/".as_ptr(), null(), libc::MS_PRIVATE | libc::MS_REC, null()) != 0
+                || libc::mount(
+                    c"tmpfs".as_ptr(), directory.as_ptr(), c"tmpfs".as_ptr(),
+                    libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    c"mode=0755,size=4096".as_ptr().cast(),
+                ) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
 /// A line it writes to the status descriptor that matters here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -158,6 +195,23 @@ impl Trouble {
 mod tests {
     use super::*;
     use crate::package::Metadata;
+
+    #[cfg(target_os = "android")]
+    #[test]
+    #[ignore = "requires root in a recovery with its OTA certificate store"]
+    fn only_the_unsigned_engine_loses_access_to_the_ota_certificates() {
+        let store = crate::signature::CERTIFICATES;
+        let original = std::fs::read(store).unwrap();
+        assert!(!original.is_empty());
+        for verify in [true, false, true] {
+            let mut child = std::process::Command::new("/system/bin/sh");
+            let check = if verify { "test -s \"$1\"" } else { "test ! -e \"$1\"" };
+            child.args(["-c", check, "ota-certificates", store]);
+            payload_signatures(&mut child, verify).unwrap();
+            assert!(child.status().unwrap().success(), "verify = {verify}");
+            assert_eq!(std::fs::read(store).unwrap(), original);
+        }
+    }
 
     #[test]
     fn the_command_line_is_the_one_recovery_builds() {

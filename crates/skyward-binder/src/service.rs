@@ -12,10 +12,9 @@ use anyhow::{Context, Result};
 const DIRECTORY: &str = "android.os.IServiceManager";
 
 /// What the directory numbers the methods it is asked by here. It numbers
-/// its methods in the order its interface declares them, and Android 16
-/// declared two lookups of its own ahead of the rest; the directory is the
-/// recovery's own program, so the version the recovery was built as says
-/// which numbering it keeps.
+/// its methods in the order its interface declares them. Android 16
+/// declared two lookups ahead of the rest. Use the SDK of the running
+/// directory, which may come from the installed system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Methods {
     /// Ask for a service without waiting for one that has not registered
@@ -42,13 +41,21 @@ fn methods_of(sdk: u32) -> Methods {
     }
 }
 
-/// The recovery's own version, which its property files give.
-const SDK: &str = "ro.build.version.sdk";
+/// The SDK of the installed servicemanager when recovery starts it.
+/// Keep it separate from the ramdisk's SDK and available to child tools.
+#[cfg(target_os = "android")]
+pub const INSTALLED_DIRECTORY_SDK: &str = "skyward.servicemanager.sdk";
 
 #[cfg(target_os = "android")]
 fn methods() -> Result<Methods> {
-    let sdk = skyward_sys::prop(SDK).with_context(|| format!("the recovery says no {SDK}"))?;
-    Ok(methods_of(sdk.parse().with_context(|| format!("{SDK} is {sdk:?}"))?))
+    let (property, sdk) = match skyward_sys::prop(INSTALLED_DIRECTORY_SDK) {
+        Some(sdk) => (INSTALLED_DIRECTORY_SDK, sdk),
+        None => {
+            let property = "ro.build.version.sdk";
+            (property, skyward_sys::prop(property).with_context(|| format!("the recovery says no {property}"))?)
+        }
+    };
+    Ok(methods_of(sdk.parse().with_context(|| format!("{property} is {sdk:?}"))?))
 }
 
 /// Every dump priority a service can register at, and the one a service

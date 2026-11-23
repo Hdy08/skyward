@@ -15,6 +15,10 @@ Hdy08 maintains this fork and the OnePlus 13, Xiaomi MIX Fold 2, and Nubia Z70 U
 
 ## Features
 
+Hold the power button for half a second to open the reboot page, with one
+tap of the motor when vibration is enabled. A target still needs confirmation,
+and the shortcut is unavailable while protected work is in progress.
+
 ### Dual boot
 
 ![One phone holds two systems](slides/en/out/01-dual-boot.png)
@@ -148,8 +152,8 @@ mode, flash the image to the recovery partition of the current slot. For example
 for Xiaomi MIX Fold 2:
 
 ```sh
-unzip skyward-v0.3.2-zizhan-OS3.0.8.0.VLRCNXM.zip
-fastboot flash recovery skyward-v0.3.2-zizhan-OS3.0.8.0.VLRCNXM.img
+unzip skyward-v0.3.3-zizhan-OS3.0.8.0.VLRCNXM.zip
+fastboot flash recovery skyward-v0.3.3-zizhan-OS3.0.8.0.VLRCNXM.img
 fastboot reboot recovery
 ```
 

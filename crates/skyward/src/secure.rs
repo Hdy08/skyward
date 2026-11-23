@@ -169,10 +169,13 @@ fn prepare_system_loader() -> Result<()> {
 /// Android 12 stock recovery omits servicemanager. Its init declaration
 /// is packed only for such a base, and starts after the installed binary,
 /// loader and label file have been supplied in the recovery's RAM.
-pub fn prepare_service_directory() -> Result<()> {
+pub fn prepare_service_directory(installed_sdk: Option<&str>) -> Result<()> {
     if !Path::new("/skyward/installed-servicemanager").exists() {
         return Ok(());
     }
+    let sdk = installed_sdk.context("the installed system says no Android SDK version for its service directory")?;
+    let sdk: u32 = sdk.parse().with_context(|| format!("the installed service directory's SDK is {sdk:?}"))?;
+    skyward_sys::set_prop(skyward_binder::service::INSTALLED_DIRECTORY_SDK, &sdk.to_string())?;
     prepare_binder_devices()?;
     prepare_system_loader()?;
     let driver = Path::new("/dev/binder");
@@ -190,13 +193,15 @@ pub fn prepare_service_directory() -> Result<()> {
         skyward_sys::set_prop("ctl.start", DIRECTORY_SERVICE)?;
         let until = Instant::now() + REGISTER_TIMEOUT;
         loop {
-            if skyward_binder::driver::Binder::open().and_then(|b| skyward_binder::service::names(&b)).is_ok() {
-                break;
+            match skyward_binder::driver::Binder::open().and_then(|b| skyward_binder::service::names(&b)) {
+                Ok(_) => break,
+                Err(error) if Instant::now() >= until => return Err(error).with_context(|| {
+                    format!("the installed service directory (SDK {sdk}) did not answer in recovery")
+                }),
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
             }
-            ensure!(Instant::now() < until, "the installed service directory did not answer in recovery");
-            std::thread::sleep(Duration::from_millis(50));
         }
-        skyward_sys::kmsg("the installed service directory runs with its own runtime in recovery RAM")?;
+        skyward_sys::kmsg(&format!("the installed service directory (SDK {sdk}) runs with its own runtime in recovery RAM"))?;
     }
     if let Some(vndk) = libraries()? {
         let config = include_str!("vendor-ld.config.txt").replace("@VNDK_LIBRARIES@", &vndk.to_string_lossy());

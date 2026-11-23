@@ -739,6 +739,8 @@ fn apply(ctx: &Context, update: &Update) -> Result<i32> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    let verify = ctx.options.signed || matches!(ctx.origin, Origin::Asked { .. });
+    ota::payload_signatures(&mut command, verify).context("set A/B payload signature verification")?;
     // The program keeps its end of the status pipe across exec.
     unsafe {
         command.pre_exec(move || {
@@ -748,7 +750,8 @@ fn apply(ctx: &Context, update: &Update) -> Result<i32> {
             Ok(())
         });
     }
-    let mut child = command.spawn().with_context(|| format!("start {}", ota::PROGRAM))?;
+    let mut child = command.spawn().with_context(|| format!("start {} (payload signature verification: {verify})", ota::PROGRAM))?;
+    let _ = kmsg(&format!("install: A/B payload signature verification: {verify}"));
     drop(status_write);
     let stderr = child.stderr.take().expect("stderr is piped");
     let mut log = File::create(ENGINE_LOG).with_context(|| format!("create {ENGINE_LOG}"))?;

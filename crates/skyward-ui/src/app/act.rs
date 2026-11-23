@@ -11,7 +11,7 @@ impl App {
                 if s == Screen::Install {
                     self.state.install_second_system = self.screen() == Screen::Systems;
                 }
-                if s == Screen::Search && self.screen() == Screen::Home {
+                if s == Screen::Search && self.screen() == Screen::Home && !self.wide_menu() {
                     // The bar moves up from where it stands unfolded: a
                     // page easing there for the keys gets there at once.
                     if let Some((rest, _)) = self.seek.take() {

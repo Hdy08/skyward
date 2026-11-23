@@ -1,6 +1,6 @@
 use crate::app::{
     Action, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
-    FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
+    FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keyboard, Keys, Pick, Place, Rows, Screen,
     SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink, Wipe, ADDABLE,
     BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE,
     USB_DRIVE_WANTED, WIPES, installs, starting,
@@ -213,6 +213,14 @@ fn hits(rects: &[Rect], actions: &[Action]) -> Vec<Hit> {
 /// card, then grouped entries. The status bar carries the readings: the
 /// slot, the data partition's lock and the battery's temperature.
 pub fn home(cx: &Ctx) -> Frame {
+    home_page(cx, None)
+}
+
+pub(crate) fn home_menu(cx: &Ctx, selected: Screen) -> Frame {
+    home_page(cx, Some(selected))
+}
+
+fn home_page(cx: &Ctx, selected: Option<Screen>) -> Frame {
     let (t, f, i, l) = (cx.t, cx.f, cx.info, cx.state.lang);
     let mut c = long_page(cx);
     let mut out = Vec::new();
@@ -258,7 +266,14 @@ pub fn home(cx: &Ctx) -> Frame {
         rows.push(Row::new(l.pick(SECOND_FAILED)).icon(RED, Icon::Systems).subtitle(why).trail(Trail::Arrow));
         opens.push(Some(Action::Open(Screen::Systems)));
     }
-    let card = widgets::device_card(&mut c, t, f, y, &i.model, &sub, &rows);
+    let mut device = Row::new(&i.model).subtitle(&sub);
+    if let Some(selected) = selected {
+        device.navigation(selected == Screen::About);
+        for (row, action) in rows.iter_mut().zip(opens.iter().copied()) {
+            row.navigation(action == Some(Action::Open(selected)));
+        }
+    }
+    let card = widgets::device_card(&mut c, t, f, y, &device, &rows);
     out.push(Hit { rect: card.rows[0], action: Action::Open(Screen::About) });
     out.extend(card.rows[1..].iter().zip(&opens).filter_map(|(&rect, open)| open.map(|action| Hit { rect, action })));
     y = card.bottom + t.m.card_gap;
@@ -281,42 +296,54 @@ pub fn home(cx: &Ctx) -> Frame {
         opens.push(Action::Open(Screen::Systems));
     }
     if !rows.is_empty() {
-        let first = widgets::list(&mut c, t, f, y, &rows);
+        let first = home_group(&mut c, cx, y, &mut rows, &opens, selected);
         out.extend(hits(&first.rows, &opens));
         y = first.bottom + t.m.card_gap;
     }
-    let tools = widgets::list(&mut c, t, f, y, &[
+    let mut tool_rows = [
         Row::new(l.pick(["安装", "安裝", "Install"])).icon(GREEN, Icon::Install),
         Row::new(l.pick(["备份", "備份", "Backup"])).icon(BLUE, Icon::Backup),
         Row::new(l.pick(["恢复", "還原", "Restore"])).icon(PURPLE, Icon::Restore),
         Row::new(l.pick(["挂载", "掛載", "Mount"])).icon(SLATE, Icon::Mount),
         Row::new(l.pick(DECRYPT)).icon(BLUE, Icon::Lock).trail(Trail::Value(fmt::data(l, &cx.state.data))),
-    ]);
-    out.extend(hits(&tools.rows, &[
+    ];
+    let tool_actions = [
         Action::Open(Screen::Install),
         Action::Open(Screen::Backup),
         Action::Open(Screen::Restore),
         Action::Open(Screen::Mount),
         Action::Open(Screen::Decrypt),
-    ]));
+    ];
+    let tools = home_group(&mut c, cx, y, &mut tool_rows, &tool_actions, selected);
+    out.extend(hits(&tools.rows, &tool_actions));
     y = tools.bottom + t.m.card_gap;
     let target = l.pick(REBOOT_TARGETS[cx.state.reboot].0);
-    let system = widgets::list(&mut c, t, f, y, &[
+    let mut system_rows = [
         Row::new(l.pick(["清除数据", "清除資料", "Wipe data"])).icon(RED, Icon::Wipe),
         Row::new(l.pick(ADVANCED)).icon(SLATE, Icon::More),
         Row::new(l.pick(SETTINGS)).icon(SLATE, Icon::Gear),
         Row::new(l.pick(REBOOT)).icon(ORANGE, Icon::Power).trail(Trail::Value(target)),
-    ]);
-    out.extend(hits(&system.rows, &[
+    ];
+    let system_actions = [
         Action::Open(Screen::Wipe),
         Action::Open(Screen::Advanced),
         Action::Open(Screen::Settings),
         Action::Open(Screen::Reboot),
-    ]));
-    // However little it holds, the page scrolls far enough to fold its bar
-    // away.
+    ];
+    let system = home_group(&mut c, cx, y, &mut system_rows, &system_actions, selected);
+    out.extend(hits(&system.rows, &system_actions));
+    // As on the original Home page, even a short menu can fold search away.
     let height = fitted(t, system.bottom).max(t.m.h + fold.span.ceil() as u32);
     Frame { back: false, fold: Some(fold), ..Frame::new(t, c.crop_height(height), out, HOME_TITLE, cards_top) }
+}
+
+fn home_group(c: &mut Canvas, cx: &Ctx, y: f32, rows: &mut [Row], actions: &[Action], selected: Option<Screen>) -> widgets::Block {
+    if let Some(selected) = selected {
+        for (row, action) in rows.iter_mut().zip(actions) {
+            row.navigation(*action == Action::Open(selected));
+        }
+    }
+    widgets::list(c, cx.t, cx.f, y, rows)
 }
 
 /// What the home page says beside its entry to the systems: the one that
@@ -512,12 +539,8 @@ pub fn mount(cx: &Ctx) -> Frame {
     Frame::new(t, fit(c, t, bottom), out, l.pick(["挂载", "掛載", "Mount"]), top)
 }
 
-/// The original author and device porter, below the version.
-const AUTHOR: Text = [
-    "© 2026 Kirk Lin · Hdy08 移植",
-    "© 2026 Kirk Lin · Hdy08 移植",
-    "© 2026 Kirk Lin · Ports by Hdy08",
-];
+/// The original author and this fork's maintainer, below the version.
+const AUTHOR: &str = "© 2026 Kirk Lin · Hdy08";
 
 /// About this device, modelled on the stock「我的设备」: the wordmark, the
 /// version and its author over a moving colour field, and the summary,
@@ -533,9 +556,9 @@ pub fn about(cx: &Ctx) -> Frame {
     let (out, summary_top, bottom) = about_cards(cx, &mut c);
     let canvas = fit(c, t, bottom);
     let art = HeroArt {
-        wordmark: widgets::wordmark(t, f, "Skyward", m.dp(233.7), m.dp(37.8)),
+        wordmark: widgets::wordmark(t, f, "Skyward", m.about_y(233.7), m.dp(37.8)),
         version: widgets::version_line(t, f, VERSION),
-        author: widgets::author_line(t, f, cx.state.lang.pick(AUTHOR)),
+        author: widgets::author_line(t, f, AUTHOR),
         runs: canvas.runs(),
     };
     Frame { header: false, hero: Some(art), ..Frame::new(t, canvas, out, cx.state.lang.pick(ABOUT), summary_top) }
@@ -577,7 +600,7 @@ fn about_cards(cx: &Ctx, c: &mut Canvas) -> (Vec<Hit>, f32, f32) {
     if let Some(r) = &i.android {
         facts.push(Fact { title: l.pick(ANDROID_VERSION), value: r.clone(), link: false });
     }
-    let summary = widgets::facts(c, t, f, m.dp(490.7), &facts, &tone);
+    let summary = widgets::facts(c, t, f, m.about_y(490.7), &facts, &tone);
     out.push(Hit { rect: summary.rows[1], action: Action::Open(Screen::Specs) });
 
     let processor = soc(l, i).map_or_else(|| fmt::cpu(l, &i.cpu), str::to_string);
@@ -688,12 +711,12 @@ pub fn specs(cx: &Ctx) -> Frame {
 /// a user whose files wait on one is asked with the control that lock is
 /// answered with, from the start.
 pub fn decrypt(cx: &Ctx) -> Frame {
-    let (c, l) = (page(cx), cx.state.lang);
+    let l = cx.state.lang;
     match &cx.state.data {
-        Data::Locked { user, keys, checking } => code(cx, c, *user, *keys, *checking),
+        Data::Locked { user, keys, checking } => code(cx, *user, *keys, *checking),
         Data::Closed | Data::Opening => data_status(
             cx,
-            c,
+            page(cx),
             Icon::Lock,
             l.pick(["解密 data 分区", "解密 data 分割區", "Decrypt the data partition"]),
             Some(l.pick(["正在读取锁屏方式", "正在讀取螢幕鎖定方式", "Reading the screen lock"])),
@@ -701,16 +724,16 @@ pub fn decrypt(cx: &Ctx) -> Frame {
         ),
         Data::Open => data_status(
             cx,
-            c,
+            page(cx),
             Icon::Folder,
             l.pick(["data 分区已解密", "data 分割區已解密", "The data partition is decrypted"]),
             Some(l.pick(["你可以在「文件管理」中查看本机文件", "你可以在「檔案管理」中查看本機檔案", "You can see the phone's files in File manager"])),
             None,
         ),
-        Data::Failed(why) => data_status(cx, c, Icon::Lock, l.pick(["未能打开 data 分区", "無法開啟 data 分割區", "Couldn't open the data partition"]), None, Some(why)),
+        Data::Failed(why) => data_status(cx, page(cx), Icon::Lock, l.pick(["未能打开 data 分区", "無法開啟 data 分割區", "Couldn't open the data partition"]), None, Some(why)),
         Data::Erased => data_status(
             cx,
-            c,
+            page(cx),
             Icon::Wipe,
             l.pick(DATA_ERASED),
             Some(l.pick(["下次开机时将重新创建", "下次開機時將重新建立", "It's made anew when the phone next starts"])),
@@ -754,11 +777,12 @@ const DECRYPT_NEEDED: Text = ["需先完成「解密」", "需先完成「解密
 
 /// A user's own files wait on their screen lock: the control it is
 /// answered with, which takes nothing while what was entered is checked.
-fn code(cx: &Ctx, mut c: Canvas, user: u32, keys: Keys, checking: bool) -> Frame {
+fn code(cx: &Ctx, user: u32, keys: Keys, checking: bool) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     let m = &t.m;
     let x = m.w as f32 / 2.0;
     let mut out = Vec::new();
+    let mut c = if keys == Keys::Letters { typing_page(cx) } else { page(cx) };
     let title = match (keys == Keys::Pattern, user) {
         (true, 0) => l.pick(["绘制锁屏图案", "繪製螢幕鎖定圖案", "Draw the screen lock pattern"]).to_string(),
         (true, user) => tr!(l, "绘制用户 {user} 的锁屏图案", "繪製使用者 {user} 的螢幕鎖定圖案", "Draw user {user}'s screen lock pattern"),
@@ -769,14 +793,15 @@ fn code(cx: &Ctx, mut c: Canvas, user: u32, keys: Keys, checking: bool) -> Frame
     c.text_center(&f.heading, &title, x, m.dp(130.0), m.dp(24.0), t.pal.text);
     c.text_center(&f.body, note, x, m.dp(166.0), m.sub_px, t.pal.subtitle);
     let mut pattern = None;
-    let bottom = match keys {
-        Keys::Letters => {
-            let top = m.h as f32 - widgets::keyboard_height(t);
-            let caps = widgets::keyboard(&mut c, t, f, l, top, s.layer, s.key_held(), l.pick(DECRYPT));
+    let (bottom, keyboard) = match keys {
+        Keys::Letters => (Keyboard::top(t), type_keys(cx, &mut c, &mut out, l.pick(DECRYPT), !checking)),
+        Keys::Digits => {
+            let top = t.m.h as f32 - widgets::keypad_height(t);
+            let caps = widgets::keypad(&mut c, t, f, l, top, s.key_held());
             if !checking {
                 out.extend(caps.into_iter().map(|(rect, cap)| Hit { rect, action: Action::Type(cap) }));
             }
-            top
+            (top, None)
         }
         Keys::Pattern => {
             let span = m.dp(300.0);
@@ -786,15 +811,7 @@ fn code(cx: &Ctx, mut c: Canvas, user: u32, keys: Keys, checking: bool) -> Frame
                 out.push(Hit { rect: Rect::new(x - span, cy - span, span * 2.0, span * 2.0), action: Action::Pattern });
                 pattern = Some((x, cy, span));
             }
-            m.h as f32 - m.dp(26.0)
-        }
-        Keys::Digits => {
-            let top = m.h as f32 - widgets::keypad_height(t);
-            let caps = widgets::keypad(&mut c, t, f, l, top, s.key_held());
-            if !checking {
-                out.extend(caps.into_iter().map(|(rect, cap)| Hit { rect, action: Action::Type(cap) }));
-            }
-            top
+            (m.h as f32 - m.dp(26.0), None)
         }
     };
     // The dots sit just above whatever types into them; a pattern is its
@@ -805,7 +822,7 @@ fn code(cx: &Ctx, mut c: Canvas, user: u32, keys: Keys, checking: bool) -> Frame
     let skip_cy = bottom - m.dp(34.0);
     c.text_center(&f.heading, l.pick(NOT_NOW), x, skip_cy, m.row_title_px, t.pal.accent);
     out.push(Hit { rect: Rect::new(x - m.dp(80.0), skip_cy - m.dp(24.0), m.dp(160.0), m.dp(48.0)), action: Action::Skip });
-    Frame { header: false, pattern, ..Frame::new(t, c, out, l.pick(DECRYPT), 0.0) }
+    Frame { header: false, pattern, keyboard, ..Frame::new(t, c, out, l.pick(DECRYPT), 0.0) }
 }
 
 /// What a slot is shown as where the boot control could not be read.
@@ -932,10 +949,14 @@ pub fn install(cx: &Ctx) -> Frame {
     } });
     let y = widgets::footnote(&mut c, t, f, methods.bottom, what);
     let y = widgets::section(&mut c, t, f, y, l.pick(["选项", "選項", "Options"]));
-    let check = Row::new(l.pick(["验证刷机包签名", "驗證刷機包簽章", "Verify zip signatures"])).trail(Trail::Switch(cx.state.check_signature));
+    let check = Row::new(l.pick(["验证刷机包签名", "驗證刷機包簽章", "Verify package signatures"])).trail(Trail::Switch(cx.state.check_signature));
     let signature = widgets::list(&mut c, t, f, y, &[check]);
     out.extend(hits(&signature.rows, &[Action::Toggle(Switch::Signature)]));
-    let note = l.pick(["开启后，仅安装带有本机官方签名的刷机包。", "開啟後，僅安裝帶有本機官方簽章的刷機包。", "When on, only zips signed with this phone's official keys install."]);
+    let note = l.pick([
+        "开启后，手动安装的脚本刷机包和 A/B 更新包都须通过本机官方签名验证。",
+        "開啟後，手動安裝的指令碼刷機包和 A/B 更新檔均須通過本機官方簽章驗證。",
+        "When on, manually installed script ZIPs and A/B updates must be signed with this phone's official keys.",
+    ]);
     let mut y = widgets::footnote(&mut c, t, f, signature.bottom, note);
     if cx.state.recovery_partitions && !cx.state.install_second_system {
         let row = Row::new(l.pick(["自动重新刷入 Skyward", "自動重新刷入 Skyward", "Flash Skyward again"])).trail(Trail::Switch(cx.state.keep_recovery));
@@ -1768,13 +1789,22 @@ pub fn wipe(cx: &Ctx) -> Frame {
     Frame::new(t, fit(c, t, track.y + track.h), out, l.pick(["清除数据", "清除資料", "Wipe data"]), top)
 }
 
-/// A page laid out above the on-screen keyboard: where the keyboard's top
-/// is, and its keys as touch targets.
-fn keyboard_hits(c: &mut Canvas, t: &Theme, f: &Fonts, s: &State, enter: &str, out: &mut Vec<Hit>) -> f32 {
-    let top = t.m.h as f32 - widgets::keyboard_height(t);
-    let keys = widgets::keyboard(c, t, f, s.lang, top, s.layer, s.key_held(), enter);
-    out.extend(keys.into_iter().map(|(rect, cap)| Hit { rect, action: Action::Type(cap) }));
-    top
+/// Leave space under the detail pane for a shared keyboard. On the cover,
+/// it is part of the usual single-column page.
+fn typing_page(cx: &Ctx) -> Canvas {
+    let t = cx.t;
+    let h = if t.m.wide_keyboard { Keyboard::top(t) as u32 } else { t.m.h };
+    sheet(cx, h, t.pal.bg)
+}
+
+fn type_keys(cx: &Ctx, c: &mut Canvas, out: &mut Vec<Hit>, enter: &'static str, enabled: bool) -> Option<Keyboard> {
+    let keyboard = Keyboard { enter, enabled };
+    if cx.t.m.wide_keyboard {
+        Some(keyboard)
+    } else {
+        out.extend(keyboard.draw(c, cx.t, cx.f, cx.state, Keyboard::top(cx.t)));
+        None
+    }
 }
 
 /// Finding a feature or partition: the field where the title would be, the
@@ -1783,14 +1813,15 @@ fn keyboard_hits(c: &mut Canvas, t: &Theme, f: &Fonts, s: &State, enter: &str, o
 pub fn search(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     let m = &t.m;
-    let mut c = page(cx);
+    let find = l.pick(["搜索", "搜尋", "Search"]);
+    let mut c = typing_page(cx);
     let mut out = Vec::new();
     let (at, cancel) = widgets::search_layout(t);
     let field = widgets::search_field(&mut c, t, f, at.x, at.w, at.y + at.h / 2.0, &s.search, l.pick(SEARCH_HINT));
     widgets::cancel_button(&mut c, t, cancel);
     out.push(Hit { rect: cancel, action: Action::CloseSearch });
     let top = field.field.y + field.field.h + m.dp(12.0);
-    let kb_top = m.h as f32 - widgets::keyboard_height(t);
+    let kb_top = Keyboard::top(t);
     if s.search.trim().is_empty() {
         let how = l.pick([
             "输入功能或分区名称，支持拼音全拼和首字母，例如输入 bf 可找到「备份」。",
@@ -1812,12 +1843,11 @@ pub fn search(cx: &Ctx) -> Frame {
             out.extend(shown.map(|(&rect, e)| Hit { rect, action: Action::Open(e.screen) }));
         }
     }
-    let find = l.pick(["搜索", "搜尋", "Search"]);
-    keyboard_hits(&mut c, t, f, s, find, &mut out);
+    let keyboard = type_keys(cx, &mut c, &mut out, find, true);
     if let Some(rect) = field.clear {
         out.push(Hit { rect, action: Action::ClearSearch });
     }
-    Frame { back: false, header: false, caret: Some(field.caret), ..Frame::new(t, c, out, find, 0.0) }
+    Frame { back: false, header: false, caret: Some(field.caret), keyboard, ..Frame::new(t, c, out, find, 0.0) }
 }
 
 /// Backing up: what to take, where it goes, and how.
@@ -2988,7 +3018,7 @@ const SECURITY: Text = ["安全性", "安全性", "Security"];
 pub fn wlan_password(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     let network = s.joining.as_ref().expect("the password page is for a network");
-    let mut c = page(cx);
+    let mut c = typing_page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
     let y = widgets::section_first(&mut c, t, f, top, &network.name);
@@ -2996,8 +3026,8 @@ pub fn wlan_password(cx: &Ctx) -> Frame {
     let (y, caret) = widgets::text_field(&mut c, t, f, y, &shown);
     let show = widgets::list(&mut c, t, f, y + t.m.card_gap, &[Row::new(l.pick(SHOW_PASSWORD)).trail(Trail::Switch(s.show_password))]);
     out.extend(hits(&show.rows, &[Action::Toggle(Switch::ShowPassword)]));
-    keyboard_hits(&mut c, t, f, s, l.pick(CONNECT_KEY), &mut out);
-    Frame { caret: Some(caret), ..Frame::new(t, c, out, l.pick(["输入密码", "輸入密碼", "Enter password"]), top) }
+    let keyboard = type_keys(cx, &mut c, &mut out, l.pick(CONNECT_KEY), true);
+    Frame { caret: Some(caret), keyboard, ..Frame::new(t, c, out, l.pick(["输入密码", "輸入密碼", "Enter password"]), top) }
 }
 
 /// A network added by hand: its name, how it is protected, its password
@@ -3008,7 +3038,7 @@ pub fn wlan_add(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     let m = &t.m;
     let a = s.adding.as_ref().expect("the page adds a network");
-    let mut c = page(cx);
+    let mut c = if a.choosing { page(cx) } else { typing_page(cx) };
     let mut out = Vec::new();
     let top = m.content_top;
     let field = |y: f32| Rect::new(m.margin, y, m.w as f32 - m.margin * 2.0, m.dp(56.0));
@@ -3031,9 +3061,13 @@ pub fn wlan_add(cx: &Ctx) -> Frame {
         let show = widgets::list(&mut c, t, f, below + m.card_gap, &[Row::new(l.pick(SHOW_PASSWORD)).trail(Trail::Switch(s.show_password))]);
         out.extend(hits(&show.rows, &[Action::Toggle(Switch::ShowPassword)]));
     }
-    keyboard_hits(&mut c, t, f, s, l.pick(CONNECT_KEY), &mut out);
     if !a.choosing {
-        return Frame { caret: Some(caret), ..Frame::new(t, c, out, l.pick(ADD_NETWORK), top) };
+        let keyboard = type_keys(cx, &mut c, &mut out, l.pick(CONNECT_KEY), true);
+        return Frame { caret: Some(caret), keyboard, ..Frame::new(t, c, out, l.pick(ADD_NETWORK), top) };
+    }
+    if !m.wide_keyboard {
+        // On the cover the keyboard remains painted behind the choices.
+        let _ = type_keys(cx, &mut c, &mut out, l.pick(CONNECT_KEY), false);
     }
     // A touch anywhere off the list closes it.
     out.clear();
@@ -3307,13 +3341,13 @@ pub fn permissions(cx: &Ctx) -> Frame {
 /// A new name for the entry the file page shows, typed on the keyboard.
 pub fn rename(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
-    let mut c = page(cx);
+    let mut c = typing_page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
     let (y, caret) = widgets::text_field(&mut c, t, f, top, &s.new_name);
     widgets::footnote(&mut c, t, f, y, l.pick(["名称不能包含\"/\"。点击「完成」保存。", "名稱不能包含「/」。點選「完成」儲存。", "A name can't hold “/”. Tap Done to save it."]));
-    keyboard_hits(&mut c, t, f, s, l.pick(DONE), &mut out);
-    Frame { caret: Some(caret), ..Frame::new(t, c, out, l.pick(RENAME), top) }
+    let keyboard = type_keys(cx, &mut c, &mut out, l.pick(DONE), true);
+    Frame { caret: Some(caret), keyboard, ..Frame::new(t, c, out, l.pick(RENAME), top) }
 }
 
 /// The folder an entry goes to already holds its name: what to do.
@@ -3438,16 +3472,16 @@ pub fn file_job(cx: &Ctx) -> Frame {
 /// lacks, and the keyboard, every key of which goes to the shell.
 pub fn terminal(cx: &Ctx) -> Frame {
     let (t, f, s) = (cx.t, cx.f, cx.state);
-    let mut c = page(cx);
+    let mut c = typing_page(cx);
     let mut out = Vec::new();
     let top = t.m.content_top;
-    keyboard_hits(&mut c, t, f, s, s.lang.pick(["回车", "Enter", "Enter"]), &mut out);
+    let keyboard = type_keys(cx, &mut c, &mut out, s.lang.pick(["回车", "Enter", "Enter"]), true);
     let l = term::layout(t, f, top);
     term::draw(&mut c, t, f, &l, cx.term);
     let held = cx.term.is_some_and(|term| term.ctrl);
     let keys = term::keys(&mut c, t, f, &l, &term::TERM_KEYS, held);
     out.extend(keys.into_iter().map(|(rect, key)| Hit { rect, action: Action::TermKey(key) }));
-    Frame { scrollback: Some((l.card, l.pitch)), ..Frame::new(t, c, out, s.lang.pick(TERMINAL), top) }
+    Frame { scrollback: Some((l.card, l.pitch)), keyboard, ..Frame::new(t, c, out, s.lang.pick(TERMINAL), top) }
 }
 
 /// A text file being edited: where it is, its lines wrapped on a card, the
@@ -3456,16 +3490,16 @@ pub fn terminal(cx: &Ctx) -> Frame {
 pub fn editor(cx: &Ctx) -> Frame {
     let (t, f, s) = (cx.t, cx.f, cx.state);
     let ed = s.editor.as_ref().expect("the editor page shows a file");
-    let mut c = page(cx);
+    let mut c = typing_page(cx);
     let mut out = Vec::new();
-    keyboard_hits(&mut c, t, f, s, s.lang.pick(["换行", "換行", "Return"]), &mut out);
+    let keyboard = type_keys(cx, &mut c, &mut out, s.lang.pick(["换行", "換行", "Return"]), true);
     editor::caption(&mut c, t, f, &ed.path);
     let l = editor::layout(t, f);
     let caret = editor::draw(&mut c, t, f, &l, ed);
     let keys = term::keys(&mut c, t, f, &l, &editor::EDITOR_KEYS, false);
     out.extend(keys.into_iter().map(|(rect, key)| Hit { rect, action: Action::TermKey(key) }));
     let button = ed.changed.then_some((widgets::Glyph::Done, Action::SaveText));
-    Frame { scrollback: Some((l.card, l.pitch)), caret, button, ..Frame::new(t, c, out, s.lang.pick(["编辑", "編輯", "Edit"]), t.m.content_top) }
+    Frame { scrollback: Some((l.card, l.pitch)), caret, button, keyboard, ..Frame::new(t, c, out, s.lang.pick(["编辑", "編輯", "Edit"]), t.m.content_top) }
 }
 
 /// The languages the pages speak, each named in itself, to speak another.

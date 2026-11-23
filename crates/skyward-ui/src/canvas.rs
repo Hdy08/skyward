@@ -484,6 +484,25 @@ impl Canvas {
         self.data[dst..dst + len].copy_from_slice(&src.data[at..at + len]);
     }
 
+    /// Copy whole rows of a pane into this canvas at `(x, y)`, without
+    /// blending or rotating. The source can hold only the rows on screen.
+    pub(crate) fn put_pane(&mut self, pane: &Canvas, x: u32, y: u32, rows: std::ops::Range<u32>) {
+        assert!(self.whole() && pane.cols() == (0..pane.w));
+        assert!(x + pane.w <= self.w && y + rows.len() as u32 <= self.h);
+        let held = pane.held();
+        assert!(held.start <= rows.start && rows.end <= held.end);
+        let stride = self.w as usize * 4;
+        let width = pane.w as usize * 4;
+        let source = (rows.start - held.start) as usize * width;
+        let dest = y as usize * stride;
+        let inset = x as usize * 4;
+        for (dst, src) in self.data[dest..dest + rows.len() * stride].chunks_exact_mut(stride)
+            .zip(pane.data[source..source + rows.len() * width].chunks_exact(width))
+        {
+            dst[inset..inset + width].copy_from_slice(src);
+        }
+    }
+
     /// Each row as runs of clear, solid and partly covered pixels, for
     /// laying the canvas over something that keeps changing.
     pub fn runs(&self) -> Vec<Vec<Run>> {

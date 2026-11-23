@@ -4,6 +4,28 @@
 use super::*;
 
 impl App {
+    /// The outgoing panel is about to fade. Let go without acting on a
+    /// pending press or confirmation, even if the fold ends up reversed.
+    pub fn cancel_touch(&mut self) {
+        let pattern = matches!(self.drag, Drag::Pattern);
+        if pattern {
+            self.state.pattern.clear();
+        }
+        self.drag = Drag::Idle;
+        self.tracker.clear();
+        self.menu.cancel();
+        self.cue = None;
+        self.row_press = None;
+        self.row_art = None;
+        let confirming = std::mem::take(&mut self.state.confirm) != 0.0;
+        let held = self.state.held.take().is_some();
+        if pattern || confirming || held {
+            self.refresh();
+        } else {
+            self.redraw();
+        }
+    }
+
     pub fn touch(&mut self, ev: Touch, f: &Fonts, now: u64) -> Vec<Effect> {
         // A finger on the dark panel lights nothing, as on the phone's own
         // system, where the power key lights it.
@@ -38,6 +60,28 @@ impl App {
             self.end_turn();
         }
         self.stir(now);
+        let pane = self.pane_at();
+        let ev = if let Some(at) = pane {
+            if let Some(effects) = self.touch_wide_key(ev, now) {
+                return effects;
+            }
+            if let Some(effects) = self.touch_menu(ev, now) {
+                return effects;
+            }
+            match ev {
+                Touch::Down(x, y) => Touch::Down(x - at as f32, y),
+                Touch::Move(x, _) if x < at as f32 && matches!(self.drag, Drag::Press { .. }) => {
+                    self.drag = Drag::Idle;
+                    self.let_row_go(now);
+                    self.dirty = true;
+                    return Vec::new();
+                }
+                Touch::Move(x, y) => Touch::Move(x - at as f32, y),
+                Touch::Up => Touch::Up,
+            }
+        } else {
+            ev
+        };
         let t = self.theme();
         let m = t.m;
         let (slop, edge) = (m.dp(8.0), m.dp(20.0));
@@ -48,7 +92,7 @@ impl App {
             Touch::Down(x, y) => {
                 self.tracker.clear();
                 self.tracker.add(now, y);
-                let side = if x < edge {
+                let side = if pane.is_none() && x < edge {
                     Some(true)
                 } else if x > m.w as f32 - edge {
                     Some(false)
@@ -96,7 +140,7 @@ impl App {
                     d.hits.iter().find(|h| h.rect.contains(x, y - top)).map(|h| (h.action, Rect { y: h.rect.y + top, ..h.rect }))
                 } else if let Some((p, top)) = on_strip {
                     p.hits.iter().find(|h| h.rect.contains(x, y - top)).map(|h| (h.action, Rect { y: h.rect.y + top, ..h.rect }))
-                } else if self.bar.on && y < widgets::bar_bottom(&t) {
+                } else if (self.bar.on && y < widgets::bar_bottom(&t)) || (pane.is_some() && y < m.status_height.ceil()) {
                     None
                 } else {
                     // A search bar folding away answers only on what is
@@ -200,7 +244,7 @@ impl App {
                 }
                 Drag::Waking => self.drag = Drag::Waking,
                 Drag::Held => self.drag = Drag::Held,
-                Drag::Idle => {}
+                Drag::Idle | Drag::WideKey { .. } => {}
             },
             Touch::Up => match std::mem::replace(&mut self.drag, Drag::Idle) {
                 Drag::Press { action: Some(a), .. } => {
@@ -302,7 +346,7 @@ impl App {
 
     /// The finger left the row it held, scrolling the page or swiping: a
     /// row not darkening yet never does, and one darkening fades back.
-    fn let_row_go(&mut self, now: u64) {
+    pub(super) fn let_row_go(&mut self, now: u64) {
         let Some(p) = self.row_press else { return };
         if now < p.rise {
             self.row_press = None;
@@ -316,6 +360,11 @@ impl App {
     /// No touchscreen answers: the keys work the pages, their light shown
     /// from now on.
     pub fn touchscreen_missing(&mut self) {
+        if self.wide_menu() && self.screen() != Screen::Fastboot {
+            // The ordinary menu is fully usable with the hardware keys.
+            self.set_menu_width(0);
+            self.refresh();
+        }
         self.keys = true;
         self.dirty = true;
     }
@@ -337,14 +386,17 @@ impl App {
         {
             return self.screenshot(key, now);
         }
-        let mut fx = self.let_chord_go(now);
+        let mut fx = self.let_chord_go();
         if !self.display_on {
-            // The power key lights the dark panel, and does only that, as on
-            // the phone's own system; the other keys leave it dark.
-            if key == Key::Power {
+            // Tapping power only wakes the panel. It can still be held to
+            // open the reboot page. The other keys leave the panel dark.
+            let press = if key == Key::Power {
                 self.wake(now);
-            }
-            self.button = Some((key, Press::Spent));
+                Press::Power { tap: PowerTap::Ignore, at: now }
+            } else {
+                Press::Spent
+            };
+            self.button = Some((key, press));
             return fx;
         }
         // A key other than power sends the charging screen away for the
@@ -358,7 +410,8 @@ impl App {
         // a power press meant to wake it does not turn it back off.
         if self.just_woke(now) {
             self.stir(now);
-            self.button = Some((key, Press::Spent));
+            let press = if key == Key::Power { Press::Power { tap: PowerTap::Ignore, at: now } } else { Press::Spent };
+            self.button = Some((key, press));
             return fx;
         }
         self.stir(now);
@@ -366,7 +419,7 @@ impl App {
             self.chord = Some((key, now));
             return fx;
         }
-        fx.extend(self.key_down(key, now, now));
+        fx.extend(self.key_down(key, now));
         fx
     }
 
@@ -386,17 +439,16 @@ impl App {
     }
 
     /// The key waiting for its partner in a screenshot does what it does
-    /// alone `now`, as pressed when it went down.
-    pub(super) fn let_chord_go(&mut self, now: u64) -> Vec<Effect> {
+    /// alone, timed from when it went down.
+    pub(super) fn let_chord_go(&mut self) -> Vec<Effect> {
         match self.chord.take() {
-            Some((key, at)) => self.key_down(key, at, now),
+            Some((key, at)) => self.key_down(key, at),
             None => Vec::new(),
         }
     }
 
-    /// What a button that went down `at` does on its own, `now`: a key
-    /// held is timed from when it went down, the screen goes off from now.
-    fn key_down(&mut self, key: Key, at: u64, now: u64) -> Vec<Effect> {
+    /// What a button that went down `at` does on its own.
+    fn key_down(&mut self, key: Key, at: u64) -> Vec<Effect> {
         match key {
             Key::Back => {
                 self.button = Some((key, Press::Spent));
@@ -407,10 +459,9 @@ impl App {
                 self.button = Some((key, Press::Volume { down, next: at + REPEAT_DELAY_MS }));
                 self.volume(down, at)
             }
-            // A press before the page it lands on is drawn is lost, rather
-            // than taken for one on nothing.
+            // Before the page is drawn a tap cannot choose a control.
             Key::Power if self.keys && self.frame.is_none() => {
-                self.button = Some((key, Press::Spent));
+                self.button = Some((key, Press::Power { tap: PowerTap::Ignore, at }));
                 Vec::new()
             }
             Key::Power => {
@@ -421,13 +472,8 @@ impl App {
                     Some(Spot { stop: Stop::Hit(Action::Confirm(which)), rect, .. }) => {
                         self.button = Some((key, Press::Slide { which, track: rect, at }))
                     }
-                    Some(spot) => self.button = Some((key, Press::Power { spot, at })),
-                    // Turning the screen off, the key ticks the motor.
-                    None => {
-                        self.button = Some((key, Press::Spent));
-                        self.sleep(now);
-                        return vec![Effect::Ticks];
-                    }
+                    Some(spot) => self.button = Some((key, Press::Power { tap: PowerTap::Work(spot), at })),
+                    None => self.button = Some((key, Press::Power { tap: PowerTap::Sleep, at })),
                 }
                 Vec::new()
             }
@@ -440,9 +486,13 @@ impl App {
     /// it does alone.
     pub fn key_up(&mut self, key: Key, now: u64) -> Vec<Effect> {
         let mut fx = match self.chord {
-            Some((first, _)) if first == key => self.let_chord_go(now),
+            Some((first, _)) if first == key => self.let_chord_go(),
             _ => Vec::new(),
         };
+        if key == Key::Power {
+            // A release at the deadline may arrive before the next tick.
+            fx.extend(self.power_held(now));
+        }
         let Some((down, press)) = self.button else { return fx };
         if down != key {
             return fx;
@@ -450,7 +500,16 @@ impl App {
         self.button = None;
         self.dirty = true;
         match press {
-            Press::Power { spot, .. } => fx.extend(self.work(spot, now)),
+            Press::Power { tap: PowerTap::Work(Spot { stop: Stop::Hit(Action::OpenEntry(i)), .. }), at } if now >= at + LONG_PRESS_MS => {
+                // An intermediate press still gives hardware-key users
+                // access to the file's actions, without preempting reboot.
+                fx.extend(self.held_entry(i));
+            }
+            Press::Power { tap: PowerTap::Work(spot), .. } => fx.extend(self.work(spot, now)),
+            Press::Power { tap: PowerTap::Sleep, .. } => {
+                self.sleep(now);
+                fx.push(Effect::Ticks);
+            }
             Press::Slide { which, track, .. } => {
                 let done = self.state.confirm > SLID;
                 self.let_knob_go(which, track);
@@ -460,7 +519,7 @@ impl App {
                     self.say(self.state.lang.pick(["请按住电源键", "請按住電源鍵", "Hold the power key"]), now);
                 }
             }
-            Press::Volume { .. } | Press::Spent => {}
+            Press::Power { tap: PowerTap::Ignore, .. } | Press::Volume { .. } | Press::Spent => {}
         }
         fx
     }

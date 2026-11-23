@@ -46,6 +46,7 @@ mod keys;
 mod manager;
 mod mount;
 mod nav;
+mod panes;
 mod power;
 mod prefs;
 mod reboot;
@@ -598,6 +599,9 @@ enum Drag {
     /// `at` is when it came down: held long enough over an entry of the file
     /// manager, it opens what can be done with that entry.
     Press { x: f32, y: f32, action: Option<Action>, edge: Option<bool>, at: u64 },
+    /// The bottom keyboard owns this gesture in panel coordinates, even
+    /// when the finger moves up into the menu or across the divider.
+    WideKey { start: (f32, f32), key: Option<Action> },
     /// A press held long enough to have done its work; nothing it does
     /// counts until it lifts.
     Held,
@@ -635,16 +639,22 @@ enum Press {
     /// A volume key, moving the light down the page or up it, and again at
     /// `next`.
     Volume { down: bool, next: u64 },
-    /// The power key on the control lit, from `at`, which it works as it
-    /// comes up; held long enough over an entry of the file manager, it
-    /// opens what can be done with the entry, as a long press does.
-    Power { spot: Spot, at: u64 },
+    /// The ordinary power press, timed from before the screenshot window.
+    /// A tap acts on release; a hold opens the reboot page.
+    Power { tap: PowerTap, at: u64 },
     /// The power key on a swipe-to-confirm control, whose knob slides along
     /// its track at `track` from `at` while the key is held; let go once
     /// it has slid far enough, the control confirms.
     Slide { which: Confirm, track: Rect, at: u64 },
     /// Done with: nothing more comes of it until it is let go.
     Spent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PowerTap {
+    Ignore,
+    Sleep,
+    Work(Spot),
 }
 
 const TOAST_MS: u64 = 2000;
@@ -758,6 +768,8 @@ const REPEAT_MS: u64 = 50;
 /// the two waits this long, or until it is let go, before it does what it
 /// does alone.
 const CHORD_MS: u64 = 150;
+/// Holding power this long opens the reboot page without choosing a target.
+const POWER_REBOOT_MS: u64 = 500;
 /// How far along its track the knob of a swipe-to-confirm control has to
 /// be let go to confirm.
 const SLID: f32 = 0.9;
@@ -880,6 +892,14 @@ fn bar_fade(hero: bool) -> Fade {
     }
 }
 
+/// The small title appears after the large one fades. The mask follows
+/// when the content reaches the header.
+fn scrolled_header(t: &Theme, frame: &Frame, scroll: f32) -> (bool, bool) {
+    let title = frame.header && frame.title_lift(scroll) >= t.m.dp(TITLE_FADE_DP);
+    let mask = scroll > (frame.content_top - widgets::bar_mask_height(t)).max(0.0);
+    (title, mask)
+}
+
 /// The panel at full brightness: it dims over half a second and comes
 /// back quickly when touched.
 fn full_brightness() -> Fade {
@@ -914,6 +934,12 @@ fn draw_faded(out: &mut Canvas, blurs: &mut Blurs, dx: f32, dy: f32, color: Rgba
     if level > 0.0 {
         blurs.get(blur).draw(out, dx, dy, color, level);
     }
+}
+
+/// The large title first stays over the search fold, then blurs as it leaves.
+fn draw_large_title(out: &mut Canvas, t: &Theme, frame: &Frame, art: &mut Blurs, scroll: f32, offset: f32) {
+    let level = (1.0 - frame.title_lift(scroll) / t.m.dp(TITLE_FADE_DP)).clamp(0.0, 1.0);
+    draw_faded(out, art, 0.0, -frame.title_lift(offset), t.pal.text, level, (1.0 - level) * t.m.dp(TITLE_BLUR_DP));
 }
 
 /// The home page's search bar moving up to become the search page's
@@ -1196,10 +1222,14 @@ pub struct App {
     backdrop: Option<Canvas>,
     /// How round the screen's corners are, in pixels.
     corners: f32,
+    /// Optional status bar height and side margin in dp.
+    status_bar: Option<(u32, u32)>,
     dirty: bool,
+    panel_w: u32,
     w: u32,
     h: u32,
     px_per_dp: f32,
+    menu: panes::Menu,
 }
 
 impl App {
@@ -1265,10 +1295,13 @@ impl App {
             cols: 0,
             backdrop: None,
             corners: 0.0,
+            status_bar: None,
             dirty: true,
+            panel_w: w,
             w,
             h,
             px_per_dp,
+            menu: panes::Menu::default(),
         }
     }
 
@@ -1278,35 +1311,32 @@ impl App {
         self.corners = radius;
     }
 
+    /// Set the status bar before drawing, using each screen's own density.
+    pub fn set_status_bar(&mut self, height_dp: u32, margin_dp: u32) {
+        self.status_bar = Some((height_dp, margin_dp));
+    }
+
     /// Reflow the current page onto another panel while keeping its page
     /// stack, text fields, display power and work in progress. A gesture
     /// never crosses panels, especially a swipe that confirms a partition
     /// write.
     pub fn resize(&mut self, w: u32, h: u32, px_per_dp: f32, now: u64) {
+        self.resize_panel(w, h, px_per_dp, false, now);
+    }
+
+    /// Reflow to the selected panel, enabling navigation beside the page
+    /// on a wide inner display. Keep the same page stack and recovery work.
+    pub fn resize_panel(&mut self, w: u32, h: u32, px_per_dp: f32, two_panes: bool, now: u64) {
         assert!(w > 0 && h > 0 && px_per_dp.is_finite() && px_per_dp > 0.0);
         let scale = px_per_dp / self.px_per_dp;
         for (_, scroll, _) in &mut self.stack {
             *scroll *= scale;
         }
-        (self.w, self.h, self.px_per_dp) = (w, h, px_per_dp);
-        self.button = None;
-        self.chord = None;
-        self.drag = Drag::Idle;
-        self.tracker.clear();
-        self.state.confirm = 0.0;
-        self.turn = None;
-        self.morph = None;
-        self.cue = None;
-        self.backdrop = None;
-        self.search_words = None;
-        self.chip = None;
-        self.button_chip = None;
-        self.dither = None;
-        self.charge_art = None;
-        self.charge_canvas = None;
-        self.drawn.clear();
-        self.spare.clear();
-        self.settle_page();
+        self.menu.rescale(scale);
+        (self.panel_w, self.h, self.px_per_dp) = (w, h, px_per_dp);
+        self.set_menu_width(if two_panes && w as f32 / px_per_dp >= 640.0 { (w * 45 + 50) / 100 } else { 0 });
+        self.w = w - self.pane_at().unwrap_or(0);
+        self.reflow();
         self.refresh();
         if self.display_on {
             self.wake(now);
@@ -1319,12 +1349,49 @@ impl App {
         }
     }
 
+    /// Discard coordinates and drawing caches whenever a page changes width.
+    fn reflow(&mut self) {
+        self.button = None;
+        self.chord = None;
+        self.drag = Drag::Idle;
+        self.state.held = None;
+        self.tracker.clear();
+        self.state.confirm = 0.0;
+        self.turn = None;
+        self.morph = None;
+        self.cue = None;
+        self.backdrop = None;
+        self.search_words = None;
+        self.chip = None;
+        self.button_chip = None;
+        self.dither = None;
+        self.charge_art = None;
+        self.charge_canvas = None;
+        self.menu.reflow();
+        self.drawn.clear();
+        self.spare.clear();
+        self.settle_page();
+    }
+
     pub fn theme(&self) -> Theme {
-        if self.state.dark {
-            Theme::dark(self.w, self.h, self.px_per_dp)
-        } else {
-            Theme::light(self.w, self.h, self.px_per_dp)
+        let mut t = self.theme_at(self.w);
+        if self.pane_at().is_some() {
+            t.m.about_scale = (self.h as f32 * 0.45 / t.m.dp(490.7)).clamp(0.65, 1.0);
+            t.m.wide_keyboard = true;
         }
+        t
+    }
+
+    fn theme_at(&self, width: u32) -> Theme {
+        let mut t = if self.state.dark {
+            Theme::dark(width, self.h, self.px_per_dp)
+        } else {
+            Theme::light(width, self.h, self.px_per_dp)
+        };
+        if let Some((height, margin)) = self.status_bar {
+            t.m.set_status_bar(height, margin);
+        }
+        t
     }
 
     pub fn screen(&self) -> Screen {
@@ -1361,6 +1428,7 @@ impl App {
                 || self.bar.moving(now)
                 || self.morph.is_some()
                 || self.turn.is_some()
+                || self.menu.moving(now)
                 || self.row_press.is_some_and(|p| p.changing(now) || p.gone(now))
                 || self.glowing());
         // The content going dark or coming up, and the charging screen's
@@ -1377,7 +1445,7 @@ impl App {
         };
         let repeat = match self.button {
             Some((_, Press::Volume { next, .. })) => Some(next),
-            Some((_, Press::Power { spot: Spot { stop: Stop::Hit(Action::OpenEntry(_)), .. }, at })) => Some(at + LONG_PRESS_MS),
+            Some((_, Press::Power { at, .. })) => Some(at + POWER_REBOOT_MS),
             _ => None,
         };
         let blink = self.blink_at(now).filter(|_| self.display_on).map(|(_, next)| next);
@@ -1412,21 +1480,14 @@ impl App {
         // The key waiting for its partner in a screenshot, left alone long
         // enough, does what it does alone.
         if self.chord.is_some_and(|(_, at)| now >= at + CHORD_MS) {
-            fx.extend(self.let_chord_go(now));
+            fx.extend(self.let_chord_go());
         }
-        // An entry of the file manager held long enough, under a finger or
-        // the power key, opens what can be done with it, a folder as much as
-        // a file, with a tap of the motor.
+        fx.extend(self.power_held(now));
+        // Holding an entry under a finger opens what can be done with it.
         if let Drag::Press { action: Some(Action::OpenEntry(i)), at, .. } = self.drag
             && now >= at + LONG_PRESS_MS
         {
             self.drag = Drag::Held;
-            fx.extend(self.held_entry(i));
-        }
-        if let Some((key, Press::Power { spot: Spot { stop: Stop::Hit(Action::OpenEntry(i)), .. }, at })) = self.button
-            && now >= at + LONG_PRESS_MS
-        {
-            self.button = Some((key, Press::Spent));
             fx.extend(self.held_entry(i));
         }
         let active = *self.active.get_or_insert(now);
@@ -1496,6 +1557,9 @@ impl App {
                 self.settle_fold(now);
             }
         }
+        if self.display_on && self.menu.tick(now, self.px_per_dp) {
+            self.dirty = true;
+        }
         if let Some((glide, pitch, scrolled)) = self.glide {
             let (y, done) = glide.at(now);
             let rows = (y / pitch).trunc() as isize;
@@ -1546,7 +1610,7 @@ impl App {
                 self.cue = None;
             }
         }
-        if self.screen() == Screen::About {
+        if self.shown_page() == Screen::About {
             let look = self.theme().hero.glow;
             match &mut self.glow {
                 Some(g) if std::ptr::eq(g.look(), look) => g.advance(now),
@@ -1562,7 +1626,7 @@ impl App {
 
     /// Whether the About page's field is on screen, moving.
     fn glowing(&self) -> bool {
-        self.glow.is_some() && self.display_on && self.top().1 < self.theme().m.dp(ABOUT_FIELD_DP)
+        self.glow.is_some() && self.display_on && self.top().1 < self.theme().m.about_y(ABOUT_FIELD_DP)
     }
 
     /// Whether the bar's title and the bar belong over the rendered page
@@ -1574,11 +1638,10 @@ impl App {
         let t = self.theme();
         let scroll = self.top().1;
         Some(if fr.hero.is_some() {
-            let gone = scroll >= t.m.dp(ABOUT_LOGO_DP) - widgets::bar_bottom(&t);
+            let gone = scroll >= t.m.about_y(ABOUT_LOGO_DP) - widgets::bar_bottom(&t);
             (gone, gone)
         } else {
-            let under = (fr.content_top - widgets::bar_bottom(&t) - t.m.dp(20.0)).max(0.0);
-            (fr.header && fr.title_lift(scroll) >= t.m.dp(TITLE_FADE_DP), scroll > under)
+            scrolled_header(&t, fr, scroll)
         })
     }
 
@@ -1629,6 +1692,12 @@ impl App {
 
     /// The page's readings changed (battery, storage): render it again.
     pub fn refresh(&mut self) {
+        let width = self.panel_w - self.pane_at().unwrap_or(0);
+        if self.w != width {
+            self.w = width;
+            self.reflow();
+        }
+        self.menu.invalidate();
         self.frame = None;
         self.stale.clear();
         self.spots = None;

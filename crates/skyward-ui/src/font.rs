@@ -302,7 +302,7 @@ pub(crate) fn bundled() -> Fonts {
     #[cfg(not(target_os = "android"))]
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/fonts");
     #[cfg(target_os = "android")]
-    let dir = "/skyward";
+    let dir = std::env::var("SKYWARD_TEST_FONTS").unwrap_or_else(|_| "/skyward".into());
     Fonts::load(format!("{dir}/MiSansVF.ttf"), 0, format!("{dir}/KirkMono-Regular.ttf")).unwrap()
 }
 

@@ -44,6 +44,8 @@ pub struct Frame {
     /// A strip held at the bottom of the screen over the page; the page
     /// scrolls far enough for nothing to stay under it.
     pub dock: Option<Dock>,
+    /// An on-screen keyboard placed below both panes on the unfolded panel.
+    pub keyboard: Option<Keyboard>,
     /// A text field's blinking cursor, in page coordinates.
     pub caret: Option<widgets::Caret>,
     /// The round button at the right end of the bar: what it shows, and
@@ -57,6 +59,24 @@ pub struct Dock {
     pub canvas: Canvas,
     /// In the strip's own coordinates.
     pub hits: Vec<Hit>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Keyboard {
+    pub enter: &'static str,
+    pub enabled: bool,
+}
+
+impl Keyboard {
+    pub(crate) fn top(t: &Theme) -> f32 {
+        let height = widgets::keyboard_height(t);
+        t.m.h as f32 - if t.m.wide_keyboard { height.ceil() } else { height }
+    }
+
+    pub(crate) fn draw(self, c: &mut Canvas, t: &Theme, f: &Fonts, s: &State, top: f32) -> Vec<Hit> {
+        let keys = widgets::keyboard(c, t, f, s.lang, top, s.layer, s.key_held(), self.enter);
+        if self.enabled { keys.into_iter().map(|(rect, cap)| Hit { rect, action: Action::Type(cap) }).collect() } else { Vec::new() }
+    }
 }
 
 /// The rows of a list drawn as they come into view, the way a list view
@@ -208,9 +228,15 @@ impl Frame {
             fold: None,
             scrollback: None,
             dock: None,
+            keyboard: None,
             caret: None,
             button: None,
         }
+    }
+
+    /// The keyboard's dock, whose x coordinates are in the full panel.
+    pub(super) fn wide_keyboard(&self) -> Option<&Dock> {
+        self.dock.as_ref().filter(|_| self.keyboard.is_some())
     }
 
     /// Where the control at `r` on the page shows, on screen, with the page

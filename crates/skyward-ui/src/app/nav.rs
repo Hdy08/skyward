@@ -79,11 +79,17 @@ impl App {
     /// In the file manager, back climbs a folder until it reaches the root,
     /// and in a place, until it reaches the place's top.
     pub(super) fn back(&mut self, now: u64) -> Vec<Effect> {
+        self.back_from(now, false)
+    }
+
+    /// The menu can leave a whole section. Apply the same cleanup and
+    /// work guards as Back, without revisiting every parent directory.
+    pub(super) fn back_from(&mut self, now: u64, menu: bool) -> Vec<Effect> {
         let (l, mut fx) = (self.state.lang, Vec::new());
         if self.stack.len() <= 1 {
             return fx;
         }
-        let morph = self.screen() == Screen::Search && self.stack[self.stack.len() - 2].0 == Screen::Home;
+        let morph = !menu && !self.wide_menu() && self.screen() == Screen::Search && self.stack[self.stack.len() - 2].0 == Screen::Home;
         if morph {
             self.start_morph(false, now);
         }
@@ -104,14 +110,14 @@ impl App {
                 self.state.asking_delete = false;
             }
             Screen::Files => {
-                if let Some(up) = self.state.files.up() {
+                if !menu && let Some(up) = self.state.files.up() {
                     return vec![Effect::ReadDir(up)];
                 }
                 // Leaving the file manager puts a picked entry down.
                 self.state.clip = None;
             }
             Screen::Choose(place) => {
-                if let Some(up) = self.state.folder(Screen::Choose(place)).up() {
+                if !menu && let Some(up) = self.state.folder(Screen::Choose(place)).up() {
                     return vec![Effect::ReadPlace(place, up)];
                 }
             }
@@ -257,7 +263,9 @@ impl App {
             }
         }
         if !morph {
-            self.leave(true);
+            // A sidebar switch may pop several pages before opening one.
+            // Keep the first outgoing frame for the whole transition.
+            self.leave(!menu);
         }
         self.stack.pop();
         self.state.confirm = 0.0;
@@ -267,10 +275,12 @@ impl App {
         // have been made, deleted or opened up to be read since. So does
         // coming back to the partitions after work on one, which may have
         // changed what it holds.
-        match self.screen() {
-            Screen::Restore => fx.push(self.find_backups()),
-            Screen::Filesystem | Screen::Filesystems if left == Screen::PartWork => fx.push(Effect::ReadFilesystems),
-            _ => {}
+        if !menu {
+            match self.screen() {
+                Screen::Restore => fx.push(self.find_backups()),
+                Screen::Filesystem | Screen::Filesystems if left == Screen::PartWork => fx.push(Effect::ReadFilesystems),
+                _ => {}
+            }
         }
         fx
     }

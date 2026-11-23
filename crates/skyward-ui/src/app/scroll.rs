@@ -111,6 +111,20 @@ mod tests {
     const SHORT: u32 = 2600;
 
     #[test]
+    fn a_short_cover_home_does_not_extend_past_the_search_fold_to_show_the_title() {
+        let (f, i) = (fonts(), info());
+        let (w, h, density) = (1080, 2520, 2.75);
+        let mut app = App::new(Screen::Home, w, h, density);
+        app.set_status_bar(40, 16);
+        let fold = app.frame(&f, &i).fold.expect("Home has folding search");
+        let end = app.max_scroll();
+        assert_eq!(end, fold.span.ceil());
+        scroll_to(&mut app, &f, end, 1000);
+        assert!(fold.shown(end).is_none());
+        assert!(!app.title.on && !app.bar.on, "the page has not scrolled far enough to change the title or mask");
+    }
+
+    #[test]
     fn the_home_search_bar_folds_away_under_its_still_title_before_the_title_goes() {
         let (f, i) = (fonts(), info());
         let t = Theme::light(W, SHORT, PPD);

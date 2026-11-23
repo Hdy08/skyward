@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn the_power_key_held_on_an_entry_opens_what_can_be_done_with_it() {
+    fn releasing_power_after_a_medium_press_shows_the_focused_files_actions() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Advanced, W, H, PPD);
         tap(&mut app, &f, &i, Action::Open(Screen::Files));
@@ -571,12 +571,11 @@ mod tests {
         assert!(app.key(Key::Power, 1000).is_empty());
         assert_eq!(app.deadline(1000), Some(1000 + CHORD_MS), "it waits for volume down first");
         assert!(app.tick(1000 + CHORD_MS).is_empty());
-        assert_eq!(app.deadline(1000 + CHORD_MS), Some(1000 + LONG_PRESS_MS), "the press is timed from when it went down");
+        assert_eq!(app.deadline(1000 + CHORD_MS), Some(1000 + POWER_REBOOT_MS), "the press is timed from when it went down");
         assert!(app.tick(1000 + LONG_PRESS_MS - 1).is_empty());
-        assert_eq!(app.tick(1000 + LONG_PRESS_MS), vec![Effect::Haptic], "held long enough, the folder's page opens");
+        assert_eq!(app.key_up(Key::Power, 1000 + LONG_PRESS_MS), vec![Effect::Haptic], "released before the reboot threshold, the folder's page opens");
         assert_eq!(app.screen(), Screen::FileInfo);
         assert_eq!(app.state.file.as_ref().map(|e| e.name.as_str()), Some("vendor"));
-        assert!(app.key_up(Key::Power, 1000 + LONG_PRESS_MS + 100).is_empty(), "and the key comes up to nothing");
         app.key(Key::Back, 2000);
         assert_eq!(lit(&mut app, &f, &i), Some(Stop::Hit(Action::OpenEntry(0))));
         assert_eq!(press(&mut app, Key::Power, 3000), vec![Effect::ReadDir("/vendor".into())], "a short press goes into the folder");
